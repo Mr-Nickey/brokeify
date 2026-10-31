@@ -1,0 +1,6 @@
+{
+  "name": "Brokeify — Free & Self-Hosted Music Aggregator",
+  "description": "The All-In-One Free & Self-Hosted Music Aggregator uniting Jellyfin, Navidrome, Emby, Plex, Internet Archive, Radio-Browser, and Spotify playlist cross-resolution with a Car-Ready Web Audio Engine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
