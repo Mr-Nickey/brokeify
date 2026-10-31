@@ -24,14 +24,52 @@ export function useAudioEngine(initialQueue: Track[]) {
   const [shuffleEnabled, setShuffleEnabled] = useState<boolean>(false);
   const [repeatMode, setRepeatMode] = useState<RepeatMode>('all');
 
-  // Web Audio DSP State
-  const [carVolumeLeveler, setCarVolumeLeveler] = useState<boolean>(true);
+  // Web Audio DSP State (persisted in localStorage & synced via Jellyfin /DisplayPreferences/brokeify)
+  const [carVolumeLeveler, setCarVolumeLeveler] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('brokeify_audio_prefs_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (typeof parsed.carVolumeLeveler === 'boolean') return parsed.carVolumeLeveler;
+      }
+    } catch {}
+    return true;
+  });
   const [lufsNormalizationEnabled, setLufsNormalizationEnabled] =
-    useState<boolean>(true);
-  const [eqPreset, setEqPreset] = useState<EQPresetName>('Car Stereo');
-  const [eqGains, setEqGains] = useState<number[]>([
-    ...EQ_PRESETS['Car Stereo'],
-  ]);
+    useState<boolean>(() => {
+      try {
+        const saved = localStorage.getItem('brokeify_audio_prefs_v1');
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (typeof parsed.lufsNormalizationEnabled === 'boolean') {
+            return parsed.lufsNormalizationEnabled;
+          }
+        }
+      } catch {}
+      return true;
+    });
+  const [eqPreset, setEqPreset] = useState<EQPresetName>(() => {
+    try {
+      const saved = localStorage.getItem('brokeify_audio_prefs_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed.eqPreset) return parsed.eqPreset;
+      }
+    } catch {}
+    return 'Car Stereo';
+  });
+  const [eqGains, setEqGains] = useState<number[]>(() => {
+    try {
+      const saved = localStorage.getItem('brokeify_audio_prefs_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed.eqGains) && parsed.eqGains.length === 5) {
+          return parsed.eqGains;
+        }
+      }
+    } catch {}
+    return [...EQ_PRESETS['Car Stereo']];
+  });
 
   // IndexedDB Offline Vault & 2-Song Lookahead Preloader State
   const [cachedTrackIds, setCachedTrackIds] = useState<Set<string>>(new Set());
@@ -493,6 +531,56 @@ export function useAudioEngine(initialQueue: Track[]) {
     });
   }, []);
 
+  // Persist audio preferences to localStorage whenever EQ or Car Mode preferences change
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        'brokeify_audio_prefs_v1',
+        JSON.stringify({
+          eqPreset,
+          eqGains,
+          carVolumeLeveler,
+          lufsNormalizationEnabled,
+          shuffleEnabled,
+          repeatMode,
+        })
+      );
+    } catch {}
+  }, [
+    eqPreset,
+    eqGains,
+    carVolumeLeveler,
+    lufsNormalizationEnabled,
+    shuffleEnabled,
+    repeatMode,
+  ]);
+
+  // Restore audio preferences pulled from Jellyfin Cloud Settings Sync (/DisplayPreferences/brokeify)
+  const restoreAudioPreferences = useCallback(
+    (prefs: {
+      eqPreset: EQPresetName;
+      eqGains: number[];
+      carVolumeLeveler: boolean;
+      lufsNormalizationEnabled: boolean;
+      shuffleEnabled?: boolean;
+      repeatMode?: RepeatMode;
+    }) => {
+      setEqPreset(prefs.eqPreset || 'Car Stereo');
+      if (Array.isArray(prefs.eqGains) && prefs.eqGains.length === 5) {
+        setEqGains([...prefs.eqGains]);
+      }
+      setCarVolumeLeveler(Boolean(prefs.carVolumeLeveler));
+      setLufsNormalizationEnabled(Boolean(prefs.lufsNormalizationEnabled));
+      if (typeof prefs.shuffleEnabled === 'boolean') {
+        setShuffleEnabled(prefs.shuffleEnabled);
+      }
+      if (prefs.repeatMode) {
+        setRepeatMode(prefs.repeatMode);
+      }
+    },
+    []
+  );
+
   // Bluetooth & Car Steering Wheel Controls via navigator.mediaSession
   useEffect(() => {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator) || !currentTrack) {
@@ -589,6 +677,7 @@ export function useAudioEngine(initialQueue: Track[]) {
     eqGains,
     applyEqPreset,
     updateEqBand,
+    restoreAudioPreferences,
     cachedTrackIds,
     preloadingTrackIds,
     vaultTotalBytes,

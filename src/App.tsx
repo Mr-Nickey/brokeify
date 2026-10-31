@@ -44,12 +44,17 @@ import {
   MusicProviderManager,
 } from './services/MusicProviderManager';
 import type {
+  BrokeifyCloudSettings,
+  CloudSyncStatus,
   Playlist,
   ProviderConfig,
   ProviderType,
   Track,
 } from './types/music';
-import { ROTATING_SPITE_TAGLINES } from './utils/musicLogic';
+import {
+  mergeProvidersPreservingAuth,
+  ROTATING_SPITE_TAGLINES,
+} from './utils/musicLogic';
 import { preloadTrackToVault } from './utils/offlineVault';
 
 type ActiveTab = 'library' | 'sources' | 'spotify' | 'audiolab';
@@ -82,6 +87,20 @@ export default function App() {
   const [isCarModeOpen, setIsCarModeOpen] = useState<boolean>(false);
   const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
 
+  // Zero-Logout Persistent Storage & Jellyfin Cloud Sync State
+  const [storagePersistStatus, setStoragePersistStatus] = useState<{
+    persisted: boolean;
+    message: string;
+  }>({
+    persisted: false,
+    message: 'Requesting navigator.storage.persist()...',
+  });
+  const [cloudSyncStatus, setCloudSyncStatus] = useState<CloudSyncStatus>({
+    state: 'idle',
+    lastSyncedAt: null,
+    message: 'Ready to sync with /DisplayPreferences/brokeify?client=Brokeify',
+  });
+
   // One-Tap Offline Playlist Downloader progress state
   const [downloadingPlaylistId, setDownloadingPlaylistId] = useState<
     string | null
@@ -94,6 +113,19 @@ export default function App() {
   // New Custom Playlist Modal State
   const [showNewPlaylistForm, setShowNewPlaylistForm] = useState<boolean>(false);
   const [newPlaylistName, setNewPlaylistName] = useState<string>('');
+
+  // 1. Call navigator.storage.persist() on app startup so Android Chrome never evicts our IndexedDB audio vault or localStorage tokens
+  useEffect(() => {
+    let mounted = true;
+    MusicProviderManager.ensurePersistentStorage().then((res) => {
+      if (mounted) {
+        setStoragePersistStatus(res);
+      }
+    });
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   // Rotate Spite Taglines every 6 seconds
   useEffect(() => {
@@ -119,6 +151,131 @@ export default function App() {
 
   const audio = useAudioEngine(BUILT_IN_TRACKS);
 
+  const handleApplyRestoredCloudSettings = (
+    restored: BrokeifyCloudSettings
+  ) => {
+    if (restored.audioPrefs) {
+      audio.restoreAudioPreferences(restored.audioPrefs);
+    }
+    if (Array.isArray(restored.providers) && restored.providers.length > 0) {
+      setProviders((prev) => {
+        const merged = mergeProvidersPreservingAuth(prev, restored.providers);
+        MusicProviderManager.saveProviders(merged);
+        return merged;
+      });
+    }
+    if (Array.isArray(restored.playlists) && restored.playlists.length > 0) {
+      setPlaylists((prev) => {
+        const byId = new Map<string, Playlist>();
+        for (const p of prev) byId.set(p.id, p);
+        for (const p of restored.playlists) byId.set(p.id, p);
+        const mergedPl = Array.from(byId.values());
+        MusicProviderManager.savePlaylists(mergedPl);
+        return mergedPl;
+      });
+    }
+    setCloudSyncStatus({
+      state: 'restored',
+      lastSyncedAt: restored.updatedAt,
+      message: `Restored EQ (${restored.audioPrefs.eqPreset}), Car Leveler (${restored.audioPrefs.carVolumeLeveler ? 'ON' : 'OFF'}), servers & playlists from Jellyfin`,
+    });
+  };
+
+  const handlePullCloudSettings = async (overrideConfig?: ProviderConfig) => {
+    const jfConfig =
+      overrideConfig ||
+      providers.find((p) => p.type === 'jellyfin') ||
+      providers[0];
+    if (!jfConfig) return;
+
+    setCloudSyncStatus((prev) => ({
+      ...prev,
+      state: 'syncing',
+      message: 'Pulling from GET /DisplayPreferences/brokeify...',
+    }));
+
+    const { settings } =
+      await MusicProviderManager.pullCloudSettingsFromJellyfin(jfConfig);
+    if (settings) {
+      handleApplyRestoredCloudSettings(settings);
+    } else {
+      // No existing cloud settings on server yet — push current state to initialize
+      await handlePushCloudSettings(jfConfig);
+    }
+  };
+
+  const handlePushCloudSettings = async (overrideConfig?: ProviderConfig) => {
+    const jfConfig =
+      overrideConfig ||
+      providers.find((p) => p.type === 'jellyfin') ||
+      providers[0];
+    if (!jfConfig) return;
+
+    const snapshot: BrokeifyCloudSettings = {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      audioPrefs: {
+        eqPreset: audio.eqPreset,
+        eqGains: audio.eqGains,
+        carVolumeLeveler: audio.carVolumeLeveler,
+        lufsNormalizationEnabled: audio.lufsNormalizationEnabled,
+        shuffleEnabled: audio.shuffleEnabled,
+        repeatMode: audio.repeatMode,
+      },
+      providers,
+      playlists,
+    };
+
+    const res = await MusicProviderManager.pushCloudSettingsToJellyfin(
+      jfConfig,
+      snapshot
+    );
+    setCloudSyncStatus({
+      state: 'pushed',
+      lastSyncedAt: snapshot.updatedAt,
+      message: res.message,
+    });
+  };
+
+  // Auto-push settings to Jellyfin /DisplayPreferences/brokeify whenever EQ, Car Mode, or Playlists change while Jellyfin is enabled
+  useEffect(() => {
+    const jfConfig = providers.find((p) => p.type === 'jellyfin' && p.enabled);
+    if (!jfConfig) return;
+
+    const snapshot: BrokeifyCloudSettings = {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      audioPrefs: {
+        eqPreset: audio.eqPreset,
+        eqGains: audio.eqGains,
+        carVolumeLeveler: audio.carVolumeLeveler,
+        lufsNormalizationEnabled: audio.lufsNormalizationEnabled,
+        shuffleEnabled: audio.shuffleEnabled,
+        repeatMode: audio.repeatMode,
+      },
+      providers,
+      playlists,
+    };
+    MusicProviderManager.pushCloudSettingsToJellyfin(jfConfig, snapshot).then(
+      (res) => {
+        setCloudSyncStatus({
+          state: 'pushed',
+          lastSyncedAt: snapshot.updatedAt,
+          message: res.message,
+        });
+      }
+    );
+  }, [
+    audio.eqPreset,
+    audio.eqGains,
+    audio.carVolumeLeveler,
+    audio.lufsNormalizationEnabled,
+    audio.shuffleEnabled,
+    audio.repeatMode,
+    providers,
+    playlists,
+  ]);
+
   // Fetch initial Radio-Browser & Internet Archive tracks in background on mount
   useEffect(() => {
     let mounted = true;
@@ -141,8 +298,11 @@ export default function App() {
   }, []);
 
   const handleUpdateProviders = (next: ProviderConfig[]) => {
-    setProviders(next);
-    MusicProviderManager.saveProviders(next);
+    setProviders((prev) => {
+      const safeMerged = mergeProvidersPreservingAuth(prev, next);
+      MusicProviderManager.saveProviders(safeMerged);
+      return safeMerged;
+    });
   };
 
   const handleMergeRemoteTracks = (newTracks: Track[]) => {
@@ -427,6 +587,11 @@ export default function App() {
             onMergeRemoteTracks={(tracks) => {
               handleMergeRemoteTracks(tracks);
             }}
+            storagePersistStatus={storagePersistStatus}
+            cloudSyncStatus={cloudSyncStatus}
+            onPushCloudSettings={() => handlePushCloudSettings()}
+            onPullCloudSettings={(cfg) => handlePullCloudSettings(cfg)}
+            onApplyRestoredCloudSettings={handleApplyRestoredCloudSettings}
           />
         )}
 

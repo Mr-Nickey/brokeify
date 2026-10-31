@@ -2,20 +2,34 @@ import React, { useState } from 'react';
 import {
   CheckCircle2,
   Cloud,
+  CloudDownload,
+  CloudUpload,
   HardDrive,
   Loader2,
+  Lock,
   Radio,
   RefreshCw,
   Server,
   ShieldCheck,
 } from 'lucide-react';
-import type { ProviderConfig, Track } from '../types/music';
+import type {
+  BrokeifyCloudSettings,
+  CloudSyncStatus,
+  ProviderConfig,
+  Track,
+} from '../types/music';
 import { MusicProviderManager } from '../services/MusicProviderManager';
+import { buildJellyfinDisplayPrefsUrl } from '../utils/musicLogic';
 
 interface SourcesHubViewProps {
   providers: ProviderConfig[];
   onUpdateProviders: (next: ProviderConfig[]) => void;
   onMergeRemoteTracks: (newTracks: Track[], providerName: string) => void;
+  storagePersistStatus: { persisted: boolean; message: string };
+  cloudSyncStatus: CloudSyncStatus;
+  onPushCloudSettings: () => Promise<void>;
+  onPullCloudSettings: (fromConfig?: ProviderConfig) => Promise<void>;
+  onApplyRestoredCloudSettings: (settings: BrokeifyCloudSettings) => void;
 }
 
 const RADIO_TAGS = ['rock', 'synthwave', 'electronic', 'jazz', 'metal', 'ambient'] as const;
@@ -24,10 +38,22 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
   providers,
   onUpdateProviders,
   onMergeRemoteTracks,
+  storagePersistStatus,
+  cloudSyncStatus,
+  onPushCloudSettings,
+  onPullCloudSettings,
+  onApplyRestoredCloudSettings,
 }) => {
   const [testingId, setTestingId] = useState<string | null>(null);
   const [selectedRadioTag, setSelectedRadioTag] = useState<string>('rock');
   const [fetchingCloudSource, setFetchingCloudSource] = useState<string | null>(null);
+
+  const jellyfinProvider =
+    providers.find((p) => p.type === 'jellyfin') || providers[0];
+  const jellyfinDisplayPrefsEndpoint = buildJellyfinDisplayPrefsUrl(
+    jellyfinProvider?.serverUrl || 'http://192.168.1.100:8096',
+    jellyfinProvider?.userId || jellyfinProvider?.username || 'admin'
+  );
 
   const handleFieldChange = (
     id: string,
@@ -44,12 +70,21 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
     setTestingId(provider.id);
     try {
       if (provider.type === 'jellyfin' || provider.type === 'emby') {
-        const { updatedConfig, tracks } =
+        const { updatedConfig, tracks, restoredCloudSettings } =
           await MusicProviderManager.connectJellyfinOrEmby(provider);
-        onUpdateProviders(
-          providers.map((p) => (p.id === provider.id ? updatedConfig : p))
+        const updatedList = providers.map((p) =>
+          p.id === provider.id ? updatedConfig : p
         );
+        onUpdateProviders(updatedList);
         onMergeRemoteTracks(tracks, provider.name);
+
+        if (provider.type === 'jellyfin') {
+          if (restoredCloudSettings) {
+            onApplyRestoredCloudSettings(restoredCloudSettings);
+          } else {
+            await onPullCloudSettings(updatedConfig);
+          }
+        }
       } else if (provider.type === 'navidrome') {
         const { updatedConfig, tracks } =
           await MusicProviderManager.connectNavidrome(provider);
@@ -128,6 +163,92 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
 
   return (
     <div className="space-y-10">
+      {/* Section 0: Zero-Logout Persistence & Jellyfin Cloud Settings Sync */}
+      <section
+        aria-labelledby="cloud-sync-heading"
+        className="rounded-2xl border border-zinc-800/90 bg-zinc-900/40 p-6 space-y-5"
+      >
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-zinc-800/80 pb-4">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2.5">
+              <Lock className="w-5 h-5 text-emerald-400 shrink-0" />
+              <h2
+                id="cloud-sync-heading"
+                className="text-xl font-bold text-white tracking-tight"
+              >
+                Zero-Logout Persistence & Jellyfin Cloud Settings Sync
+              </h2>
+            </div>
+            <p className="text-sm text-zinc-400">
+              Automatically backs up and restores your EQ presets, Car Mode
+              leveler, extra server configs, and playlists via Jellyfin&apos;s
+              native DisplayPreferences endpoint.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => onPullCloudSettings()}
+              disabled={cloudSyncStatus.state === 'syncing'}
+              className="inline-flex items-center gap-2 rounded-xl border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 px-3.5 py-2 text-xs font-semibold text-white transition-colors whitespace-nowrap shrink-0 min-h-[40px]"
+            >
+              <CloudDownload className="w-4 h-4 text-emerald-400" />
+              <span>Pull & Restore from Jellyfin</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onPushCloudSettings}
+              disabled={cloudSyncStatus.state === 'syncing'}
+              className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 px-4 py-2 text-xs font-bold text-zinc-950 transition-colors whitespace-nowrap shrink-0 min-h-[40px]"
+            >
+              <CloudUpload className="w-4 h-4" />
+              <span>Push Settings to Jellyfin</span>
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+          <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/60 p-4 space-y-1">
+            <div className="font-semibold text-white flex items-center gap-1.5">
+              <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span>Android Chrome Storage Lock</span>
+            </div>
+            <p className="text-zinc-400 font-mono" data-testid="storage-persist-status">
+              {storagePersistStatus.message}
+            </p>
+          </div>
+
+          <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/60 p-4 space-y-1">
+            <div className="font-semibold text-white flex items-center gap-1.5">
+              <Lock className="w-4 h-4 text-purple-400 shrink-0" />
+              <span>Zero-Logout Auth Token Guard</span>
+            </div>
+            <p className="text-zinc-400">
+              Saved Jellyfin, Navidrome, Emby & Plex tokens are never cleared on
+              network timeout or offline errors.
+            </p>
+          </div>
+
+          <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/60 p-4 space-y-1">
+            <div className="font-semibold text-white flex items-center gap-1.5">
+              <Cloud className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span>Jellyfin DisplayPreferences Sync</span>
+            </div>
+            <p
+              className="text-emerald-400 font-mono truncate"
+              title={jellyfinDisplayPrefsEndpoint}
+              data-testid="jellyfin-cloud-sync-endpoint"
+            >
+              {jellyfinDisplayPrefsEndpoint}
+            </p>
+            <p className="text-zinc-400" data-testid="cloud-sync-status-message">
+              {cloudSyncStatus.message}
+            </p>
+          </div>
+        </div>
+      </section>
       {/* Section 1: Instant Free Cloud Sources */}
       <section aria-labelledby="cloud-sources-heading" className="space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-2 border-b border-zinc-800/80 pb-4">

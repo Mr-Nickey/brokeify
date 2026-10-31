@@ -1,5 +1,7 @@
 import type {
+  BrokeifyCloudSettings,
   EQPresetName,
+  ProviderConfig,
   SpotifyImportedItem,
   SpotifyResolvedItem,
   Track,
@@ -314,3 +316,121 @@ export function crossResolveTrack(
     matchReason: bestReason,
   };
 }
+
+/**
+ * Builds Jellyfin's native DisplayPreferences endpoint URL for Brokeify Cloud Settings Sync:
+ * /DisplayPreferences/brokeify?userId={userId}&client=Brokeify
+ */
+export function buildJellyfinDisplayPrefsUrl(
+  serverUrl: string,
+  userId: string
+): string {
+  const cleanBase = serverUrl.trim().replace(/\/+$/, '');
+  const safeUser = encodeURIComponent(userId.trim() || 'brokeify-user');
+  return `${cleanBase}/DisplayPreferences/brokeify?userId=${safeUser}&client=Brokeify`;
+}
+
+/**
+ * Serializes BrokeifyCloudSettings into Jellyfin's DisplayPreferencesDto structure
+ * under CustomPrefs.brokeify_cloud_state so GET/POST /DisplayPreferences/brokeify works natively.
+ */
+export function serializeCloudSettingsPayload(
+  settings: BrokeifyCloudSettings,
+  existingDisplayPrefs?: Record<string, any>
+): Record<string, any> {
+  const baseCustomPrefs =
+    existingDisplayPrefs && typeof existingDisplayPrefs.CustomPrefs === 'object'
+      ? { ...existingDisplayPrefs.CustomPrefs }
+      : {};
+
+  return {
+    Id: 'brokeify',
+    Client: 'Brokeify',
+    SortBy: existingDisplayPrefs?.SortBy || 'SortName',
+    SortOrder: existingDisplayPrefs?.SortOrder || 'Ascending',
+    CustomPrefs: {
+      ...baseCustomPrefs,
+      brokeify_cloud_state: JSON.stringify(settings),
+      brokeify_updated_at: settings.updatedAt,
+    },
+  };
+}
+
+/**
+ * Parses a Jellyfin GET /DisplayPreferences/brokeify JSON response and extracts BrokeifyCloudSettings.
+ */
+export function parseCloudSettingsResponse(
+  rawResponse: Record<string, any> | null | undefined
+): BrokeifyCloudSettings | null {
+  if (!rawResponse || typeof rawResponse !== 'object') return null;
+
+  const rawState = rawResponse.CustomPrefs?.brokeify_cloud_state;
+  if (typeof rawState !== 'string' || !rawState.trim()) return null;
+
+  try {
+    const parsed = JSON.parse(rawState) as BrokeifyCloudSettings;
+    if (!parsed || typeof parsed !== 'object' || !parsed.audioPrefs) {
+      return null;
+    }
+    return {
+      version: Number(parsed.version || 1),
+      updatedAt: String(parsed.updatedAt || new Date().toISOString()),
+      audioPrefs: {
+        eqPreset: parsed.audioPrefs.eqPreset || 'Car Stereo',
+        eqGains:
+          Array.isArray(parsed.audioPrefs.eqGains) &&
+          parsed.audioPrefs.eqGains.length === 5
+            ? parsed.audioPrefs.eqGains.map((n) => Number(n) || 0)
+            : [...EQ_PRESETS['Car Stereo']],
+        carVolumeLeveler: Boolean(parsed.audioPrefs.carVolumeLeveler ?? true),
+        lufsNormalizationEnabled: Boolean(
+          parsed.audioPrefs.lufsNormalizationEnabled ?? true
+        ),
+        shuffleEnabled: Boolean(parsed.audioPrefs.shuffleEnabled ?? false),
+        repeatMode: parsed.audioPrefs.repeatMode || 'all',
+      },
+      providers: Array.isArray(parsed.providers) ? parsed.providers : [],
+      playlists: Array.isArray(parsed.playlists) ? parsed.playlists : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Zero-Logout Credential Guard:
+ * Merges incoming or updated ProviderConfigs with existing saved configs while NEVER
+ * clearing or overwriting non-empty saved auth tokens, userIds, passwords, or salts
+ * on network timeout or partial sync payloads.
+ */
+export function mergeProvidersPreservingAuth(
+  existingProviders: readonly ProviderConfig[],
+  incomingProviders: readonly ProviderConfig[]
+): ProviderConfig[] {
+  const byId = new Map<string, ProviderConfig>();
+  for (const p of existingProviders) {
+    byId.set(p.id, { ...p });
+  }
+
+  for (const inc of incomingProviders) {
+    const prev = byId.get(inc.id);
+    if (!prev) {
+      byId.set(inc.id, { ...inc });
+      continue;
+    }
+
+    byId.set(inc.id, {
+      ...prev,
+      ...inc,
+      serverUrl: inc.serverUrl?.trim() ? inc.serverUrl : prev.serverUrl,
+      username: inc.username?.trim() ? inc.username : prev.username,
+      password: inc.password?.trim() ? inc.password : prev.password,
+      token: inc.token?.trim() ? inc.token : prev.token,
+      userId: inc.userId?.trim() ? inc.userId : prev.userId,
+      salt: inc.salt?.trim() ? inc.salt : prev.salt,
+    });
+  }
+
+  return Array.from(byId.values());
+}
+

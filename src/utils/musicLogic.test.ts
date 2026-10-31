@@ -11,8 +11,12 @@ import {
   crossResolveTrack,
   EQ_PRESETS,
   ROTATING_SPITE_TAGLINES,
+  buildJellyfinDisplayPrefsUrl,
+  serializeCloudSettingsPayload,
+  parseCloudSettingsResponse,
+  mergeProvidersPreservingAuth,
 } from './musicLogic';
-import type { Track } from '../types/music';
+import type { BrokeifyCloudSettings, ProviderConfig, Track } from '../types/music';
 
 test('ROTATING_SPITE_TAGLINES includes all 3 required taglines', () => {
   assert.equal(ROTATING_SPITE_TAGLINES.length, 3);
@@ -111,3 +115,72 @@ test('EQ_PRESETS has 5 bands for each required preset', () => {
     assert.equal(EQ_PRESETS[preset].length, 5);
   }
 });
+
+test('Jellyfin DisplayPreferences Cloud Sync URL, serialization, and parsing round-trip cleanly', () => {
+  const url = buildJellyfinDisplayPrefsUrl('https://jf.homelab.local/', 'user-42');
+  assert.equal(
+    url,
+    'https://jf.homelab.local/DisplayPreferences/brokeify?userId=user-42&client=Brokeify'
+  );
+
+  const sampleSettings: BrokeifyCloudSettings = {
+    version: 1,
+    updatedAt: '2026-10-31T20:00:00.000Z',
+    audioPrefs: {
+      eqPreset: 'Bass Boost',
+      eqGains: [6.5, 4.0, 0, 0.5, 1.5],
+      carVolumeLeveler: true,
+      lufsNormalizationEnabled: true,
+      shuffleEnabled: true,
+      repeatMode: 'all',
+    },
+    providers: [],
+    playlists: [],
+  };
+
+  const payload = serializeCloudSettingsPayload(sampleSettings);
+  assert.equal(payload.Id, 'brokeify');
+  assert.equal(payload.Client, 'Brokeify');
+  assert.ok(payload.CustomPrefs.brokeify_cloud_state);
+
+  const restored = parseCloudSettingsResponse(payload);
+  assert.ok(restored);
+  assert.equal(restored.audioPrefs.eqPreset, 'Bass Boost');
+  assert.deepEqual(restored.audioPrefs.eqGains, [6.5, 4.0, 0, 0.5, 1.5]);
+  assert.equal(restored.audioPrefs.shuffleEnabled, true);
+});
+
+test('mergeProvidersPreservingAuth never clears saved auth tokens on offline or empty updates', () => {
+  const existing: ProviderConfig[] = [
+    {
+      id: 'prov-jellyfin',
+      type: 'jellyfin',
+      name: 'Jellyfin Media Server',
+      enabled: true,
+      serverUrl: 'https://jf.myhome.net',
+      username: 'nreed',
+      token: 'persisted-jf-token-999',
+      userId: 'jf-uid-1',
+      status: 'connected',
+    },
+  ];
+
+  const incomingAfterTimeout: ProviderConfig[] = [
+    {
+      id: 'prov-jellyfin',
+      type: 'jellyfin',
+      name: 'Jellyfin Media Server',
+      enabled: true,
+      serverUrl: 'https://jf.myhome.net',
+      username: 'nreed',
+      token: '', // Empty token from failed/partial response must NOT overwrite saved token
+      userId: '',
+      status: 'connected',
+    },
+  ];
+
+  const merged = mergeProvidersPreservingAuth(existing, incomingAfterTimeout);
+  assert.equal(merged[0].token, 'persisted-jf-token-999');
+  assert.equal(merged[0].userId, 'jf-uid-1');
+});
+

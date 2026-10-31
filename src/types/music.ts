@@ -96,3 +96,26 @@ export interface SpotifyResolvedItem {
 }
 
 export type RepeatMode = 'off' | 'all' | 'one';
+
+export interface BrokeifyAudioPreferences {
+  eqPreset: EQPresetName;
+  eqGains: number[];
+  carVolumeLeveler: boolean;
+  lufsNormalizationEnabled: boolean;
+  shuffleEnabled: boolean;
+  repeatMode: RepeatMode;
+}
+
+export interface BrokeifyCloudSettings {
+  version: number;
+  updatedAt: string;
+  audioPrefs: BrokeifyAudioPreferences;
+  providers: ProviderConfig[];
+  playlists: Playlist[];
+}
+
+export interface CloudSyncStatus {
+  state: 'idle' | 'syncing' | 'restored' | 'pushed' | 'cached-fallback';
+  lastSyncedAt: string | null;
+  message: string;
+}
