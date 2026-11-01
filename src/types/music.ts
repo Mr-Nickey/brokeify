@@ -13,7 +13,7 @@ export interface ProviderConfig {
   name: string;
   enabled: boolean;
   serverUrl: string;
-  authMode?: 'apikey' | 'password';
+  authMode?: 'session' | 'quickconnect' | 'apikey' | 'password';
   username?: string;
   password?: string;
   token?: string;
@@ -49,6 +49,9 @@ export interface Track {
   fallbackStreamUrl?: string;
   artworkUrl: string;
   accentColor: string;
+  genre?: string;
+  tags?: string[];
+  bpm?: number;
   /**
    * ReplayGain / LUFS normalization offset in dB (e.g. -4.2 or +2.5)
    * Used by GainNode in Web Audio API

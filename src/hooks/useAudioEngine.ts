@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { EQPresetName, RepeatMode, Track } from '../types/music';
 import {
+  buildJellyfinStreamCandidates,
   EQ_FREQUENCIES,
   EQ_PRESETS,
   fisherYatesShuffle,
@@ -10,8 +11,8 @@ import {
   getAllVaultEntries,
   getCachedTrackBlob,
   preloadTrackToVault,
+  removeTrackFromVault,
 } from '../utils/offlineVault';
-import { synthesizeWavBlob } from '../utils/synthWavGenerator';
 
 export function useAudioEngine(initialQueue: Track[]) {
   const [queue, setQueue] = useState<Track[]>(initialQueue);
@@ -90,6 +91,25 @@ export function useAudioEngine(initialQueue: Track[]) {
   const compressorNodeRef = useRef<DynamicsCompressorNode | null>(null);
   const analyserNodeRef = useRef<AnalyserNode | null>(null);
   const activeObjectUrlRef = useRef<string | null>(null);
+  const onEndedCallbackRef = useRef<() => void>(() => {});
+
+  // Keep queue synchronized when initialQueue updates (e.g. when Jellyfin tracks load or sources change)
+  useEffect(() => {
+    setQueue((prevQueue) => {
+      const cleanedPrev = prevQueue.filter(
+        (t) => t && t.source !== 'built-in' && !t.streamUrl.startsWith('synth://')
+      );
+      if (initialQueue.length === 0) {
+        return cleanedPrev;
+      }
+      if (cleanedPrev.length === 0) {
+        return initialQueue;
+      }
+      // Refresh stream URLs on existing queued tracks if initialQueue has updated tokens/URLs
+      const byId = new Map(initialQueue.map((t) => [t.id, t]));
+      return cleanedPrev.map((t) => byId.get(t.id) || t);
+    });
+  }, [initialQueue]);
 
   const currentTrack: Track | null = queue[currentIndex] || queue[0] || null;
 
@@ -109,40 +129,98 @@ export function useAudioEngine(initialQueue: Track[]) {
     refreshVaultState();
   }, [refreshVaultState]);
 
-  // Initialize HTML5 <audio crossOrigin="anonymous">
-  useEffect(() => {
-    const audio = new Audio();
-    audio.crossOrigin = 'anonymous';
-    audio.preload = 'auto';
-    audioRef.current = audio;
-
+  const bindAudioEvents = useCallback((audio: HTMLAudioElement) => {
     const handleTimeUpdate = () => {
       setCurrentTime(audio.currentTime || 0);
     };
     const handleLoadedMetadata = () => {
-      if (audio.duration && Number.isFinite(audio.duration)) {
+      if (audio.duration && Number.isFinite(audio.duration) && audio.duration > 0) {
         setDuration(audio.duration);
       }
+    };
+    const handlePlay = () => setIsPlaying(true);
+    const handlePause = () => {
+      if (!audio.ended) {
+        setIsPlaying(false);
+      }
+    };
+    const handleEnded = () => {
+      onEndedCallbackRef.current();
     };
 
     audio.addEventListener('timeupdate', handleTimeUpdate);
     audio.addEventListener('loadedmetadata', handleLoadedMetadata);
+    audio.addEventListener('play', handlePlay);
+    audio.addEventListener('pause', handlePause);
+    audio.addEventListener('ended', handleEnded);
+
+    return () => {
+      audio.removeEventListener('timeupdate', handleTimeUpdate);
+      audio.removeEventListener('loadedmetadata', handleLoadedMetadata);
+      audio.removeEventListener('play', handlePlay);
+      audio.removeEventListener('pause', handlePause);
+      audio.removeEventListener('ended', handleEnded);
+    };
+  }, []);
+
+  // Initialize HTML5 <audio> WITHOUT crossOrigin="anonymous" so remote Jellyfin streams are never blocked by CORS preflight/headers
+  useEffect(() => {
+    const audio = new Audio();
+    audio.preload = 'auto';
+    audioRef.current = audio;
+    const unbind = bindAudioEvents(audio);
 
     return () => {
       audio.pause();
-      audio.removeEventListener('timeupdate', handleTimeUpdate);
-      audio.removeEventListener('loadedmetadata', handleLoadedMetadata);
+      unbind();
       if (activeObjectUrlRef.current) {
         URL.revokeObjectURL(activeObjectUrlRef.current);
       }
     };
-  }, []);
+  }, [bindAudioEvents]);
 
-  // Initialize Web Audio API Graph lazily on user gesture / play
+  /**
+   * Ensures we have a clean, untainted HTMLAudioElement when streaming directly from a remote server URL.
+   * Once `ctx.createMediaElementSource(audio)` has been called on an `<audio>` element, browsers permanently
+   * mute any cross-origin stream that lacks CORS headers. Creating a fresh `<audio>` element when switching
+   * from a WebAudio-bound blob to a direct remote stream prevents silent/blocked playback.
+   */
+  const ensureUntaintedAudioElement = useCallback((): HTMLAudioElement => {
+    const current = audioRef.current;
+    if (current && !sourceNodeRef.current) {
+      current.removeAttribute('crossOrigin');
+      return current;
+    }
+
+    if (current) {
+      try {
+        current.pause();
+        current.removeAttribute('src');
+        current.load();
+      } catch {}
+    }
+
+    sourceNodeRef.current = null;
+    const freshAudio = new Audio();
+    freshAudio.preload = 'auto';
+    freshAudio.volume = isMuted ? 0 : Math.max(0, Math.min(1, volume));
+    bindAudioEvents(freshAudio);
+    audioRef.current = freshAudio;
+    return freshAudio;
+  }, [bindAudioEvents, isMuted, volume]);
+
+  // Initialize Web Audio API Graph lazily ONLY when playing local blob:// URLs that are guaranteed same-origin
   const ensureAudioGraph = useCallback(() => {
     const audio = audioRef.current;
-    if (!audio || audioCtxRef.current) {
-      if (audioCtxRef.current?.state === 'suspended') {
+    if (!audio) return;
+
+    // Never attach createMediaElementSource to a direct remote HTTP stream (avoids Web Audio CORS silence/lockout)
+    if (audio.src && !audio.src.startsWith('blob:')) {
+      return;
+    }
+
+    if (audioCtxRef.current && sourceNodeRef.current) {
+      if (audioCtxRef.current.state === 'suspended') {
         audioCtxRef.current.resume().catch(() => {});
       }
       return;
@@ -150,8 +228,13 @@ export function useAudioEngine(initialQueue: Track[]) {
 
     try {
       const AudioCtx =
-        window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const ctx = new AudioCtx();
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext })
+          .webkitAudioContext;
+      const ctx = audioCtxRef.current || new AudioCtx();
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
       const source = ctx.createMediaElementSource(audio);
 
       // 1. LUFS Normalization GainNode
@@ -234,7 +317,6 @@ export function useAudioEngine(initialQueue: Track[]) {
       comp.knee.setTargetAtTime(30, ctx.currentTime, 0.02);
       comp.ratio.setTargetAtTime(12, ctx.currentTime, 0.02);
     } else {
-      // Effectively transparent compressor when disabled
       comp.threshold.setTargetAtTime(0, ctx.currentTime, 0.02);
       comp.knee.setTargetAtTime(0, ctx.currentTime, 0.02);
       comp.ratio.setTargetAtTime(1, ctx.currentTime, 0.02);
@@ -257,27 +339,26 @@ export function useAudioEngine(initialQueue: Track[]) {
     );
   }, [currentTrack, lufsNormalizationEnabled, carVolumeLeveler]);
 
-  // Sync Master Volume
+  // Sync Master Volume (applies to both Web Audio graph and direct HTML5 <audio>)
   useEffect(() => {
     const audio = audioRef.current;
     const masterNode = masterGainNodeRef.current;
     const ctx = audioCtxRef.current;
-    const effectiveVol = isMuted ? 0 : volume;
-    if (masterNode && ctx) {
-      masterNode.gain.setTargetAtTime(effectiveVol, ctx.currentTime, 0.015);
-    } else if (audio) {
+    const effectiveVol = isMuted ? 0 : Math.max(0, Math.min(1, volume));
+    if (audio) {
       audio.volume = effectiveVol;
+    }
+    if (masterNode && ctx && sourceNodeRef.current) {
+      masterNode.gain.setTargetAtTime(effectiveVol, ctx.currentTime, 0.015);
     }
   }, [volume, isMuted]);
 
-  // 2-Song Lookahead Preloader (Dead-Zone Proof)
+  // 2-Song Lookahead Preloader (runs after playback starts so it never competes with active stream startup)
   useEffect(() => {
-    if (!currentTrack || queue.length === 0) return;
+    if (!currentTrack || queue.length <= 1 || !isPlaying) return;
 
     let cancelled = false;
     const lookaheadTracks: Track[] = [];
-    // Also ensure current track is cached in vault, plus Track N+1 and Track N+2
-    lookaheadTracks.push(currentTrack);
     if (queue.length > 1) {
       lookaheadTracks.push(queue[(currentIndex + 1) % queue.length]);
     }
@@ -285,9 +366,9 @@ export function useAudioEngine(initialQueue: Track[]) {
       lookaheadTracks.push(queue[(currentIndex + 2) % queue.length]);
     }
 
-    const runPreloader = async () => {
+    const startTimer = setTimeout(async () => {
       for (const tr of lookaheadTracks) {
-        if (cancelled) break;
+        if (cancelled || !tr) break;
         const alreadyCached = await getCachedTrackBlob(tr.id);
         if (alreadyCached) continue;
 
@@ -310,109 +391,121 @@ export function useAudioEngine(initialQueue: Track[]) {
           }
         }
       }
-    };
+    }, 3500);
 
-    runPreloader();
     return () => {
       cancelled = true;
+      clearTimeout(startTimer);
     };
-  }, [currentTrack, currentIndex, queue, refreshVaultState]);
+  }, [currentTrack, currentIndex, isPlaying, queue, refreshVaultState]);
 
-  // Load and play track from Offline Vault Blob or Stream URL
+  const loadRequestIdRef = useRef<number>(0);
+
+  // Load and play track from Offline Vault Blob or Multi-Candidate Progressive HTTP Stream URL
   const loadAndPlayTrack = useCallback(
     async (track: Track, autoPlay: boolean) => {
-      const audio = audioRef.current;
-      if (!audio) return;
+      const requestId = ++loadRequestIdRef.current;
 
       setDuration(track.duration || 180);
       setCurrentTime(0);
-
-      // 1. Check IndexedDB Offline Vault first
-      let blob = await getCachedTrackBlob(track.id);
-      if (!blob && track.streamUrl.startsWith('synth://')) {
-        blob = await preloadTrackToVault(track);
-        await refreshVaultState();
-      }
 
       if (activeObjectUrlRef.current) {
         URL.revokeObjectURL(activeObjectUrlRef.current);
         activeObjectUrlRef.current = null;
       }
 
-      const isSelfHostedTrack =
-        track.source === 'jellyfin' ||
-        track.source === 'emby' ||
-        track.source === 'navidrome' ||
-        track.source === 'plex';
+      // 1. Check IndexedDB Offline Vault first
+      const cachedBlob = await getCachedTrackBlob(track.id);
+      if (requestId !== loadRequestIdRef.current) return;
 
-      if (blob) {
-        const objUrl = URL.createObjectURL(blob);
+      if (cachedBlob) {
+        const audio = audioRef.current || ensureUntaintedAudioElement();
+        const objUrl = URL.createObjectURL(cachedBlob);
         activeObjectUrlRef.current = objUrl;
-        if (!sourceNodeRef.current) {
-          audio.crossOrigin = 'anonymous';
-        }
         audio.src = objUrl;
-      } else {
-        // For remote self-hosted tracks, omit crossOrigin if Web Audio MediaElementSource hasn't locked it,
-        // or try anonymous first and fall back to direct /Download URL if needed
-        if (!sourceNodeRef.current && isSelfHostedTrack) {
-          audio.removeAttribute('crossOrigin');
-        } else {
-          audio.crossOrigin = 'anonymous';
-        }
-        audio.src = track.streamUrl;
-      }
+        audio.volume = isMuted ? 0 : Math.max(0, Math.min(1, volume));
 
-      if (autoPlay) {
-        if (!isSelfHostedTrack || blob) {
+        if (autoPlay) {
           ensureAudioGraph();
-        }
-        try {
-          await audio.play();
-          setIsPlaying(true);
-        } catch {
-          // If a real server track failed on universal stream URL, retry with direct Download fallback URL without crossOrigin
-          if (isSelfHostedTrack) {
-            try {
-              audio.removeAttribute('crossOrigin');
-              audio.src = track.fallbackStreamUrl || track.streamUrl;
-              await audio.play();
-              setIsPlaying(true);
-              return;
-            } catch {
-              setIsPlaying(false);
-              return;
-            }
-          }
-
-          // Graceful fallback for built-in / cloud demo streams only
-          const fallbackBlob = synthesizeWavBlob(
-            track.id,
-            track.synthRecipe || {
-              bpm: 120,
-              rootHz: 110,
-              scaleRatios: [1, 1.2, 1.33, 1.5, 1.6],
-              progression: [1, 0.8, 0.9, 1.125],
-              bassPattern: [1, 1, 1.5, 1],
-              padWave: 'sawtooth',
-              leadWave: 'triangle',
-              driveAmount: 1.25,
-            },
-            24
-          );
-          const fallbackUrl = URL.createObjectURL(fallbackBlob);
-          activeObjectUrlRef.current = fallbackUrl;
-          audio.src = fallbackUrl;
           try {
             await audio.play();
             setIsPlaying(true);
+            return;
           } catch {
-            setIsPlaying(false);
+            // Cached blob was unreadable by browser decoder; purge it and fall through to direct HTTP streaming
+            await removeTrackFromVault(track.id);
+            await refreshVaultState();
+            if (activeObjectUrlRef.current) {
+              URL.revokeObjectURL(activeObjectUrlRef.current);
+              activeObjectUrlRef.current = null;
+            }
           }
+        } else {
+          return;
         }
       }
+
+      // 2. Direct HTTP Progressive Streaming (with 4-stage fallback for Jellyfin/Emby)
+      const audio = ensureUntaintedAudioElement();
+      audio.removeAttribute('crossOrigin');
+      audio.volume = isMuted ? 0 : Math.max(0, Math.min(1, volume));
+
+      let savedToken = '';
+      let savedUserId = '';
+      try {
+        savedToken = (localStorage.getItem('jellyfin_token') ?? '').trim();
+        savedUserId = (localStorage.getItem('jellyfin_user_id') ?? '').trim();
+      } catch {
+        // ignore
+      }
+
+      const candidateUrls = buildJellyfinStreamCandidates(
+        track,
+        savedToken,
+        savedUserId
+      );
+
+      if (candidateUrls.length === 0) {
+        setIsPlaying(false);
+        return;
+      }
+
+      if (!autoPlay) {
+        audio.src = candidateUrls[0];
+        return;
+      }
+
+      for (const candidateUrl of candidateUrls) {
+        if (requestId !== loadRequestIdRef.current) return;
+        try {
+          audio.removeAttribute('crossOrigin');
+          audio.src = candidateUrl;
+          audio.load();
+          await audio.play();
+          if (requestId === loadRequestIdRef.current) {
+            setIsPlaying(true);
+          }
+          return;
+        } catch (err: any) {
+          // If interrupted by a newer load request, exit loop
+          if (requestId !== loadRequestIdRef.current) {
+            return;
+          }
+          // Otherwise try the next fallback stream URL (e.g. universal HTTP -> stream.mp3 -> Download)
+        }
+      }
+
+      if (requestId === loadRequestIdRef.current) {
+        setIsPlaying(false);
+      }
     },
-    [ensureAudioGraph, refreshVaultState]
+    [
+      ensureAudioGraph,
+      ensureUntaintedAudioElement,
+      isMuted,
+      refreshVaultState,
+      volume,
+    ]
   );
 
   // Trigger track load when currentIndex or currentTrack.id changes
@@ -426,26 +519,36 @@ export function useAudioEngine(initialQueue: Track[]) {
   }, [currentTrack, isPlaying, loadAndPlayTrack]);
 
   const togglePlayPause = useCallback(async () => {
-    const audio = audioRef.current;
-    if (!audio || !currentTrack) return;
+    const targetTrack = currentTrack || queue[0] || initialQueue[0] || null;
+    if (!targetTrack) return;
 
-    ensureAudioGraph();
-    if (isPlaying) {
+    if (!currentTrack && initialQueue.length > 0) {
+      setQueue(initialQueue);
+      setCurrentIndex(0);
+    }
+
+    const audio = audioRef.current;
+    if (isPlaying && audio) {
       audio.pause();
       setIsPlaying(false);
+      return;
+    }
+
+    if (!audio || !audio.src || lastLoadedTrackIdRef.current !== targetTrack.id) {
+      lastLoadedTrackIdRef.current = targetTrack.id;
+      await loadAndPlayTrack(targetTrack, true);
     } else {
-      if (!audio.src) {
-        await loadAndPlayTrack(currentTrack, true);
-      } else {
-        try {
-          await audio.play();
-          setIsPlaying(true);
-        } catch {
-          await loadAndPlayTrack(currentTrack, true);
-        }
+      if (audio.src.startsWith('blob:')) {
+        ensureAudioGraph();
+      }
+      try {
+        await audio.play();
+        setIsPlaying(true);
+      } catch {
+        await loadAndPlayTrack(targetTrack, true);
       }
     }
-  }, [currentTrack, ensureAudioGraph, isPlaying, loadAndPlayTrack]);
+  }, [currentTrack, ensureAudioGraph, initialQueue, isPlaying, loadAndPlayTrack, queue]);
 
   const playNext = useCallback(() => {
     if (queue.length === 0) return;
@@ -469,12 +572,11 @@ export function useAudioEngine(initialQueue: Track[]) {
     setIsPlaying(true);
   }, [currentIndex, queue.length]);
 
-  // Handle track ended event
+  // Keep ended callback up to date
   useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    const onEnded = () => {
-      if (repeatMode === 'one') {
+    onEndedCallbackRef.current = () => {
+      const audio = audioRef.current;
+      if (repeatMode === 'one' && audio) {
         audio.currentTime = 0;
         audio.play().catch(() => {});
       } else if (repeatMode === 'all' || currentIndex < queue.length - 1) {
@@ -483,8 +585,6 @@ export function useAudioEngine(initialQueue: Track[]) {
         setIsPlaying(false);
       }
     };
-    audio.addEventListener('ended', onEnded);
-    return () => audio.removeEventListener('ended', onEnded);
   }, [currentIndex, playNext, queue.length, repeatMode]);
 
   const seekTo = useCallback((timeSec: number) => {

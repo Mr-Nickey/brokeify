@@ -17,6 +17,19 @@ import {
   mergeProvidersPreservingAuth,
   isLikelyJellyfinApiKey,
   matchJellyfinUserFromList,
+  buildJellyfinInstantMixUrl,
+  buildClientInstantMix,
+  buildJellyfinPublicSystemInfoUrl,
+  buildJellyfinQuickConnectInitiateUrl,
+  buildJellyfinQuickConnectPollUrl,
+  buildJellyfinQuickConnectAuthUrl,
+  buildJellyfinAuthHeaders,
+  buildJellyfinUsersMeUrl,
+  buildJellyfinUserAudioItemsUrl,
+  buildJellyfinUserPlaylistsUrl,
+  buildJellyfinPlaylistItemsUrl,
+  buildJellyfinGlobalAudioItemsUrl,
+  buildJellyfinGlobalPlaylistsUrl,
 } from './musicLogic';
 import type { BrokeifyCloudSettings, ProviderConfig, Track } from '../types/music';
 
@@ -52,21 +65,71 @@ test('lufsToLinearGain converts dB offsets accurately and clamps extremes', () =
   assert.equal(lufsToLinearGain(-30), lufsToLinearGain(-12));
 });
 
-test('Jellyfin, Subsonic, and Plex URL builders produce spec-compliant endpoints', () => {
+test('Jellyfin Quick Connect, Authenticated Headers, User-Scoped Endpoints, Subsonic, and Plex URL builders produce spec-compliant endpoints', () => {
   const header = buildEmbyAuthHeader('tok123');
   assert.ok(header.includes('Client="Brokeify"'));
   assert.ok(header.includes('Device="BrokeifyWeb"'));
   assert.ok(header.includes('DeviceId="brokeify-01"'));
+  assert.ok(header.includes('Version="2.0.0"'));
   assert.ok(header.includes('Token="tok123"'));
 
-  const jfUniversal = buildJellyfinStreamUrl('https://jellyfin.flockingreeds.farm/', 'item99', 'secretKey', 'user1', false);
-  assert.ok(jfUniversal.startsWith('https://jellyfin.flockingreeds.farm/Audio/item99/universal?'));
-  assert.ok(jfUniversal.includes('Container=opus%2Cmp3%2Caac%2Cflac%2Cwav'));
-  assert.ok(jfUniversal.includes('AudioCodec=mp3'));
-  assert.ok(jfUniversal.includes('api_key=secretKey'));
+  const authHeaders = buildJellyfinAuthHeaders('tok123');
+  assert.equal(authHeaders['Accept'], 'application/json');
+  assert.equal(authHeaders['X-Emby-Token'], 'tok123');
+  assert.equal(
+    authHeaders['Authorization'],
+    'MediaBrowser Client="Brokeify", Device="BrokeifyWeb", DeviceId="brokeify-01", Version="2.0.0", Token="tok123"'
+  );
 
-  const jfDirect = buildJellyfinStreamUrl('https://jellyfin.flockingreeds.farm/', 'item99', 'secretKey', 'user1', true);
-  assert.equal(jfDirect, 'https://jellyfin.flockingreeds.farm/Items/item99/Download?api_key=secretKey');
+  assert.equal(
+    buildJellyfinPublicSystemInfoUrl('https://jellyfin.flockingreeds.farm/'),
+    'https://jellyfin.flockingreeds.farm/System/Info/Public'
+  );
+  assert.equal(
+    buildJellyfinQuickConnectInitiateUrl('https://jellyfin.flockingreeds.farm/'),
+    'https://jellyfin.flockingreeds.farm/QuickConnect/Initiate'
+  );
+  assert.equal(
+    buildJellyfinQuickConnectPollUrl('https://jellyfin.flockingreeds.farm/', 'sec-99'),
+    'https://jellyfin.flockingreeds.farm/QuickConnect/Connect?Secret=sec-99'
+  );
+  assert.equal(
+    buildJellyfinQuickConnectAuthUrl('https://jellyfin.flockingreeds.farm/'),
+    'https://jellyfin.flockingreeds.farm/Users/AuthenticateWithQuickConnect'
+  );
+  assert.equal(
+    buildJellyfinUsersMeUrl('https://jellyfin.flockingreeds.farm/', 'tok123'),
+    'https://jellyfin.flockingreeds.farm/Users/Me?api_key=tok123'
+  );
+  assert.equal(
+    buildJellyfinUserAudioItemsUrl('https://jellyfin.flockingreeds.farm/', 'uid-42', 'tok123'),
+    'https://jellyfin.flockingreeds.farm/Users/uid-42/Items?IncludeItemTypes=Audio&Recursive=true&Fields=MediaSources,NormalizationGain,Album,Artists&Limit=3000&api_key=tok123'
+  );
+  assert.equal(
+    buildJellyfinUserPlaylistsUrl('https://jellyfin.flockingreeds.farm/', 'uid-42', 'tok123'),
+    'https://jellyfin.flockingreeds.farm/Users/uid-42/Items?IncludeItemTypes=Playlist&Recursive=true&api_key=tok123'
+  );
+  assert.equal(
+    buildJellyfinPlaylistItemsUrl('https://jellyfin.flockingreeds.farm/', 'pl-88', 'uid-42', 'tok123'),
+    'https://jellyfin.flockingreeds.farm/Playlists/pl-88/Items?UserId=uid-42&Fields=MediaSources,NormalizationGain&api_key=tok123'
+  );
+  assert.equal(
+    buildJellyfinGlobalAudioItemsUrl('https://jellyfin.flockingreeds.farm/', 'myKey32'),
+    'https://jellyfin.flockingreeds.farm/Items?IncludeItemTypes=Audio&Recursive=true&Fields=MediaSources,NormalizationGain,Album,Artists&Limit=3000&api_key=myKey32'
+  );
+  assert.equal(
+    buildJellyfinGlobalPlaylistsUrl('https://jellyfin.flockingreeds.farm/', 'myKey32'),
+    'https://jellyfin.flockingreeds.farm/Items?IncludeItemTypes=Playlist&Recursive=true&api_key=myKey32'
+  );
+
+  const jfUniversal = buildJellyfinStreamUrl('https://jellyfin.yourdomain.com/', 'item99', 'secretKey', 'user1', false);
+  assert.equal(
+    jfUniversal,
+    'https://jellyfin.yourdomain.com/Audio/item99/universal?UserId=user1&DeviceId=brokeify-01&MaxStreamingBitrate=140000000&Container=mp3,flac,aac,m4a,ogg,wav,opus,webma,webm&TranscodingContainer=mp3&TranscodingProtocol=http&AudioCodec=mp3&api_key=secretKey'
+  );
+
+  const jfDirect = buildJellyfinStreamUrl('https://jellyfin.yourdomain.com/', 'item99', 'secretKey', 'user1', true);
+  assert.equal(jfDirect, 'https://jellyfin.yourdomain.com/Audio/item99/stream?static=true&api_key=secretKey');
 
   const subsonic = buildSubsonicUrl(
     'https://navi.local',
@@ -205,4 +268,73 @@ test('mergeProvidersPreservingAuth never clears saved auth tokens on offline or 
   assert.equal(merged[0].token, 'persisted-jf-token-999');
   assert.equal(merged[0].userId, 'jf-uid-1');
 });
+
+test('buildJellyfinInstantMixUrl and buildClientInstantMix generate smart radio mixes', () => {
+  const mixUrl = buildJellyfinInstantMixUrl(
+    'https://jellyfin.yourdomain.com/',
+    'jellyfin-item42',
+    'apiKey123',
+    'user99',
+    25
+  );
+  assert.ok(
+    mixUrl.startsWith('https://jellyfin.yourdomain.com/Items/item42/InstantMix?')
+  );
+  assert.ok(mixUrl.includes('UserId=user99'));
+  assert.ok(mixUrl.includes('Limit=25'));
+  assert.ok(mixUrl.includes('api_key=apiKey123'));
+
+  const seed: Track = {
+    id: 's1',
+    title: 'Midnight Synth',
+    artist: 'Outrun Artist',
+    album: 'Cyber',
+    duration: 200,
+    source: 'built-in',
+    sourceName: 'Demo',
+    streamUrl: 'synth://s1',
+    artworkUrl: '',
+    accentColor: '#10b981',
+    genre: 'Synthwave',
+    tags: ['outrun', 'night-drive'],
+    bpm: 118,
+  };
+  const similar: Track = {
+    id: 's2',
+    title: 'Neon Highway',
+    artist: 'Retro Wave',
+    album: 'Cyber 2',
+    duration: 195,
+    source: 'built-in',
+    sourceName: 'Demo',
+    streamUrl: 'synth://s2',
+    artworkUrl: '',
+    accentColor: '#10b981',
+    genre: 'Synthwave',
+    tags: ['outrun', 'analog'],
+    bpm: 120,
+  };
+  const different: Track = {
+    id: 's3',
+    title: 'Quiet Acoustic Ballad',
+    artist: 'Folk Singer',
+    album: 'Campfire',
+    duration: 210,
+    source: 'built-in',
+    sourceName: 'Demo',
+    streamUrl: 'synth://s3',
+    artworkUrl: '',
+    accentColor: '#f59e0b',
+    genre: 'Acoustic',
+    tags: ['ballad', 'chill'],
+    bpm: 72,
+  };
+
+  const mix = buildClientInstantMix(seed, [seed, different, similar], 25, () => 0.5);
+  assert.equal(mix.length, 3);
+  assert.equal(mix[0].id, 's1');
+  assert.equal(mix[1].id, 's2'); // High-affinity Synthwave track prioritized ahead of Acoustic track
+  assert.equal(mix[2].id, 's3');
+});
+
 

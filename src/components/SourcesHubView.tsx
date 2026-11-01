@@ -2,26 +2,30 @@ import React, { useState } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
-  ChevronDown,
-  ChevronUp,
   Cloud,
   CloudDownload,
   CloudUpload,
+  Eye,
+  EyeOff,
   HardDrive,
-  KeyRound,
   Loader2,
   Lock,
+  LogOut,
+  Plus,
   Radio,
   RefreshCw,
   Server,
   ShieldCheck,
   Terminal,
+  X,
+  Zap,
 } from 'lucide-react';
 import type {
   BrokeifyCloudSettings,
   CloudSyncStatus,
   Playlist,
   ProviderConfig,
+  ProviderType,
   Track,
 } from '../types/music';
 import { MusicProviderManager } from '../services/MusicProviderManager';
@@ -38,9 +42,18 @@ interface SourcesHubViewProps {
   onPushCloudSettings: () => Promise<void>;
   onPullCloudSettings: (fromConfig?: ProviderConfig) => Promise<void>;
   onApplyRestoredCloudSettings: (settings: BrokeifyCloudSettings) => void;
+  onOpenOnboardingModal?: () => void;
+  onLogoutProvider?: (type: ProviderType) => Promise<void>;
 }
 
-const RADIO_TAGS = ['rock', 'synthwave', 'electronic', 'jazz', 'metal', 'ambient'] as const;
+const RADIO_TAGS = [
+  'rock',
+  'synthwave',
+  'electronic',
+  'jazz',
+  'metal',
+  'ambient',
+] as const;
 
 export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
   providers,
@@ -52,21 +65,32 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
   onPushCloudSettings,
   onPullCloudSettings,
   onApplyRestoredCloudSettings,
+  onOpenOnboardingModal,
+  onLogoutProvider,
 }) => {
   const [testingId, setTestingId] = useState<string | null>(null);
   const [selectedRadioTag, setSelectedRadioTag] = useState<string>('rock');
-  const [fetchingCloudSource, setFetchingCloudSource] = useState<string | null>(null);
-  const [showDisabledConnectors, setShowDisabledConnectors] = useState<boolean>(false);
+  const [fetchingCloudSource, setFetchingCloudSource] = useState<string | null>(
+    null
+  );
+  const [showAddSourcePicker, setShowAddSourcePicker] =
+    useState<boolean>(false);
+  const [visibleSecrets, setVisibleSecrets] = useState<Record<string, boolean>>(
+    {}
+  );
+  const [confirmingLogoutType, setConfirmingLogoutType] =
+    useState<ProviderType | null>(null);
 
   const jellyfinProvider =
     providers.find((p) => p.type === 'jellyfin') || providers[0];
-  const builtInProvider = providers.find((p) => p.type === 'built-in');
 
-  const jellyfinDisplayPrefsEndpoint = buildJellyfinDisplayPrefsUrl(
-    jellyfinProvider?.serverUrl || 'https://jellyfin.flockingreeds.farm',
-    jellyfinProvider?.userId || jellyfinProvider?.username || 'admin',
-    jellyfinProvider?.token
-  );
+  const jellyfinDisplayPrefsEndpoint = jellyfinProvider?.serverUrl?.trim()
+    ? buildJellyfinDisplayPrefsUrl(
+        jellyfinProvider.serverUrl,
+        jellyfinProvider.userId || jellyfinProvider.username || 'admin',
+        jellyfinProvider.token
+      )
+    : '/DisplayPreferences/brokeify?client=Brokeify';
 
   const handleFieldChange = (
     id: string,
@@ -75,6 +99,58 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
   ) => {
     const next = providers.map((p) =>
       p.id === id ? { ...p, [field]: value } : p
+    );
+    onUpdateProviders(next);
+  };
+
+  const handleSecretChange = (prov: ProviderConfig, rawValue: string) => {
+    const next = providers.map((p) => {
+      if (p.id !== prov.id) return p;
+      if (p.type === 'plex') {
+        return { ...p, token: rawValue, password: rawValue };
+      }
+      return {
+        ...p,
+        password: rawValue,
+        token: '',
+        authMode: 'password' as const,
+      };
+    });
+    onUpdateProviders(next);
+  };
+
+  const handleClearSecret = (prov: ProviderConfig) => {
+    if (prov.type === 'jellyfin') {
+      try {
+        localStorage.removeItem('jellyfin_token');
+        localStorage.removeItem('jellyfin_user_id');
+      } catch {
+        // ignore
+      }
+    }
+    const next = providers.map((p) =>
+      p.id === prov.id
+        ? {
+            ...p,
+            password: '',
+            token: '',
+            userId: '',
+            status: 'disconnected' as const,
+            diagnosticLog: 'Cleared saved credentials from localStorage.',
+            lastMessage: 'Cleared saved credentials.',
+          }
+        : p
+    );
+    onUpdateProviders(next);
+  };
+
+  const toggleSecretVisibility = (id: string) => {
+    setVisibleSecrets((prev) => ({ ...prev, [id]: !prev[id] }));
+  };
+
+  const handleActivateHiddenSource = (provId: string) => {
+    const next = providers.map((p) =>
+      p.id === provId ? { ...p, enabled: true } : p
     );
     onUpdateProviders(next);
   };
@@ -88,7 +164,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
           tracks,
           playlists: syncedPlaylists,
           restoredCloudSettings,
-        } = await MusicProviderManager.connectJellyfinOrEmby(provider);
+        } = await MusicProviderManager.fetchJellyfinMusic(provider);
 
         // Auto-turn OFF Built-In Demo Tracks once Jellyfin connects with real songs
         const shouldDisableDemo =
@@ -117,7 +193,10 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
           onMergeRemotePlaylists(syncedPlaylists);
         }
 
-        if (provider.type === 'jellyfin' && updatedConfig.status === 'connected') {
+        if (
+          provider.type === 'jellyfin' &&
+          updatedConfig.status === 'connected'
+        ) {
           if (restoredCloudSettings) {
             onApplyRestoredCloudSettings(restoredCloudSettings);
           } else {
@@ -146,7 +225,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
         const tracks = await MusicProviderManager.fetchRadioBrowserStations(
           selectedRadioTag
         );
-        const msg = `✅ Connected to Radio-Browser API -> Loaded ${tracks.length} live ${selectedRadioTag.toUpperCase()} stations`;
+        const msg = `✅ Connected! Loaded ${tracks.length} live ${selectedRadioTag.toUpperCase()} stations`;
         const updated: ProviderConfig = {
           ...provider,
           enabled: true,
@@ -160,8 +239,9 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
         );
         onMergeRemoteTracks(tracks, `Radio-Browser (${selectedRadioTag})`);
       } else if (provider.type === 'internet-archive') {
-        const tracks = await MusicProviderManager.fetchInternetArchiveTracks();
-        const msg = `✅ Connected to archive.org -> Loaded ${tracks.length} lossless/VBR live concert recordings`;
+        const tracks =
+          await MusicProviderManager.fetchInternetArchiveTracks();
+        const msg = `✅ Connected! Loaded ${tracks.length} lossless/VBR live concert recordings`;
         const updated: ProviderConfig = {
           ...provider,
           enabled: true,
@@ -175,7 +255,8 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
         );
         onMergeRemoteTracks(tracks, 'Internet Archive');
       } else {
-        const msg = '✅ Built-In Demo Tracks verified (6 full-length synth tracks ready)';
+        const msg =
+          '✅ Connected! Loaded 8 built-in synthwave & car-test tracks';
         const updated: ProviderConfig = {
           ...provider,
           enabled: true,
@@ -204,7 +285,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
   };
 
   const activeProviders = providers.filter((p) => p.enabled);
-  const disabledProviders = providers.filter((p) => !p.enabled);
+  const hiddenProviders = providers.filter((p) => !p.enabled);
 
   const renderConnectorCard = (prov: ProviderConfig) => {
     const isTesting = testingId === prov.id;
@@ -212,18 +293,18 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
     const isSelfHosted = ['jellyfin', 'emby', 'navidrome', 'plex'].includes(
       prov.type
     );
-    const useApiKeyMode = (prov.authMode || 'apikey') === 'apikey';
+    const currentSecretValue =
+      prov.type === 'plex' ? (prov.token ?? '') : (prov.password ?? '');
+    const isShowingSecret = Boolean(visibleSecrets[prov.id]);
     const diagnosticText = prov.diagnosticLog || prov.lastMessage;
+    const isConnectedSession =
+      prov.status === 'connected' || Boolean(prov.token?.trim());
 
     return (
       <div
         key={prov.id}
         data-testid={`connector-card-${prov.type}`}
-        className={`rounded-2xl border p-5 sm:p-6 flex flex-col justify-between gap-5 transition-colors ${
-          prov.enabled
-            ? 'border-zinc-800/90 bg-zinc-900/50'
-            : 'border-zinc-800/60 bg-zinc-950/60 opacity-90'
-        }`}
+        className="rounded-2xl border border-zinc-800/90 bg-zinc-900/50 p-5 sm:p-6 flex flex-col justify-between gap-5 transition-colors"
       >
         <div className="space-y-4">
           {/* Card Header + Sliding Toggle Switch */}
@@ -248,11 +329,11 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                 </h3>
                 <p className="text-xs text-zinc-400 font-mono truncate">
                   {isJellyfinOrEmby
-                    ? 'GET /Users?api_key=... OR POST /Users/AuthenticateByName'
+                    ? 'Quick Connect or Username & Password'
                     : prov.type === 'navidrome'
-                      ? '/rest/getPlaylists.view • /rest/stream.view?maxBitRate=320'
+                      ? 'Subsonic REST API v1.16.1'
                       : prov.type === 'plex'
-                        ? '/library/sections • X-Plex-Token'
+                        ? 'Plex Music Server (X-Plex-Token)'
                         : prov.serverUrl}
                 </p>
               </div>
@@ -269,42 +350,50 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
             />
           </div>
 
+          {/* Active Session Banner + Quick Connect / Log Out Bar for Jellyfin */}
+          {prov.type === 'jellyfin' && (
+            <div className="rounded-xl border border-zinc-800/90 bg-zinc-950/80 px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2.5">
+              <div className="flex items-center gap-2 text-xs">
+                {isConnectedSession ? (
+                  <>
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <span className="text-zinc-200">
+                      Signed in as{' '}
+                      <strong className="text-emerald-400">
+                        {prov.username || 'Jellyfin User'}
+                      </strong>
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-zinc-400">
+                    Sign in with{' '}
+                    <strong className="text-zinc-200">Quick Connect</strong> or
+                    enter your Username &amp; Password below.
+                  </span>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2">
+                {onOpenOnboardingModal && (
+                  <button
+                    type="button"
+                    onClick={onOpenOnboardingModal}
+                    data-testid="card-jellyfin-quickconnect-btn"
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500 hover:text-zinc-950 border border-emerald-500/40 px-2.5 py-1 text-xs font-bold text-emerald-300 transition-colors"
+                  >
+                    <Zap className="w-3.5 h-3.5" />
+                    <span>Quick Connect</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* Self-Hosted Server Configuration Fields */}
           {isSelfHosted && (
             <div className="space-y-3.5 pt-1">
-              {/* Jellyfin / Emby Explicit Auth Method Toggle: Direct API Key vs Username + Password */}
-              {isJellyfinOrEmby && (
-                <div className="rounded-xl border border-zinc-800/90 bg-zinc-950/80 px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex items-center gap-2 text-xs">
-                    <KeyRound className="w-4 h-4 text-emerald-400 shrink-0" />
-                    <span className="font-semibold text-zinc-200">
-                      Auth Method:{' '}
-                      <span className="text-emerald-400">
-                        {useApiKeyMode
-                          ? 'Method A — Direct Jellyfin API Key (Zero CORS Preflight)'
-                          : 'Method B — Username + Password'}
-                      </span>
-                    </span>
-                  </div>
-
-                  <SlidingToggle
-                    checked={useApiKeyMode}
-                    onChange={(useKey) =>
-                      handleFieldChange(
-                        prov.id,
-                        'authMode',
-                        useKey ? 'apikey' : 'password'
-                      )
-                    }
-                    label={useApiKeyMode ? 'Use API Key' : 'Use Password'}
-                    ariaLabel={`Use API Key vs Password for ${prov.name}`}
-                    size="sm"
-                    testId={`toggle-authmode-${prov.type}`}
-                  />
-                </div>
-              )}
-
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {/* Server URL */}
                 <div className="sm:col-span-2">
                   <label
                     htmlFor={`url-${prov.id}`}
@@ -315,42 +404,38 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                   <input
                     id={`url-${prov.id}`}
                     type="url"
-                    value={prov.serverUrl}
+                    value={prov.serverUrl ?? ''}
                     onChange={(e) =>
                       handleFieldChange(prov.id, 'serverUrl', e.target.value)
                     }
-                    placeholder="https://jellyfin.flockingreeds.farm"
-                    className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3.5 py-2 text-sm text-white placeholder-zinc-600 focus:border-emerald-500 focus:outline-none font-mono"
+                    placeholder="https://jellyfin.yourdomain.com"
+                    className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3.5 py-2 text-sm text-white placeholder-zinc-500 focus:border-emerald-500 focus:outline-none font-mono"
                   />
                 </div>
 
+                {/* Username */}
                 {prov.type !== 'plex' && (
                   <div>
                     <label
                       htmlFor={`user-${prov.id}`}
                       className="block text-xs font-medium text-zinc-400 mb-1"
                     >
-                      {isJellyfinOrEmby && useApiKeyMode
-                        ? 'Username (matches User ID, or blank for Admin)'
-                        : 'Username'}
+                      Username
                     </label>
                     <input
                       id={`user-${prov.id}`}
                       type="text"
-                      value={prov.username || ''}
+                      value={prov.username ?? ''}
                       onChange={(e) =>
                         handleFieldChange(prov.id, 'username', e.target.value)
                       }
-                      placeholder={
-                        isJellyfinOrEmby && useApiKeyMode
-                          ? 'Nicky (optional)'
-                          : 'Nicky'
-                      }
-                      className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3.5 py-2 text-sm text-white placeholder-zinc-600 focus:border-emerald-500 focus:outline-none"
+                      placeholder="Enter username (e.g., admin)"
+                      className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3.5 py-2 text-sm text-white placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
                     />
                   </div>
                 )}
 
+                {/* Password with Clear (X) and Show/Hide (Eye) buttons */}
                 <div className={prov.type === 'plex' ? 'sm:col-span-2' : ''}>
                   <label
                     htmlFor={`token-${prov.id}`}
@@ -358,44 +443,58 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                   >
                     {prov.type === 'plex'
                       ? 'X-Plex-Token'
-                      : prov.type === 'navidrome'
-                        ? 'Password or Subsonic Token'
-                        : useApiKeyMode
-                          ? 'Direct Jellyfin API Key (32-char hex)'
-                          : 'Account Password'}
+                      : 'Password'}
                   </label>
-                  <input
-                    id={`token-${prov.id}`}
-                    type="password"
-                    value={
-                      prov.type === 'plex'
-                        ? prov.token || ''
-                        : isJellyfinOrEmby && useApiKeyMode
-                          ? prov.password || prov.token || ''
-                          : prov.password || ''
-                    }
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      if (prov.type === 'plex') {
-                        handleFieldChange(prov.id, 'token', val);
-                      } else if (isJellyfinOrEmby && useApiKeyMode) {
-                        const next = providers.map((p) =>
-                          p.id === prov.id
-                            ? { ...p, password: val, token: val }
-                            : p
-                        );
-                        onUpdateProviders(next);
-                      } else {
-                        handleFieldChange(prov.id, 'password', val);
+                  <div className="relative flex items-center">
+                    <input
+                      id={`token-${prov.id}`}
+                      type={isShowingSecret ? 'text' : 'password'}
+                      value={currentSecretValue}
+                      onChange={(e) => handleSecretChange(prov, e.target.value)}
+                      placeholder={
+                        prov.type === 'plex'
+                          ? 'Paste your X-Plex-Token...'
+                          : isConnectedSession && !currentSecretValue
+                            ? 'Authenticated via Session Token (or enter password)'
+                            : 'Enter your password...'
                       }
-                    }}
-                    placeholder={
-                      isJellyfinOrEmby && useApiKeyMode
-                        ? 'Paste 32-char Jellyfin API Key...'
-                        : '••••••••••••'
-                    }
-                    className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3.5 py-2 text-sm text-white placeholder-zinc-600 focus:border-emerald-500 focus:outline-none font-mono"
-                  />
+                      className="w-full rounded-xl border border-zinc-800 bg-zinc-950 pl-3.5 pr-20 py-2 text-sm text-white placeholder-zinc-500 focus:border-emerald-500 focus:outline-none font-mono"
+                    />
+
+                    <div className="absolute right-1.5 flex items-center gap-0.5">
+                      <button
+                        type="button"
+                        onClick={() => handleClearSecret(prov)}
+                        aria-label={`Clear saved password for ${prov.name}`}
+                        title="Clear password"
+                        data-testid={`clear-secret-${prov.type}`}
+                        className="rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-rose-400 transition-colors"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => toggleSecretVisibility(prov.id)}
+                        aria-label={
+                          isShowingSecret
+                            ? `Hide password for ${prov.name}`
+                            : `Show password for ${prov.name}`
+                        }
+                        title={
+                          isShowingSecret ? 'Hide password' : 'Show password'
+                        }
+                        data-testid={`toggle-show-secret-${prov.type}`}
+                        className="rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-white transition-colors"
+                      >
+                        {isShowingSecret ? (
+                          <EyeOff className="w-4 h-4 text-emerald-400" />
+                        ) : (
+                          <Eye className="w-4 h-4" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -433,29 +532,37 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
           <div className="flex items-center justify-between gap-3">
             <span className="text-xs font-mono text-zinc-400 tabular-nums">
               {prov.trackCount !== undefined && prov.trackCount > 0
-                ? `${prov.trackCount} songs${
-                    prov.playlistCount ? ` & ${prov.playlistCount} playlists` : ''
+                ? `${prov.trackCount} tracks${
+                    prov.playlistCount
+                      ? ` & ${prov.playlistCount} playlists`
+                      : ''
                   } mounted`
                 : `Status: ${prov.status.toUpperCase()}`}
             </span>
 
-            <button
-              type="button"
-              onClick={() => handleTestAndSync(prov)}
-              disabled={isTesting}
-              data-testid={`test-connection-${prov.type}`}
-              className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 px-4 py-2 text-xs font-bold text-zinc-950 transition-colors whitespace-nowrap shrink-0 min-h-[40px]"
-            >
-              {isTesting ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              ) : (
-                <RefreshCw className="w-3.5 h-3.5" />
-              )}
-              <span>Test Connection</span>
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => handleTestAndSync(prov)}
+                disabled={isTesting}
+                data-testid={`test-connection-${prov.type}`}
+                className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 px-4 py-2 text-xs font-bold text-zinc-950 transition-colors whitespace-nowrap shrink-0 min-h-[40px]"
+              >
+                {isTesting ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="w-3.5 h-3.5" />
+                )}
+                <span>
+                  {isConnectedSession && !currentSecretValue
+                    ? 'Sync Library & Playlists'
+                    : 'Connect & Save'}
+                </span>
+              </button>
+            </div>
           </div>
 
-          {/* Live Diagnostic Log Box beneath Test Connection */}
+          {/* Live Diagnostic Log Box beneath Connect & Save */}
           <div
             data-testid={`diagnostic-log-${prov.type}`}
             className={`rounded-xl border px-3.5 py-2.5 text-xs font-mono leading-relaxed flex items-start gap-2 ${
@@ -482,8 +589,11 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
 
   return (
     <div className="space-y-8">
-      {/* Section 1: Active / Enabled Connectors (Expanded by Default) */}
-      <section aria-labelledby="active-connectors-heading" className="space-y-4">
+      {/* Section 1: Active Music Sources (Only active connectors are shown; others stay hidden until activated) */}
+      <section
+        aria-labelledby="active-connectors-heading"
+        className="space-y-4"
+      >
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-zinc-800/80 pb-4">
           <div>
             <h2
@@ -493,37 +603,86 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
               Active Music Sources ({activeProviders.length} Enabled)
             </h2>
             <p className="text-sm text-zinc-400 mt-0.5">
-              Connect Jellyfin via Direct API Key or Password. Zero fake fallback
-              tracks — only your real server songs and playlists are mounted.
+              Sign in with Quick Connect or your Username &amp; Password.
+              Additional sources stay tucked away until you activate them.
             </p>
           </div>
 
-          {/* Quick Toggle for Built-In Demo Tracks */}
-          {builtInProvider && (
-            <div className="rounded-xl border border-zinc-800 bg-zinc-900/70 px-3.5 py-2 flex items-center gap-3 shrink-0">
-              <SlidingToggle
-                checked={builtInProvider.enabled}
-                onChange={(nextChecked) =>
-                  handleFieldChange(builtInProvider.id, 'enabled', nextChecked)
-                }
-                label="Built-In Demo Tracks"
-                ariaLabel="Toggle Built-In Demo Tracks"
-                size="sm"
-                testId="quick-toggle-builtin-demo"
-              />
-            </div>
-          )}
+          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+            {onOpenOnboardingModal && (
+              <button
+                type="button"
+                onClick={onOpenOnboardingModal}
+                data-testid="sources-open-onboarding-btn"
+                className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 px-4 py-2 text-xs font-bold text-zinc-950 transition-colors whitespace-nowrap shrink-0 min-h-[38px]"
+              >
+                <Zap className="w-3.5 h-3.5" />
+                <span>Quick Connect / Login</span>
+              </button>
+            )}
+
+            {hiddenProviders.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowAddSourcePicker(!showAddSourcePicker)}
+                data-testid="toggle-add-sources-picker"
+                className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-900 hover:border-emerald-500/50 hover:text-white px-3.5 py-2 text-xs font-semibold text-zinc-200 transition-colors whitespace-nowrap shrink-0 min-h-[38px]"
+              >
+                <Plus className="w-3.5 h-3.5 text-emerald-400" />
+                <span>
+                  {showAddSourcePicker
+                    ? 'Hide Extra Sources'
+                    : `Activate Another Source (${hiddenProviders.length})`}
+                </span>
+              </button>
+            )}
+          </div>
         </div>
 
+        {/* Compact Pop-Out Picker for Hidden Connectors */}
+        {showAddSourcePicker && hiddenProviders.length > 0 && (
+          <div
+            data-testid="hidden-sources-picker"
+            className="rounded-2xl border border-emerald-500/30 bg-zinc-900/60 p-4 space-y-2.5"
+          >
+            <div className="text-xs font-semibold text-zinc-300">
+              Select a music source to activate its connector card:
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {hiddenProviders.map((hp) => (
+                <button
+                  key={hp.id}
+                  type="button"
+                  onClick={() => handleActivateHiddenSource(hp.id)}
+                  data-testid={`activate-source-${hp.type}`}
+                  className="inline-flex items-center gap-2 rounded-xl border border-zinc-700 bg-zinc-950 hover:border-emerald-500 hover:bg-emerald-500/15 px-3.5 py-2 text-xs font-bold text-white transition-all"
+                >
+                  <Plus className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>{hp.name}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         {activeProviders.length === 0 ? (
-          <div className="rounded-2xl border border-zinc-800/80 bg-zinc-900/30 p-8 text-center space-y-2">
+          <div className="rounded-2xl border border-zinc-800/80 bg-zinc-900/30 p-8 text-center space-y-3">
             <p className="text-sm text-zinc-300 font-semibold">
-              No music sources are currently toggled ON.
+              No music sources are currently active.
             </p>
-            <p className="text-xs text-zinc-400">
-              Expand &ldquo;Other Available Connectors&rdquo; below to enable
-              Jellyfin or another source.
-            </p>
+            <div className="flex flex-wrap items-center justify-center gap-2">
+              {hiddenProviders.map((hp) => (
+                <button
+                  key={hp.id}
+                  type="button"
+                  onClick={() => handleActivateHiddenSource(hp.id)}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 px-3.5 py-2 text-xs font-bold text-zinc-950 transition-colors"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Activate {hp.name}</span>
+                </button>
+              ))}
+            </div>
           </div>
         ) : (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -532,50 +691,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
         )}
       </section>
 
-      {/* Section 2: Collapsible Accordion for Disabled / Unused Connectors */}
-      {disabledProviders.length > 0 && (
-        <section
-          aria-labelledby="disabled-connectors-heading"
-          className="rounded-2xl border border-zinc-800/90 bg-zinc-900/30 overflow-hidden"
-        >
-          <button
-            type="button"
-            onClick={() => setShowDisabledConnectors(!showDisabledConnectors)}
-            aria-expanded={showDisabledConnectors}
-            data-testid="other-connectors-accordion-btn"
-            className="w-full px-5 sm:px-6 py-4 flex items-center justify-between gap-4 text-left hover:bg-zinc-900/60 transition-colors"
-          >
-            <div>
-              <h2
-                id="disabled-connectors-heading"
-                className="text-base font-bold text-white tracking-tight"
-              >
-                Other Available Connectors ({disabledProviders.length} Hidden - Tap
-                to Expand)
-              </h2>
-              <p className="text-xs text-zinc-400 mt-0.5">
-                {disabledProviders.map((d) => d.name).join(' · ')}
-              </p>
-            </div>
-            <div className="flex items-center gap-2 text-xs font-semibold text-emerald-400 shrink-0">
-              <span>{showDisabledConnectors ? 'Collapse' : 'Expand'}</span>
-              {showDisabledConnectors ? (
-                <ChevronUp className="w-4 h-4" />
-              ) : (
-                <ChevronDown className="w-4 h-4" />
-              )}
-            </div>
-          </button>
-
-          {showDisabledConnectors && (
-            <div className="p-5 sm:p-6 pt-2 border-t border-zinc-800/80 grid grid-cols-1 lg:grid-cols-2 gap-6">
-              {disabledProviders.map((prov) => renderConnectorCard(prov))}
-            </div>
-          )}
-        </section>
-      )}
-
-      {/* Section 3: Zero-Logout Persistence & Jellyfin Cloud Settings Sync */}
+      {/* Section 2: Zero-Logout Persistence & Jellyfin Cloud Settings Sync */}
       <section
         aria-labelledby="cloud-sync-heading"
         className="rounded-2xl border border-zinc-800/90 bg-zinc-900/40 p-6 space-y-5"
@@ -588,7 +704,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                 id="cloud-sync-heading"
                 className="text-lg font-bold text-white tracking-tight"
               >
-                Zero-Logout Persistence & Jellyfin Cloud Settings Sync
+                Zero-Logout Persistence &amp; Jellyfin Cloud Settings Sync
               </h2>
             </div>
             <p className="text-xs text-zinc-400">
@@ -606,7 +722,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
               className="inline-flex items-center gap-2 rounded-xl border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 px-3.5 py-2 text-xs font-semibold text-white transition-colors whitespace-nowrap shrink-0 min-h-[40px]"
             >
               <CloudDownload className="w-4 h-4 text-emerald-400" />
-              <span>Pull & Restore from Jellyfin</span>
+              <span>Pull &amp; Restore from Jellyfin</span>
             </button>
 
             <button
@@ -627,7 +743,10 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
               <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
               <span>Android Chrome Storage Lock</span>
             </div>
-            <p className="text-zinc-400 font-mono" data-testid="storage-persist-status">
+            <p
+              className="text-zinc-400 font-mono"
+              data-testid="storage-persist-status"
+            >
               {storagePersistStatus.message}
             </p>
           </div>
@@ -638,8 +757,8 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
               <span>Zero-Logout Auth Token Guard</span>
             </div>
             <p className="text-zinc-400">
-              Saved Jellyfin, Navidrome, Emby & Plex tokens are never cleared on
-              network timeout or offline errors.
+              Saved Jellyfin, Navidrome, Emby &amp; Plex tokens are never
+              cleared on network timeout or offline errors.
             </p>
           </div>
 
@@ -655,10 +774,87 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
             >
               {jellyfinDisplayPrefsEndpoint}
             </p>
-            <p className="text-zinc-400" data-testid="cloud-sync-status-message">
+            <p
+              className="text-zinc-400"
+              data-testid="cloud-sync-status-message"
+            >
               {cloudSyncStatus.message}
             </p>
           </div>
+        </div>
+      </section>
+
+      {/* Section 3: Tucked-Away Account & Session Controls (Safe 2-Step Sign Out at Bottom) */}
+      <section
+        aria-labelledby="account-session-heading"
+        data-testid="account-session-footer"
+        className="rounded-2xl border border-zinc-800/80 bg-zinc-950/60 p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4"
+      >
+        <div className="space-y-1">
+          <h3
+            id="account-session-heading"
+            className="text-sm font-bold text-zinc-200 flex items-center gap-2"
+          >
+            <LogOut className="w-4 h-4 text-zinc-400 shrink-0" />
+            <span>Account &amp; Session Management</span>
+          </h3>
+          <p className="text-xs text-zinc-400">
+            Need to switch accounts or reset your server login? Sign out safely below (requires 2-tap confirmation so you never hit it by accident).
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          {activeProviders
+            .filter((p) =>
+              ['jellyfin', 'emby', 'navidrome', 'plex'].includes(p.type)
+            )
+            .map((prov) => {
+              const isConfirming = confirmingLogoutType === prov.type;
+              return isConfirming ? (
+                <div
+                  key={`logout-confirm-${prov.id}`}
+                  className="inline-flex items-center gap-2 rounded-xl border border-rose-500/50 bg-rose-950/40 p-1.5"
+                >
+                  <span className="text-xs font-semibold text-rose-200 px-2">
+                    Sign out of {prov.name}?
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setConfirmingLogoutType(null);
+                      if (onLogoutProvider) {
+                        onLogoutProvider(prov.type);
+                      } else {
+                        handleClearSecret(prov);
+                      }
+                    }}
+                    data-testid={`confirm-logout-provider-${prov.type}`}
+                    className="rounded-lg bg-rose-500 hover:bg-rose-400 px-3 py-1.5 text-xs font-bold text-white transition-colors"
+                  >
+                    Yes, Log Out
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmingLogoutType(null)}
+                    data-testid={`cancel-logout-provider-${prov.type}`}
+                    className="rounded-lg bg-zinc-800 hover:bg-zinc-700 px-2.5 py-1.5 text-xs font-semibold text-zinc-300 transition-colors"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button
+                  key={`logout-btn-${prov.id}`}
+                  type="button"
+                  onClick={() => setConfirmingLogoutType(prov.type)}
+                  data-testid={`logout-provider-${prov.type}`}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-800 bg-zinc-900 hover:border-rose-500/40 hover:text-rose-300 px-3.5 py-2 text-xs font-semibold text-zinc-400 transition-colors min-h-[38px]"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span>Log Out of {prov.name}</span>
+                </button>
+              );
+            })}
         </div>
       </section>
     </div>

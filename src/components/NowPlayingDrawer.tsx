@@ -16,8 +16,10 @@ import {
   Sliders,
   Volume2,
   VolumeX,
+  Wand2,
 } from 'lucide-react';
 import type { EQPresetName, RepeatMode, Track } from '../types/music';
+import { createAlbumArtworkDataUri } from '../utils/artworkGenerator';
 
 interface NowPlayingDrawerProps {
   isOpen: boolean;
@@ -47,6 +49,7 @@ interface NowPlayingDrawerProps {
   onCycleRepeat: () => void;
   onToggleCarVolumeLeveler: () => void;
   onPlaySpecificTrack: (track: Track) => void;
+  onMoreLikeThis: (track: Track) => void;
   onOpenCarMode: () => void;
   onOpenAudioLab: () => void;
 }
@@ -86,10 +89,13 @@ export const NowPlayingDrawer: React.FC<NowPlayingDrawerProps> = ({
   onCycleRepeat,
   onToggleCarVolumeLeveler,
   onPlaySpecificTrack,
+  onMoreLikeThis,
   onOpenCarMode,
   onOpenAudioLab,
 }) => {
   if (!isOpen || !currentTrack) return null;
+
+  const isCurrentCached = cachedTrackIds.has(currentTrack.id);
 
   return (
     <div
@@ -106,17 +112,35 @@ export const NowPlayingDrawer: React.FC<NowPlayingDrawerProps> = ({
       >
         {/* Drag Handle & Header */}
         <div className="w-12 h-1.5 bg-zinc-700 rounded-full mx-auto mb-5" />
-        <div className="flex items-center justify-between gap-4 border-b border-zinc-800/80 pb-4">
-          <div>
-            <span className="text-xs font-mono text-emerald-400 uppercase tracking-wider">
-              Now Playing · {currentTrack.sourceName}
-            </span>
-            <h2 className="text-lg font-bold text-white">
+        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-zinc-800/80 pb-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-mono text-emerald-400 uppercase tracking-wider">
+                Now Playing · {currentTrack.sourceName}
+              </span>
+              {isCurrentCached && (
+                <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 border border-emerald-500/40 px-2.5 py-0.5 text-[11px] font-mono font-semibold text-emerald-300">
+                  <CheckCircle2 className="w-3 h-3" />
+                  Pre-Loaded &amp; Ready
+                </span>
+              )}
+            </div>
+            <h2 className="text-lg font-bold text-white truncate">
               {currentTrack.album}
             </h2>
           </div>
 
           <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => onMoreLikeThis(currentTrack)}
+              data-testid="drawer-more-like-this-btn"
+              className="inline-flex items-center gap-1.5 rounded-xl bg-purple-600 hover:bg-purple-500 px-3.5 py-2 text-xs font-bold text-white shadow-sm shadow-purple-500/20 transition-colors min-h-[40px]"
+            >
+              <Wand2 className="w-3.5 h-3.5" />
+              <span>More Like This 🪄</span>
+            </button>
+
             <button
               type="button"
               onClick={() => {
@@ -126,7 +150,7 @@ export const NowPlayingDrawer: React.FC<NowPlayingDrawerProps> = ({
               className="inline-flex items-center gap-2 rounded-xl bg-emerald-500/15 border border-emerald-500/40 px-3.5 py-2 text-xs font-semibold text-emerald-300 hover:bg-emerald-500 hover:text-zinc-950 transition-colors min-h-[40px]"
             >
               <Car className="w-4 h-4" />
-              <span>Car Mode</span>
+              <span>Car Mode 🚗</span>
             </button>
 
             <button
@@ -150,6 +174,15 @@ export const NowPlayingDrawer: React.FC<NowPlayingDrawerProps> = ({
                 src={currentTrack.artworkUrl}
                 alt={currentTrack.title}
                 referrerPolicy="no-referrer"
+                onError={(e) => {
+                  e.currentTarget.onerror = null;
+                  e.currentTarget.src = createAlbumArtworkDataUri(
+                    currentTrack.title,
+                    currentTrack.artist,
+                    currentTrack.accentColor || '#10b981',
+                    '#09090b'
+                  );
+                }}
                 className="w-40 h-40 sm:w-48 sm:h-48 rounded-2xl border border-zinc-800 object-cover shadow-2xl shrink-0"
               />
               <div className="space-y-3 text-center sm:text-left min-w-0 flex-1">
@@ -165,6 +198,12 @@ export const NowPlayingDrawer: React.FC<NowPlayingDrawerProps> = ({
                   <span>{currentTrack.bitrateKbps || 320} kbps</span>
                   <span aria-hidden="true">·</span>
                   <span>LUFS {currentTrack.normalizationGain ?? 0} dB</span>
+                  {currentTrack.genre && (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <span className="text-purple-300">{currentTrack.genre}</span>
+                    </>
+                  )}
                 </div>
 
                 {/* Live Web Audio Spectrum Bars */}
@@ -176,7 +215,7 @@ export const NowPlayingDrawer: React.FC<NowPlayingDrawerProps> = ({
                     <div
                       key={idx}
                       className="w-2 rounded-t bg-emerald-400/80 transition-all duration-150"
-                      style={{ height: `${ isPlaying ? Math.max(15, val) : 15 }%` }}
+                      style={{ height: `${isPlaying ? Math.max(15, val) : 15}%` }}
                     />
                   ))}
                 </div>
@@ -372,7 +411,7 @@ export const NowPlayingDrawer: React.FC<NowPlayingDrawerProps> = ({
                         ) : isCached ? (
                           <span className="text-emerald-400 inline-flex items-center gap-1 font-mono font-semibold">
                             <CheckCircle2 className="w-3 h-3" />
-                            Pre-loaded
+                            Pre-Loaded &amp; Ready
                           </span>
                         ) : (
                           <span className="font-mono">{track.sourceName}</span>
@@ -380,13 +419,25 @@ export const NowPlayingDrawer: React.FC<NowPlayingDrawerProps> = ({
                       </div>
                     </div>
 
-                    <button
-                      type="button"
-                      onClick={() => onPlaySpecificTrack(track)}
-                      className="rounded-lg bg-zinc-800 hover:bg-emerald-500 hover:text-zinc-950 px-3 py-1.5 text-xs font-semibold text-zinc-200 transition-colors shrink-0 min-h-[36px]"
-                    >
-                      {isCurrent && isPlaying ? 'Playing' : 'Play'}
-                    </button>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => onMoreLikeThis(track)}
+                        title={`More Like ${track.title} 🪄`}
+                        aria-label={`Create Instant Mix based on ${track.title}`}
+                        className="rounded-lg border border-purple-500/40 bg-purple-500/15 hover:bg-purple-500 hover:text-white px-2.5 py-1.5 text-xs font-semibold text-purple-300 transition-colors min-h-[36px]"
+                      >
+                        🪄
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => onPlaySpecificTrack(track)}
+                        className="rounded-lg bg-zinc-800 hover:bg-emerald-500 hover:text-zinc-950 px-3 py-1.5 text-xs font-semibold text-zinc-200 transition-colors shrink-0 min-h-[36px]"
+                      >
+                        {isCurrent && isPlaying ? 'Playing' : 'Play'}
+                      </button>
+                    </div>
                   </div>
                 );
               })}

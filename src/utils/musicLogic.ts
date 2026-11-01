@@ -65,12 +65,144 @@ export function lufsToLinearGain(normalizationGainDb?: number): number {
 }
 
 /**
- * Builds the Jellyfin / Emby X-Emby-Authorization header value.
+ * Builds the Jellyfin / Emby Authorization header value:
+ * MediaBrowser Client="Brokeify", Device="BrokeifyWeb", DeviceId="brokeify-01", Version="2.0.0"
  */
 export function buildEmbyAuthHeader(token?: string): string {
   const base =
     'MediaBrowser Client="Brokeify", Device="BrokeifyWeb", DeviceId="brokeify-01", Version="2.0.0"';
-  return token ? `${base}, Token="${token}"` : base;
+  return token ? `${base}, Token="${token.trim()}"` : base;
+}
+
+/**
+ * Builds the standard authenticated Jellyfin request headers with both X-Emby-Token and Authorization.
+ */
+export function buildJellyfinAuthHeaders(token: string): Record<string, string> {
+  const cleanToken = token.trim();
+  return {
+    Accept: 'application/json',
+    'X-Emby-Token': cleanToken,
+    Authorization: `MediaBrowser Client="Brokeify", Device="BrokeifyWeb", DeviceId="brokeify-01", Version="2.0.0", Token="${cleanToken}"`,
+  };
+}
+
+/**
+ * Builds Jellyfin Public System Info URL: GET {serverUrl}/System/Info/Public
+ */
+export function buildJellyfinPublicSystemInfoUrl(serverUrl: string): string {
+  const cleanBase = serverUrl.trim().replace(/\/+$/, '');
+  return `${cleanBase}/System/Info/Public`;
+}
+
+/**
+ * Builds Jellyfin Quick Connect endpoints:
+ * - Initiate: POST {serverUrl}/QuickConnect/Initiate
+ * - Poll: GET {serverUrl}/QuickConnect/Connect?Secret={secret}
+ * - Authenticate: POST {serverUrl}/Users/AuthenticateWithQuickConnect
+ */
+export function buildJellyfinQuickConnectInitiateUrl(serverUrl: string): string {
+  const cleanBase = serverUrl.trim().replace(/\/+$/, '');
+  return `${cleanBase}/QuickConnect/Initiate`;
+}
+
+export function buildJellyfinQuickConnectPollUrl(
+  serverUrl: string,
+  secret: string
+): string {
+  const cleanBase = serverUrl.trim().replace(/\/+$/, '');
+  return `${cleanBase}/QuickConnect/Connect?Secret=${encodeURIComponent(
+    secret.trim()
+  )}`;
+}
+
+export function buildJellyfinQuickConnectAuthUrl(serverUrl: string): string {
+  const cleanBase = serverUrl.trim().replace(/\/+$/, '');
+  return `${cleanBase}/Users/AuthenticateWithQuickConnect`;
+}
+
+/**
+ * Builds Jellyfin /Users/Me endpoint with ?api_key={token} fallback.
+ */
+export function buildJellyfinUsersMeUrl(
+  serverUrl: string,
+  token: string
+): string {
+  const cleanBase = serverUrl.trim().replace(/\/+$/, '');
+  return `${cleanBase}/Users/Me?api_key=${encodeURIComponent(token.trim())}`;
+}
+
+/**
+ * Builds Jellyfin User-scoped Audio & Playlist endpoints with ?api_key={token} fallback:
+ * - Audio: ${serverUrl}/Users/${userId}/Items?IncludeItemTypes=Audio&Recursive=true&Fields=MediaSources,NormalizationGain,Album,Artists&Limit=3000&api_key=${token}
+ * - Playlists: ${serverUrl}/Users/${userId}/Items?IncludeItemTypes=Playlist&Recursive=true&api_key=${token}
+ * - Playlist Items: ${serverUrl}/Playlists/${playlistId}/Items?UserId=${userId}&Fields=MediaSources,NormalizationGain&api_key=${token}
+ */
+export function buildJellyfinUserAudioItemsUrl(
+  serverUrl: string,
+  userId: string,
+  token: string
+): string {
+  const cleanBase = serverUrl.trim().replace(/\/+$/, '');
+  return `${cleanBase}/Users/${encodeURIComponent(
+    userId.trim()
+  )}/Items?IncludeItemTypes=Audio&Recursive=true&Fields=MediaSources,NormalizationGain,Album,Artists&Limit=3000&api_key=${encodeURIComponent(
+    token.trim()
+  )}`;
+}
+
+export function buildJellyfinUserPlaylistsUrl(
+  serverUrl: string,
+  userId: string,
+  token: string
+): string {
+  const cleanBase = serverUrl.trim().replace(/\/+$/, '');
+  return `${cleanBase}/Users/${encodeURIComponent(
+    userId.trim()
+  )}/Items?IncludeItemTypes=Playlist&Recursive=true&api_key=${encodeURIComponent(
+    token.trim()
+  )}`;
+}
+
+export function buildJellyfinPlaylistItemsUrl(
+  serverUrl: string,
+  playlistId: string,
+  userId: string,
+  token: string
+): string {
+  const cleanBase = serverUrl.trim().replace(/\/+$/, '');
+  const userParam = userId.trim()
+    ? `UserId=${encodeURIComponent(userId.trim())}&`
+    : '';
+  return `${cleanBase}/Playlists/${encodeURIComponent(
+    playlistId.trim()
+  )}/Items?${userParam}Fields=MediaSources,NormalizationGain&api_key=${encodeURIComponent(
+    token.trim()
+  )}`;
+}
+
+/**
+ * Builds Jellyfin Direct API Key global items endpoints:
+ * - Audio: GET {serverUrl}/Items?IncludeItemTypes=Audio&Recursive=true&Fields=MediaSources,NormalizationGain,Album,Artists&Limit=3000&api_key={apiKey}
+ * - Playlists: GET {serverUrl}/Items?IncludeItemTypes=Playlist&Recursive=true&api_key={apiKey}
+ */
+export function buildJellyfinGlobalAudioItemsUrl(
+  serverUrl: string,
+  apiKey: string
+): string {
+  const cleanBase = serverUrl.trim().replace(/\/+$/, '');
+  return `${cleanBase}/Items?IncludeItemTypes=Audio&Recursive=true&Fields=MediaSources,NormalizationGain,Album,Artists&Limit=3000&api_key=${encodeURIComponent(
+    apiKey.trim()
+  )}`;
+}
+
+export function buildJellyfinGlobalPlaylistsUrl(
+  serverUrl: string,
+  apiKey: string
+): string {
+  const cleanBase = serverUrl.trim().replace(/\/+$/, '');
+  return `${cleanBase}/Items?IncludeItemTypes=Playlist&Recursive=true&api_key=${encodeURIComponent(
+    apiKey.trim()
+  )}`;
 }
 
 /**
@@ -117,30 +249,99 @@ export function matchJellyfinUserFromList(
 }
 
 /**
- * Builds a Jellyfin or Emby stream URL:
- * Universal: {serverUrl}/Audio/{itemId}/universal?UserId={userId}&DeviceId=brokeify-01&MaxStreamingBitrate=320000&Container=opus,mp3,aac,flac,wav&AudioCodec=mp3&api_key={token}
- * Direct fallback: {serverUrl}/Items/{itemId}/Download?api_key={token}
+ * Builds a Jellyfin or Emby progressive HTTP stream URL:
+ * Primary: ${serverUrl}/Audio/${trackId}/universal?UserId=${userId}&DeviceId=brokeify-01&MaxStreamingBitrate=140000000&Container=mp3,flac,aac,m4a,ogg,wav,opus,webma,webm&TranscodingContainer=mp3&TranscodingProtocol=http&AudioCodec=mp3&api_key=${token}
+ * Direct static fallback: ${serverUrl}/Audio/${trackId}/stream?static=true&api_key=${token}
  */
 export function buildJellyfinStreamUrl(
   serverUrl: string,
   itemId: string,
   token: string,
-  userId = 'brokeify-user',
+  userId = '',
   directDownload = false
 ): string {
   const cleanBase = serverUrl.trim().replace(/\/+$/, '');
+  const rawItemId = itemId.replace(/^(jellyfin|emby)-/, '').trim();
+  const cleanToken = token.trim();
+  const cleanUserId = userId.trim();
   if (directDownload) {
-    return `${cleanBase}/Items/${encodeURIComponent(itemId)}/Download?api_key=${encodeURIComponent(token)}`;
+    return `${cleanBase}/Audio/${encodeURIComponent(rawItemId)}/stream?static=true&api_key=${encodeURIComponent(cleanToken)}`;
   }
-  const params = new URLSearchParams({
-    UserId: userId,
-    DeviceId: 'brokeify-01',
-    MaxStreamingBitrate: '320000',
-    Container: 'opus,mp3,aac,flac,wav',
-    AudioCodec: 'mp3',
-    api_key: token,
-  });
-  return `${cleanBase}/Audio/${encodeURIComponent(itemId)}/universal?${params.toString()}`;
+  const userQuery = cleanUserId
+    ? `UserId=${encodeURIComponent(cleanUserId)}&`
+    : '';
+  return `${cleanBase}/Audio/${encodeURIComponent(rawItemId)}/universal?${userQuery}DeviceId=brokeify-01&MaxStreamingBitrate=140000000&Container=mp3,flac,aac,m4a,ogg,wav,opus,webma,webm&TranscodingContainer=mp3&TranscodingProtocol=http&AudioCodec=mp3&api_key=${encodeURIComponent(cleanToken)}`;
+}
+
+/**
+ * Builds an ordered list of progressive HTTP stream URLs for a Jellyfin/Emby track
+ * so native HTML5 <audio> playback automatically falls back across static stream,
+ * universal HTTP stream, explicit MP3 stream, and raw Download stream.
+ */
+export function buildJellyfinStreamCandidates(
+  track: Pick<Track, 'id' | 'source' | 'streamUrl' | 'fallbackStreamUrl'>,
+  latestToken?: string,
+  latestUserId?: string
+): string[] {
+  if (track.source !== 'jellyfin' && track.source !== 'emby') {
+    return [track.streamUrl, track.fallbackStreamUrl].filter(
+      (u): u is string => Boolean(u && u.trim())
+    );
+  }
+
+  const rawItemId = track.id.replace(/^(jellyfin|emby)-/, '').trim();
+  let baseUrl = '';
+  let parsedToken = (latestToken ?? '').trim();
+  let parsedUserId = (latestUserId ?? '').trim();
+
+  const sourceUrl = track.streamUrl || track.fallbackStreamUrl || '';
+  try {
+    const u = new URL(sourceUrl);
+    const pathMatch = u.pathname.match(/^(.*?)\/(?:Audio|Items)\//i);
+    const basePath = pathMatch ? pathMatch[1] : '';
+    baseUrl = `${u.origin}${basePath}`.replace(/\/+$/, '');
+    if (!parsedToken) {
+      parsedToken = (
+        u.searchParams.get('api_key') ||
+        u.searchParams.get('ApiKey') ||
+        ''
+      ).trim();
+    }
+    if (!parsedUserId) {
+      parsedUserId = (
+        u.searchParams.get('UserId') ||
+        u.searchParams.get('userId') ||
+        ''
+      ).trim();
+    }
+  } catch {
+    // Fallback if URL parsing fails
+  }
+
+  if (!baseUrl || !rawItemId || !parsedToken) {
+    return [track.streamUrl, track.fallbackStreamUrl].filter(
+      (u): u is string => Boolean(u && u.trim())
+    );
+  }
+
+  const encId = encodeURIComponent(rawItemId);
+  const encToken = encodeURIComponent(parsedToken);
+  const userQuery = parsedUserId
+    ? `UserId=${encodeURIComponent(parsedUserId)}&`
+    : '';
+
+  const candidates = [
+    // 1. Direct static byte-range stream (fastest start, zero transcoding overhead)
+    `${baseUrl}/Audio/${encId}/stream?static=true&api_key=${encToken}`,
+    // 2. Universal HTTP progressive stream (direct plays supported containers, transcodes others to HTTP MP3)
+    `${baseUrl}/Audio/${encId}/universal?${userQuery}DeviceId=brokeify-01&MaxStreamingBitrate=140000000&Container=mp3,flac,aac,m4a,ogg,wav,opus,webma,webm&TranscodingContainer=mp3&TranscodingProtocol=http&AudioCodec=mp3&api_key=${encToken}`,
+    // 3. Explicit progressive MP3 stream fallback (in case browser rejects original container e.g. WMA/ALAC)
+    `${baseUrl}/Audio/${encId}/stream.mp3?AudioCodec=mp3&AudioBitrate=320000&api_key=${encToken}`,
+    // 4. Direct Item Download endpoint
+    `${baseUrl}/Items/${encId}/Download?api_key=${encToken}`,
+  ];
+
+  return Array.from(new Set(candidates));
 }
 
 /**
@@ -482,4 +683,112 @@ export function mergeProvidersPreservingAuth(
 
   return Array.from(byId.values());
 }
+
+/**
+ * Builds the Jellyfin InstantMix endpoint URL:
+ * GET {serverUrl}/Items/{trackId}/InstantMix?[UserId={userId}&]Limit=25&Fields=MediaSources,NormalizationGain,Album,Artists,Genres&api_key={token}
+ */
+export function buildJellyfinInstantMixUrl(
+  serverUrl: string,
+  trackId: string,
+  token: string,
+  userId = '',
+  limit = 25
+): string {
+  const cleanBase = serverUrl.trim().replace(/\/+$/, '');
+  const rawItemId = trackId.replace(/^(jellyfin|emby)-/, '');
+  const params = new URLSearchParams();
+  if (userId && userId.trim()) {
+    params.set('UserId', userId.trim());
+  }
+  params.set('Limit', String(limit));
+  params.set('Fields', 'MediaSources,NormalizationGain,Album,Artists,Genres');
+  if (token && token.trim()) {
+    params.set('api_key', token.trim());
+  }
+  return `${cleanBase}/Items/${encodeURIComponent(rawItemId)}/InstantMix?${params.toString()}`;
+}
+
+/**
+ * Smart Client-Side Instant Mix Engine:
+ * Scores library tracks by genre, tags, tempo/BPM, and acoustic/synth vibe,
+ * prioritizes high-affinity matches, and shuffles up to `limit` (25) tracks with `seedTrack` leading.
+ */
+export function buildClientInstantMix(
+  seedTrack: Track,
+  catalog: readonly Track[],
+  limit = 25,
+  randomFn: () => number = Math.random
+): Track[] {
+  if (catalog.length === 0) return [seedTrack];
+
+  const seedGenre = (seedTrack.genre || '').trim().toLowerCase();
+  const seedTags = new Set(
+    (seedTrack.tags || []).map((t) => t.trim().toLowerCase())
+  );
+  const seedBpm = seedTrack.bpm ?? seedTrack.synthRecipe?.bpm ?? 118;
+  const seedDrive = seedTrack.synthRecipe?.driveAmount ?? 1.25;
+  const seedArtist = normalizeMatchToken(seedTrack.artist);
+
+  const others = catalog.filter((t) => t.id !== seedTrack.id);
+
+  const scored = others.map((cand) => {
+    let score = 0;
+    const candGenre = (cand.genre || '').trim().toLowerCase();
+    const candTags = (cand.tags || []).map((t) => t.trim().toLowerCase());
+    const candBpm = cand.bpm ?? cand.synthRecipe?.bpm ?? 118;
+    const candDrive = cand.synthRecipe?.driveAmount ?? 1.25;
+    const candArtist = normalizeMatchToken(cand.artist);
+
+    if (seedGenre && candGenre) {
+      if (candGenre === seedGenre) {
+        score += 50;
+      } else if (
+        candGenre.includes(seedGenre) ||
+        seedGenre.includes(candGenre)
+      ) {
+        score += 30;
+      }
+    }
+
+    for (const tag of candTags) {
+      if (seedTags.has(tag)) {
+        score += 20;
+      }
+    }
+
+    const bpmDiff = Math.abs(candBpm - seedBpm);
+    if (bpmDiff <= 15) {
+      score += 25;
+    } else if (bpmDiff <= 30) {
+      score += 12;
+    }
+
+    if (Math.abs(candDrive - seedDrive) <= 0.25) {
+      score += 15;
+    }
+
+    if (candArtist === seedArtist) {
+      score += 20;
+    }
+
+    return { track: cand, score };
+  });
+
+  const highAffinity = scored.filter((s) => s.score >= 35).map((s) => s.track);
+  const mediumAffinity = scored
+    .filter((s) => s.score >= 15 && s.score < 35)
+    .map((s) => s.track);
+  const remaining = scored.filter((s) => s.score < 15).map((s) => s.track);
+
+  const combined = [
+    seedTrack,
+    ...fisherYatesShuffle(highAffinity, randomFn),
+    ...fisherYatesShuffle(mediumAffinity, randomFn),
+    ...fisherYatesShuffle(remaining, randomFn),
+  ];
+
+  return combined.slice(0, Math.max(1, limit));
+}
+
 

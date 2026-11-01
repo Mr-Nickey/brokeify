@@ -1,4 +1,5 @@
 import type { Track } from '../types/music';
+import { buildJellyfinStreamCandidates } from './musicLogic';
 import { synthesizeWavBlob } from './synthWavGenerator';
 
 const DB_NAME = 'brokeify-offline-vault';
@@ -15,6 +16,23 @@ export interface VaultEntry {
 }
 
 const fallbackMemoryVault = new Map<string, VaultEntry>();
+
+function isValidAudioBlob(blob: Blob | null | undefined): blob is Blob {
+  if (!blob || !(blob instanceof Blob) || blob.size < 8192) {
+    return false;
+  }
+  const mime = (blob.type || '').toLowerCase();
+  if (
+    mime.includes('text/html') ||
+    mime.includes('application/json') ||
+    mime.includes('mpegurl') ||
+    mime.includes('text/plain') ||
+    mime.includes('xml')
+  ) {
+    return false;
+  }
+  return true;
+}
 
 function openVaultDb(): Promise<IDBDatabase | null> {
   if (typeof indexedDB === 'undefined') {
@@ -39,7 +57,12 @@ function openVaultDb(): Promise<IDBDatabase | null> {
 
 export async function getCachedTrackBlob(trackId: string): Promise<Blob | null> {
   const mem = fallbackMemoryVault.get(trackId);
-  if (mem) return mem.blob;
+  if (mem) {
+    if (isValidAudioBlob(mem.blob)) {
+      return mem.blob;
+    }
+    fallbackMemoryVault.delete(trackId);
+  }
 
   const db = await openVaultDb();
   if (!db) return null;
@@ -51,10 +74,13 @@ export async function getCachedTrackBlob(trackId: string): Promise<Blob | null> 
       const req = store.get(trackId);
       req.onsuccess = () => {
         const entry = req.result as VaultEntry | undefined;
-        if (entry?.blob) {
+        if (entry?.blob && isValidAudioBlob(entry.blob)) {
           fallbackMemoryVault.set(trackId, entry);
           resolve(entry.blob);
         } else {
+          if (entry) {
+            removeTrackFromVault(trackId).catch(() => {});
+          }
           resolve(null);
         }
       };
@@ -99,7 +125,9 @@ export async function saveTrackBlobToVault(
 export async function getAllVaultEntries(): Promise<VaultEntry[]> {
   const db = await openVaultDb();
   if (!db) {
-    return Array.from(fallbackMemoryVault.values());
+    return Array.from(fallbackMemoryVault.values()).filter((e) =>
+      isValidAudioBlob(e.blob)
+    );
   }
 
   return new Promise((resolve) => {
@@ -108,15 +136,26 @@ export async function getAllVaultEntries(): Promise<VaultEntry[]> {
       const store = tx.objectStore(STORE_NAME);
       const req = store.getAll();
       req.onsuccess = () => {
-        const list = (req.result as VaultEntry[]) || [];
+        const list = ((req.result as VaultEntry[]) || []).filter((e) =>
+          isValidAudioBlob(e.blob)
+        );
         for (const item of list) {
           fallbackMemoryVault.set(item.trackId, item);
         }
         resolve(list);
       };
-      req.onerror = () => resolve(Array.from(fallbackMemoryVault.values()));
+      req.onerror = () =>
+        resolve(
+          Array.from(fallbackMemoryVault.values()).filter((e) =>
+            isValidAudioBlob(e.blob)
+          )
+        );
     } catch {
-      resolve(Array.from(fallbackMemoryVault.values()));
+      resolve(
+        Array.from(fallbackMemoryVault.values()).filter((e) =>
+          isValidAudioBlob(e.blob)
+        )
+      );
     }
   });
 }
@@ -156,9 +195,8 @@ export async function clearOfflineVault(): Promise<void> {
 }
 
 /**
- * Fetches or synthesizes the full audio Blob for a track and stores it in `brokeify-offline-vault`.
- * If a remote stream blocks CORS fetch(), it falls back to synthesizing an offline proxy blob
- * so the 2-song lookahead preloader and offline playlist downloader never fail.
+ * Fetches the full audio Blob for a track and stores it in `brokeify-offline-vault`.
+ * Validates that responses are genuine audio streams and never caches HTML/JSON/HLS manifests.
  */
 export async function preloadTrackToVault(track: Track): Promise<Blob | null> {
   const existing = await getCachedTrackBlob(track.id);
@@ -181,22 +219,43 @@ export async function preloadTrackToVault(track: Track): Promise<Blob | null> {
     return blob;
   }
 
-  const candidateUrls = [track.streamUrl, track.fallbackStreamUrl].filter(
-    (u): u is string => Boolean(u)
+  let savedToken = '';
+  let savedUserId = '';
+  try {
+    savedToken = (localStorage.getItem('jellyfin_token') ?? '').trim();
+    savedUserId = (localStorage.getItem('jellyfin_user_id') ?? '').trim();
+  } catch {
+    // ignore
+  }
+
+  const candidateUrls = buildJellyfinStreamCandidates(
+    track,
+    savedToken,
+    savedUserId
   );
 
   for (const url of candidateUrls) {
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 12000);
+      const timer = setTimeout(() => controller.abort(), 15000);
       const response = await fetch(url, {
         signal: controller.signal,
         mode: 'cors',
       });
       clearTimeout(timer);
       if (response.ok) {
+        const contentType = (
+          response.headers.get('content-type') || ''
+        ).toLowerCase();
+        if (
+          contentType.includes('text/html') ||
+          contentType.includes('application/json') ||
+          contentType.includes('mpegurl')
+        ) {
+          continue;
+        }
         const blob = await response.blob();
-        if (blob.size > 1024) {
+        if (isValidAudioBlob(blob)) {
           await saveTrackBlobToVault(track, blob);
           return blob;
         }
@@ -206,17 +265,5 @@ export async function preloadTrackToVault(track: Track): Promise<Blob | null> {
     }
   }
 
-  // Never substitute fake synth audio for real self-hosted server tracks
-  if (
-    track.source === 'jellyfin' ||
-    track.source === 'emby' ||
-    track.source === 'navidrome' ||
-    track.source === 'plex'
-  ) {
-    return null;
-  }
-
-  const fallbackBlob = synthesizeWavBlob(track.id, defaultRecipe, 20);
-  await saveTrackBlobToVault(track, fallbackBlob);
-  return fallbackBlob;
+  return null;
 }

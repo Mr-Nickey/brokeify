@@ -7,275 +7,40 @@ import type {
 } from '../types/music';
 import { createAlbumArtworkDataUri } from '../utils/artworkGenerator';
 import {
+  buildClientInstantMix,
   buildEmbyAuthHeader,
+  buildJellyfinAuthHeaders,
   buildJellyfinDisplayPrefsUrl,
+  buildJellyfinGlobalAudioItemsUrl,
+  buildJellyfinGlobalPlaylistsUrl,
+  buildJellyfinInstantMixUrl,
+  buildJellyfinPlaylistItemsUrl,
+  buildJellyfinPublicSystemInfoUrl,
+  buildJellyfinQuickConnectAuthUrl,
+  buildJellyfinQuickConnectInitiateUrl,
+  buildJellyfinQuickConnectPollUrl,
+  buildJellyfinStreamCandidates,
   buildJellyfinStreamUrl,
+  buildJellyfinUserAudioItemsUrl,
+  buildJellyfinUserPlaylistsUrl,
+  buildJellyfinUsersMeUrl,
   buildPlexStreamUrl,
   buildSubsonicUrl,
   EQ_PRESETS,
-  isLikelyJellyfinApiKey,
-  matchJellyfinUserFromList,
-  mergeProvidersPreservingAuth,
   parseCloudSettingsResponse,
   serializeCloudSettingsPayload,
 } from '../utils/musicLogic';
 
-const PROVIDERS_STORAGE_KEY = 'brokeify_providers_v2';
+const PROVIDERS_STORAGE_KEY = 'brokeify_providers_v3';
 const PLAYLISTS_STORAGE_KEY = 'brokeify_playlists_v2';
 const CUSTOM_TRACKS_STORAGE_KEY = 'brokeify_remote_tracks_v2';
 const AUDIO_PREFS_STORAGE_KEY = 'brokeify_audio_prefs_v1';
 const JELLYFIN_CLOUD_MIRROR_KEY = 'brokeify_jf_displayprefs_mirror_v1';
+const ONBOARDING_COMPLETED_KEY = 'brokeify_onboarding_completed_v1';
+export const JELLYFIN_TOKEN_STORAGE_KEY = 'jellyfin_token';
+export const JELLYFIN_USER_ID_STORAGE_KEY = 'jellyfin_user_id';
 
-export const BUILT_IN_TRACKS: Track[] = [
-  {
-    id: 'builtin-1',
-    title: 'Neon Overdrive (Dead-Zone Mix)',
-    artist: 'Chrome Tape Syndicate',
-    album: 'Spite & Hard Drives Vol. 1',
-    duration: 184,
-    source: 'built-in',
-    sourceName: 'Built-In Demo Tracks',
-    streamUrl: 'synth://neon-overdrive',
-    artworkUrl: createAlbumArtworkDataUri(
-      'Neon Overdrive',
-      'Chrome Tape Syndicate',
-      '#10b981',
-      '#a855f7',
-      'DEMO VAULT'
-    ),
-    accentColor: '#10b981',
-    normalizationGain: -2.4,
-    bitrateKbps: 320,
-    format: 'WAV/PCM',
-    synthRecipe: {
-      bpm: 124,
-      rootHz: 110,
-      scaleRatios: [1, 1.2, 1.333, 1.5, 1.6, 2],
-      progression: [1, 0.8, 0.89, 1.125],
-      bassPattern: [1, 1, 1.5, 1, 1.2, 1, 1.5, 0.8],
-      padWave: 'sawtooth',
-      leadWave: 'sawtooth',
-      driveAmount: 1.35,
-    },
-  },
-  {
-    id: 'builtin-2',
-    title: 'Subsonic Highway 101',
-    artist: 'The Self-Hosted Collective',
-    album: 'RAID Array Nights',
-    duration: 212,
-    source: 'built-in',
-    sourceName: 'Built-In Demo Tracks',
-    streamUrl: 'synth://subsonic-highway',
-    artworkUrl: createAlbumArtworkDataUri(
-      'Subsonic Highway 101',
-      'The Self-Hosted Collective',
-      '#a855f7',
-      '#10b981',
-      'DEMO VAULT'
-    ),
-    accentColor: '#a855f7',
-    normalizationGain: -1.1,
-    bitrateKbps: 320,
-    format: 'WAV/PCM',
-    synthRecipe: {
-      bpm: 112,
-      rootHz: 98,
-      scaleRatios: [1, 1.125, 1.25, 1.5, 1.667, 2],
-      progression: [1, 1.25, 0.833, 1.125],
-      bassPattern: [1, 1, 1, 1.25, 1, 1, 1.5, 1],
-      padWave: 'triangle',
-      leadWave: 'triangle',
-      driveAmount: 1.15,
-    },
-  },
-  {
-    id: 'builtin-3',
-    title: 'Eleven Ninety-Nine Robbery',
-    artist: 'Duct Tape Oscillator',
-    album: 'Zero Subscriptions',
-    duration: 168,
-    source: 'built-in',
-    sourceName: 'Built-In Demo Tracks',
-    streamUrl: 'synth://eleven-ninety-nine',
-    artworkUrl: createAlbumArtworkDataUri(
-      'Eleven Ninety-Nine Robbery',
-      'Duct Tape Oscillator',
-      '#f43f5e',
-      '#10b981',
-      'DEMO VAULT'
-    ),
-    accentColor: '#f43f5e',
-    normalizationGain: -3.8,
-    bitrateKbps: 320,
-    format: 'WAV/PCM',
-    synthRecipe: {
-      bpm: 136,
-      rootHz: 82.41,
-      scaleRatios: [1, 1.2, 1.333, 1.414, 1.5, 1.8],
-      progression: [1, 1, 1.2, 0.89],
-      bassPattern: [1, 1.5, 1, 1.5, 1, 1.5, 1.2, 1.5],
-      padWave: 'sawtooth',
-      leadWave: 'square',
-      driveAmount: 1.55,
-    },
-  },
-  {
-    id: 'builtin-4',
-    title: 'Midnight Transcode (FLAC to Car)',
-    artist: 'Jellyfin Ghost',
-    album: 'Home Lab Sessions',
-    duration: 196,
-    source: 'built-in',
-    sourceName: 'Built-In Demo Tracks',
-    streamUrl: 'synth://midnight-transcode',
-    artworkUrl: createAlbumArtworkDataUri(
-      'Midnight Transcode',
-      'Jellyfin Ghost',
-      '#06b6d4',
-      '#a855f7',
-      'DEMO VAULT'
-    ),
-    accentColor: '#06b6d4',
-    normalizationGain: 1.8,
-    bitrateKbps: 320,
-    format: 'WAV/PCM',
-    synthRecipe: {
-      bpm: 98,
-      rootHz: 130.81,
-      scaleRatios: [1, 1.125, 1.2, 1.5, 1.6, 1.875],
-      progression: [1, 0.8, 0.75, 0.89],
-      bassPattern: [1, 0.5, 1, 1, 0.5, 1, 1.5, 1],
-      padWave: 'sine',
-      leadWave: 'triangle',
-      driveAmount: 1.1,
-    },
-  },
-  {
-    id: 'builtin-5',
-    title: 'Sunset',
-    artist: 'The Midnight',
-    album: 'Endless Summer (Cloud Mirror)',
-    duration: 224,
-    source: 'built-in',
-    sourceName: 'Built-In Demo Tracks',
-    streamUrl: 'synth://sunset-mirror',
-    artworkUrl: createAlbumArtworkDataUri(
-      'Sunset',
-      'The Midnight',
-      '#f59e0b',
-      '#ec4899',
-      'DEMO VAULT'
-    ),
-    accentColor: '#f59e0b',
-    normalizationGain: -1.5,
-    bitrateKbps: 320,
-    format: 'WAV/PCM',
-    synthRecipe: {
-      bpm: 116,
-      rootHz: 116.54,
-      scaleRatios: [1, 1.125, 1.25, 1.5, 1.667, 2],
-      progression: [1, 0.833, 1.125, 1.25],
-      bassPattern: [1, 1, 1, 1, 1.25, 1.25, 1.5, 1.5],
-      padWave: 'sawtooth',
-      leadWave: 'triangle',
-      driveAmount: 1.25,
-    },
-  },
-  {
-    id: 'builtin-6',
-    title: 'Nightcall',
-    artist: 'Kavinsky',
-    album: 'OutRun (Cloud Mirror)',
-    duration: 252,
-    source: 'built-in',
-    sourceName: 'Built-In Demo Tracks',
-    streamUrl: 'synth://nightcall-mirror',
-    artworkUrl: createAlbumArtworkDataUri(
-      'Nightcall',
-      'Kavinsky',
-      '#8b5cf6',
-      '#10b981',
-      'DEMO VAULT'
-    ),
-    accentColor: '#8b5cf6',
-    normalizationGain: -2.0,
-    bitrateKbps: 320,
-    format: 'WAV/PCM',
-    synthRecipe: {
-      bpm: 91,
-      rootHz: 110,
-      scaleRatios: [1, 1.2, 1.333, 1.5, 1.6, 2],
-      progression: [1, 0.8, 0.9, 0.75],
-      bassPattern: [1, 1, 0.5, 1, 1, 1, 1.5, 1],
-      padWave: 'sawtooth',
-      leadWave: 'square',
-      driveAmount: 1.4,
-    },
-  },
-  {
-    id: 'builtin-7',
-    title: 'Resonance',
-    artist: 'HOME',
-    album: 'Odyssey (Cloud Mirror)',
-    duration: 212,
-    source: 'built-in',
-    sourceName: 'Built-In Demo Tracks',
-    streamUrl: 'synth://resonance-mirror',
-    artworkUrl: createAlbumArtworkDataUri(
-      'Resonance',
-      'HOME',
-      '#14b8a6',
-      '#a855f7',
-      'DEMO VAULT'
-    ),
-    accentColor: '#14b8a6',
-    normalizationGain: 0.9,
-    bitrateKbps: 320,
-    format: 'WAV/PCM',
-    synthRecipe: {
-      bpm: 100,
-      rootHz: 146.83,
-      scaleRatios: [1, 1.125, 1.25, 1.5, 1.667, 1.875],
-      progression: [1, 0.75, 0.833, 1.125],
-      bassPattern: [1, 1, 1.5, 1, 0.75, 0.75, 1, 1],
-      padWave: 'triangle',
-      leadWave: 'sine',
-      driveAmount: 1.15,
-    },
-  },
-  {
-    id: 'builtin-8',
-    title: 'Turbo Killer',
-    artist: 'Carpenter Brut',
-    album: 'EP III (Cloud Mirror)',
-    duration: 208,
-    source: 'built-in',
-    sourceName: 'Built-In Demo Tracks',
-    streamUrl: 'synth://turbo-killer-mirror',
-    artworkUrl: createAlbumArtworkDataUri(
-      'Turbo Killer',
-      'Carpenter Brut',
-      '#ef4444',
-      '#a855f7',
-      'DEMO VAULT'
-    ),
-    accentColor: '#ef4444',
-    normalizationGain: -4.1,
-    bitrateKbps: 320,
-    format: 'WAV/PCM',
-    synthRecipe: {
-      bpm: 140,
-      rootHz: 73.42,
-      scaleRatios: [1, 1.2, 1.333, 1.414, 1.5, 1.78],
-      progression: [1, 1.2, 0.89, 1.333],
-      bassPattern: [1, 2, 1, 2, 1, 2, 1.5, 2],
-      padWave: 'sawtooth',
-      leadWave: 'square',
-      driveAmount: 1.65,
-    },
-  },
-];
+export const BUILT_IN_TRACKS: Track[] = [];
 
 export const DEFAULT_PROVIDERS: ProviderConfig[] = [
   {
@@ -283,53 +48,42 @@ export const DEFAULT_PROVIDERS: ProviderConfig[] = [
     type: 'jellyfin',
     name: 'Jellyfin Media Server',
     enabled: true,
-    serverUrl: 'https://jellyfin.flockingreeds.farm',
-    authMode: 'apikey',
+    serverUrl: '',
+    authMode: 'password',
     username: '',
     password: '',
     token: '',
     userId: '',
     status: 'disconnected',
     lastMessage:
-      'Supports Direct API Key (GET /Users?api_key=...) or Username + Password',
+      'Sign in with Quick Connect or your Jellyfin Username & Password.',
     diagnosticLog:
-      'Ready: Enter your 32-character Jellyfin API Key (or switch to Password mode) and click Test Connection.',
-  },
-  {
-    id: 'prov-builtin',
-    type: 'built-in',
-    name: 'Built-In Demo Tracks',
-    enabled: true,
-    serverUrl: 'builtin://demo-tracks',
-    status: 'connected',
-    lastMessage:
-      '8 built-in synthwave & car-test tracks (Automatically turns OFF when Jellyfin connects)',
-    trackCount: 8,
+      'Ready: Sign in with Quick Connect or your Jellyfin Username & Password.',
   },
   {
     id: 'prov-emby',
     type: 'emby',
     name: 'Emby Media Server',
     enabled: false,
-    serverUrl: 'http://192.168.1.101:8096',
-    authMode: 'apikey',
+    serverUrl: '',
+    authMode: 'password',
     username: '',
     password: '',
     token: '',
     userId: '',
     status: 'disconnected',
-    lastMessage: 'Emby Server connector (?api_key= or AuthenticateByName)',
+    lastMessage: 'Sign in with your Emby Server URL, Username & Password.',
   },
   {
     id: 'prov-navidrome',
     type: 'navidrome',
     name: 'Navidrome / Subsonic Server',
     enabled: false,
-    serverUrl: 'http://192.168.1.102:4533',
+    serverUrl: '',
     username: '',
     password: '',
     token: '',
-    salt: 'brokeify01',
+    salt: '',
     status: 'disconnected',
     lastMessage: 'Subsonic REST API v1.16.1 connector',
   },
@@ -338,7 +92,7 @@ export const DEFAULT_PROVIDERS: ProviderConfig[] = [
     type: 'plex',
     name: 'Plex Music Server',
     enabled: false,
-    serverUrl: 'http://192.168.1.103:32400',
+    serverUrl: '',
     token: '',
     status: 'disconnected',
     lastMessage: 'Connect via Server URL + X-Plex-Token',
@@ -365,26 +119,7 @@ export const DEFAULT_PROVIDERS: ProviderConfig[] = [
   },
 ];
 
-export const DEFAULT_PLAYLISTS: Playlist[] = [
-  {
-    id: 'pl-night-drive',
-    name: 'Dead-Zone Night Drive',
-    description: 'High-contrast synthwave & electro cuts leveled for highway cruising.',
-    source: 'built-in',
-    trackIds: ['builtin-1', 'builtin-5', 'builtin-6', 'builtin-7', 'builtin-8'],
-    createdAt: '2026-10-01',
-    coverAccent: '#10b981',
-  },
-  {
-    id: 'pl-spite-anthem',
-    name: 'Powered by Spite & Hard Drives',
-    description: 'Home-lab classics across Jellyfin, Navidrome & Brokeify Free Cloud.',
-    source: 'mixed',
-    trackIds: ['builtin-3', 'builtin-2', 'builtin-4', 'builtin-1'],
-    createdAt: '2026-10-12',
-    coverAccent: '#a855f7',
-  },
-];
+export const DEFAULT_PLAYLISTS: Playlist[] = [];
 
 export class MusicProviderManager {
   /**
@@ -434,24 +169,61 @@ export class MusicProviderManager {
 
   static loadProviders(): ProviderConfig[] {
     try {
+      const savedToken = (
+        localStorage.getItem(JELLYFIN_TOKEN_STORAGE_KEY) ?? ''
+      ).trim();
+      const savedUserId = (
+        localStorage.getItem(JELLYFIN_USER_ID_STORAGE_KEY) ?? ''
+      ).trim();
+
       const raw = localStorage.getItem(PROVIDERS_STORAGE_KEY);
-      if (!raw) return DEFAULT_PROVIDERS;
+      if (!raw) {
+        return DEFAULT_PROVIDERS.map((p) =>
+          p.type === 'jellyfin' && savedToken
+            ? {
+                ...p,
+                token: savedToken,
+                userId: savedUserId || p.userId,
+                authMode: 'session',
+              }
+            : { ...p }
+        );
+      }
       const parsed = JSON.parse(raw) as ProviderConfig[];
-      if (!Array.isArray(parsed) || parsed.length === 0) return DEFAULT_PROVIDERS;
-      return mergeProvidersPreservingAuth(DEFAULT_PROVIDERS, parsed);
+      if (!Array.isArray(parsed) || parsed.length === 0) {
+        return DEFAULT_PROVIDERS.map((p) => ({ ...p }));
+      }
+      const savedById = new Map<string, ProviderConfig>();
+      for (const item of parsed) {
+        if (item && item.id) {
+          savedById.set(item.id, item);
+        }
+      }
+      return DEFAULT_PROVIDERS.map((def) => {
+        const saved = savedById.get(def.id);
+        const merged = saved ? { ...def, ...saved } : { ...def };
+        if (merged.type === 'jellyfin') {
+          if (savedToken && !merged.token) {
+            merged.token = savedToken;
+          }
+          if (savedUserId && !merged.userId) {
+            merged.userId = savedUserId;
+          }
+        }
+        return merged;
+      });
     } catch {
-      return DEFAULT_PROVIDERS;
+      return DEFAULT_PROVIDERS.map((p) => ({ ...p }));
     }
   }
 
   /**
-   * Zero-Logout Save: Never overwrites existing saved auth tokens with empty strings on network error.
+   * Saves the exact provider state to localStorage so clearing an input field or clicking the X Clear button
+   * immediately persists the empty string without resurrecting old characters.
    */
   static saveProviders(providers: ProviderConfig[]): void {
     try {
-      const existing = MusicProviderManager.loadProviders();
-      const safeMerged = mergeProvidersPreservingAuth(existing, providers);
-      localStorage.setItem(PROVIDERS_STORAGE_KEY, JSON.stringify(safeMerged));
+      localStorage.setItem(PROVIDERS_STORAGE_KEY, JSON.stringify(providers));
     } catch {
       // Ignore storage quota errors
     }
@@ -460,11 +232,18 @@ export class MusicProviderManager {
   static loadPlaylists(): Playlist[] {
     try {
       const raw = localStorage.getItem(PLAYLISTS_STORAGE_KEY);
-      if (!raw) return DEFAULT_PLAYLISTS;
+      if (!raw) return [];
       const parsed = JSON.parse(raw) as Playlist[];
-      return Array.isArray(parsed) && parsed.length > 0 ? parsed : DEFAULT_PLAYLISTS;
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(
+        (pl) =>
+          pl &&
+          pl.source !== 'built-in' &&
+          pl.id !== 'pl-night-drive' &&
+          pl.id !== 'pl-spite-anthem'
+      );
     } catch {
-      return DEFAULT_PLAYLISTS;
+      return [];
     }
   }
 
@@ -478,15 +257,41 @@ export class MusicProviderManager {
 
   static loadCachedRemoteTracks(): Track[] {
     try {
+      const savedToken = (
+        localStorage.getItem(JELLYFIN_TOKEN_STORAGE_KEY) ?? ''
+      ).trim();
+      const savedUserId = (
+        localStorage.getItem(JELLYFIN_USER_ID_STORAGE_KEY) ?? ''
+      ).trim();
       const raw = localStorage.getItem(CUSTOM_TRACKS_STORAGE_KEY);
       if (!raw) return [];
       const parsed = JSON.parse(raw) as Track[];
       if (!Array.isArray(parsed)) return [];
-      // Filter out any legacy fake LAN tracks
-      return parsed.filter(
-        (t) =>
-          !t.id.endsWith('-lan-1') && !t.streamUrl.startsWith('synth://jellyfin')
-      );
+      return parsed
+        .filter(
+          (t) =>
+            t &&
+            t.source !== 'built-in' &&
+            !t.id.endsWith('-lan-1') &&
+            !t.streamUrl.startsWith('synth://')
+        )
+        .map((t) => {
+          if (t.source === 'jellyfin' || t.source === 'emby') {
+            const candidates = buildJellyfinStreamCandidates(
+              t,
+              t.source === 'jellyfin' ? savedToken : undefined,
+              t.source === 'jellyfin' ? savedUserId : undefined
+            );
+            if (candidates.length > 0) {
+              return {
+                ...t,
+                streamUrl: candidates[0],
+                fallbackStreamUrl: candidates[1] || candidates[0],
+              };
+            }
+          }
+          return t;
+        });
     } catch {
       return [];
     }
@@ -532,7 +337,6 @@ export class MusicProviderManager {
 
   /**
    * Jellyfin Native Cloud Settings Sync (GET /DisplayPreferences/brokeify?userId={userId}&client=Brokeify&api_key={token})
-   * Uses ?api_key={token} query param without custom headers on GET to avoid CORS preflight blocks.
    */
   static async pullCloudSettingsFromJellyfin(
     config: ProviderConfig
@@ -541,18 +345,19 @@ export class MusicProviderManager {
     endpointUrl: string;
     fromMirror: boolean;
   }> {
+    const cleanServer = (config.serverUrl ?? '').trim();
+    if (!cleanServer) {
+      return {
+        settings: null,
+        endpointUrl: '/DisplayPreferences/brokeify?client=Brokeify',
+        fromMirror: false,
+      };
+    }
     const userId =
       config.userId?.trim() || config.username?.trim() || 'brokeify-user';
     const token = config.token?.trim() || config.password?.trim() || '';
-    const displayEndpoint = buildJellyfinDisplayPrefsUrl(
-      config.serverUrl,
-      userId
-    );
-    const fetchUrl = buildJellyfinDisplayPrefsUrl(
-      config.serverUrl,
-      userId,
-      token
-    );
+    const displayEndpoint = buildJellyfinDisplayPrefsUrl(cleanServer, userId);
+    const fetchUrl = buildJellyfinDisplayPrefsUrl(cleanServer, userId, token);
 
     if (token) {
       try {
@@ -612,25 +417,21 @@ export class MusicProviderManager {
     endpointUrl: string;
     message: string;
   }> {
+    const cleanServer = (config.serverUrl ?? '').trim();
     const userId =
       config.userId?.trim() || config.username?.trim() || 'brokeify-user';
     const token = config.token?.trim() || config.password?.trim() || '';
-    const displayEndpoint = buildJellyfinDisplayPrefsUrl(
-      config.serverUrl,
-      userId
-    );
-    const postUrl = buildJellyfinDisplayPrefsUrl(
-      config.serverUrl,
-      userId,
-      token
-    );
+    const displayEndpoint = cleanServer
+      ? buildJellyfinDisplayPrefsUrl(cleanServer, userId)
+      : `/DisplayPreferences/brokeify?userId=${encodeURIComponent(userId)}&client=Brokeify`;
 
     const payload = serializeCloudSettingsPayload(settings);
     try {
       localStorage.setItem(JELLYFIN_CLOUD_MIRROR_KEY, JSON.stringify(payload));
     } catch {}
 
-    if (token) {
+    if (cleanServer && token) {
+      const postUrl = buildJellyfinDisplayPrefsUrl(cleanServer, userId, token);
       try {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 2500);
@@ -664,11 +465,437 @@ export class MusicProviderManager {
   }
 
   /**
-   * 1. Bulletproof Jellyfin & Emby Connector
-   * - Method A (API Key mode or 32-char hex key): GET {serverUrl}/Users?api_key={apiKey} (Zero CORS preflight!)
-   * - Method B (Username + Password mode): POST {serverUrl}/Users/AuthenticateByName
-   * - Fetches real tracks (Limit=2000) & real playlists (/Users/{userId}/Items?IncludeItemTypes=Playlist + /Playlists/{playlistId}/Items)
-   * - Zero fake track fallback: Never mounts mock tracks; reports exact diagnostic status.
+   * Brokeify First-Run Onboarding State Helpers:
+   * Returns true if the user has already connected a music server OR clicked "Free Cloud Streams & Demo".
+   */
+  static hasCompletedOnboarding(providers: readonly ProviderConfig[]): boolean {
+    try {
+      if (localStorage.getItem(ONBOARDING_COMPLETED_KEY) === 'true') {
+        return true;
+      }
+    } catch {
+      // ignore
+    }
+    return providers.some(
+      (p) =>
+        p.type !== 'built-in' &&
+        p.status === 'connected' &&
+        Boolean(p.serverUrl?.trim())
+    );
+  }
+
+  static markOnboardingCompleted(): void {
+    try {
+      localStorage.setItem(ONBOARDING_COMPLETED_KEY, 'true');
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * Jellyfin Quick Connect Step 1:
+   * Pings GET {serverUrl}/System/Info/Public to verify server reachability & version.
+   */
+  static async testJellyfinServerPublicInfo(serverUrl: string): Promise<{
+    ok: boolean;
+    version?: string;
+    serverName?: string;
+    quickConnectAvailable?: boolean;
+    message: string;
+  }> {
+    const cleanUrl = (serverUrl ?? '').trim().replace(/\/+$/, '');
+    if (!cleanUrl) {
+      return {
+        ok: false,
+        message: '❌ Please enter a Jellyfin Server URL first.',
+      };
+    }
+
+    try {
+      const res = await fetch(buildJellyfinPublicSystemInfoUrl(cleanUrl), {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+      if (!res.ok) {
+        return {
+          ok: false,
+          message: `❌ Server returned HTTP ${res.status} (${res.statusText || 'Unreachable'})`,
+        };
+      }
+      const data = await res.json();
+      const version = String(data?.Version || '10.x');
+      const serverName = String(data?.ServerName || 'Jellyfin');
+      return {
+        ok: true,
+        version,
+        serverName,
+        message: `✅ Server reachable (Jellyfin v${version})`,
+      };
+    } catch (err: any) {
+      return {
+        ok: false,
+        message: `❌ Could not reach ${cleanUrl}/System/Info/Public (${err?.message || 'CORS or network error'})`,
+      };
+    }
+  }
+
+  /**
+   * Jellyfin Quick Connect Step 2:
+   * Sends POST {serverUrl}/QuickConnect/Initiate with X-Emby-Authorization header.
+   * Returns { code: "123456", secret: "...", authenticated: false }.
+   */
+  static async initiateJellyfinQuickConnect(serverUrl: string): Promise<{
+    code: string;
+    secret: string;
+    authenticated: boolean;
+  }> {
+    const cleanUrl = (serverUrl ?? '').trim().replace(/\/+$/, '');
+    if (!cleanUrl) {
+      throw new Error('Missing Jellyfin Server URL.');
+    }
+
+    const authHeader = buildEmbyAuthHeader();
+    const res = await fetch(buildJellyfinQuickConnectInitiateUrl(cleanUrl), {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        Authorization: authHeader,
+        'X-Emby-Authorization': authHeader,
+      },
+    });
+
+    if (!res.ok) {
+      throw new Error(
+        `POST /QuickConnect/Initiate returned HTTP ${res.status} (${res.statusText || 'Ensure Quick Connect is enabled on your Jellyfin server'})`
+      );
+    }
+
+    const data = await res.json();
+    const code = String(data?.Code || '').trim();
+    const secret = String(data?.Secret || '').trim();
+    if (!code || !secret) {
+      throw new Error(
+        'Jellyfin /QuickConnect/Initiate did not return a valid Code and Secret.'
+      );
+    }
+
+    return {
+      code,
+      secret,
+      authenticated: Boolean(data?.Authenticated),
+    };
+  }
+
+  /**
+   * Jellyfin Quick Connect Step 3 (Polling):
+   * Polls GET {serverUrl}/QuickConnect/Connect?Secret={secret} every 3 seconds.
+   */
+  static async pollJellyfinQuickConnect(
+    serverUrl: string,
+    secret: string
+  ): Promise<{
+    authenticated: boolean;
+    code?: string;
+    secret: string;
+  }> {
+    const cleanUrl = (serverUrl ?? '').trim().replace(/\/+$/, '');
+    const authHeader = buildEmbyAuthHeader();
+    const res = await fetch(
+      buildJellyfinQuickConnectPollUrl(cleanUrl, secret),
+      {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          Authorization: authHeader,
+          'X-Emby-Authorization': authHeader,
+        },
+      }
+    );
+
+    if (!res.ok) {
+      throw new Error(
+        `GET /QuickConnect/Connect returned HTTP ${res.status}`
+      );
+    }
+
+    const data = await res.json();
+    return {
+      authenticated: Boolean(data?.Authenticated),
+      code: data?.Code ? String(data.Code) : undefined,
+      secret: String(data?.Secret || secret),
+    };
+  }
+
+  /**
+   * Jellyfin Quick Connect Step 4 (Exchange Secret for Session Token):
+   * Sends POST {serverUrl}/Users/AuthenticateWithQuickConnect with body { Secret: secret }
+   * and X-Emby-Authorization header. Extracts AccessToken, User.Id, and User.Name,
+   * and saves AccessToken and User.Id to localStorage under `jellyfin_token` and `jellyfin_user_id`.
+   */
+  static async authenticateWithJellyfinQuickConnect(
+    serverUrl: string,
+    secret: string
+  ): Promise<{
+    accessToken: string;
+    userId: string;
+    username: string;
+  }> {
+    const cleanUrl = (serverUrl ?? '').trim().replace(/\/+$/, '');
+    const authHeader = buildEmbyAuthHeader();
+    const res = await fetch(buildJellyfinQuickConnectAuthUrl(cleanUrl), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        Authorization: authHeader,
+        'X-Emby-Authorization': authHeader,
+      },
+      body: JSON.stringify({ Secret: secret.trim() }),
+    });
+
+    if (!res.ok) {
+      throw new Error(
+        `POST /Users/AuthenticateWithQuickConnect returned HTTP ${res.status}`
+      );
+    }
+
+    const data = await res.json();
+    const accessToken = String(data?.AccessToken || '').trim();
+    const userId = String(data?.User?.Id || '').trim();
+    const username = String(data?.User?.Name || 'Jellyfin User').trim();
+
+    if (!accessToken) {
+      throw new Error(
+        'AuthenticateWithQuickConnect did not return an AccessToken.'
+      );
+    }
+
+    try {
+      localStorage.setItem(JELLYFIN_TOKEN_STORAGE_KEY, accessToken);
+      if (userId) {
+        localStorage.setItem(JELLYFIN_USER_ID_STORAGE_KEY, userId);
+      }
+    } catch {
+      // ignore storage quota errors
+    }
+
+    return {
+      accessToken,
+      userId,
+      username,
+    };
+  }
+
+  /**
+   * Logs out of a provider (e.g. Jellyfin), clearing saved session tokens, userId,
+   * and cached remote tracks/playlists so the user can cleanly log back in.
+   */
+  static async logoutProvider(
+    providerType: ProviderConfig['type'],
+    currentProviders: ProviderConfig[]
+  ): Promise<{
+    updatedProviders: ProviderConfig[];
+    remainingTracks: Track[];
+    remainingPlaylists: Playlist[];
+  }> {
+    const target = currentProviders.find((p) => p.type === providerType);
+    if (providerType === 'jellyfin') {
+      const cleanUrl = (target?.serverUrl ?? '').trim().replace(/\/+$/, '');
+      const token = (
+        target?.token ||
+        localStorage.getItem(JELLYFIN_TOKEN_STORAGE_KEY) ||
+        ''
+      ).trim();
+
+      if (cleanUrl && token) {
+        try {
+          await fetch(
+            `${cleanUrl}/Sessions/Logout?api_key=${encodeURIComponent(token)}`,
+            {
+              method: 'POST',
+              headers: buildJellyfinAuthHeaders(token),
+            }
+          );
+        } catch {
+          // Non-blocking if offline or CORS
+        }
+      }
+
+      try {
+        localStorage.removeItem(JELLYFIN_TOKEN_STORAGE_KEY);
+        localStorage.removeItem(JELLYFIN_USER_ID_STORAGE_KEY);
+        localStorage.removeItem(ONBOARDING_COMPLETED_KEY);
+      } catch {
+        // ignore
+      }
+    }
+
+    const updatedProviders: ProviderConfig[] = currentProviders.map((p) => {
+      if (p.type === providerType) {
+        return {
+          ...p,
+          authMode: 'password',
+          password: '',
+          token: '',
+          userId: '',
+          status: 'disconnected',
+          trackCount: 0,
+          playlistCount: 0,
+          lastMessage:
+            'Logged out. Sign in with Quick Connect or Username & Password.',
+          diagnosticLog:
+            'Logged out cleanly. Ready to sign back in via Quick Connect or Username & Password.',
+        };
+      }
+      return p;
+    });
+
+    MusicProviderManager.saveProviders(updatedProviders);
+
+    const remainingTracks = MusicProviderManager.loadCachedRemoteTracks().filter(
+      (t) => t.source !== providerType
+    );
+    MusicProviderManager.saveCachedRemoteTracks(remainingTracks);
+
+    const remainingPlaylists = MusicProviderManager.loadPlaylists().filter(
+      (pl) => pl.source !== providerType
+    );
+    MusicProviderManager.savePlaylists(remainingPlaylists);
+
+    return {
+      updatedProviders,
+      remainingTracks,
+      remainingPlaylists,
+    };
+  }
+
+  /**
+   * Executes a Jellyfin GET request with both X-Emby-Token and Authorization headers,
+   * and automatically falls back to a CORS-preflight-free simple GET (?api_key= in URL)
+   * if a reverse proxy blocks custom headers on OPTIONS preflight.
+   */
+  static async fetchJellyfinGet(
+    urlWithApiKey: string,
+    token: string
+  ): Promise<Response> {
+    const authHeaders = buildJellyfinAuthHeaders(token);
+    try {
+      const res = await fetch(urlWithApiKey, {
+        method: 'GET',
+        headers: authHeaders,
+      });
+      if (res.ok) return res;
+      // Fallback to simple GET without custom headers in case header format was rejected
+      const fallbackRes = await fetch(urlWithApiKey, {
+        method: 'GET',
+      });
+      return fallbackRes.ok ? fallbackRes : res;
+    } catch {
+      // Network/CORS preflight error on custom headers: retry as simple GET with ?api_key=
+      return fetch(urlWithApiKey, {
+        method: 'GET',
+      });
+    }
+  }
+
+  /**
+   * Resolves the authenticated user's Id and Name from GET {serverUrl}/Users/Me
+   * if userId is missing from state.
+   */
+  static async resolveJellyfinUserFromMe(
+    serverUrl: string,
+    token: string
+  ): Promise<{ userId: string; username: string } | null> {
+    const cleanUrl = (serverUrl ?? '').trim().replace(/\/+$/, '');
+    const cleanToken = (token ?? '').trim();
+    if (!cleanUrl || !cleanToken) return null;
+
+    try {
+      const res = await MusicProviderManager.fetchJellyfinGet(
+        buildJellyfinUsersMeUrl(cleanUrl, cleanToken),
+        cleanToken
+      );
+      if (!res.ok) return null;
+      const data = await res.json();
+      const id = String(data?.Id || '').trim();
+      const name = String(data?.Name || '').trim();
+      if (!id) return null;
+      try {
+        localStorage.setItem(JELLYFIN_USER_ID_STORAGE_KEY, id);
+      } catch {
+        // ignore
+      }
+      return { userId: id, username: name };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Direct alias for fetching Jellyfin tracks & playlists after Quick Connect or manual login.
+   */
+  static async fetchJellyfinMusic(config: ProviderConfig): Promise<{
+    updatedConfig: ProviderConfig;
+    tracks: Track[];
+    playlists: Playlist[];
+    restoredCloudSettings?: BrokeifyCloudSettings | null;
+  }> {
+    return MusicProviderManager.connectJellyfinOrEmby(config);
+  }
+
+  /**
+   * Helper to authenticate with Jellyfin/Emby via Username & Password:
+   * POST {serverUrl}/Users/AuthenticateByName
+   */
+  private static async authenticateByUsernamePassword(
+    cleanUrl: string,
+    cleanUsername: string,
+    cleanPassword: string
+  ): Promise<{ token: string; userId: string; username: string }> {
+    const authHeader = buildEmbyAuthHeader();
+    const res = await fetch(`${cleanUrl}/Users/AuthenticateByName`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        Authorization: authHeader,
+        'X-Emby-Authorization': authHeader,
+      },
+      body: JSON.stringify({
+        Username: cleanUsername,
+        Pw: cleanPassword,
+      }),
+    });
+
+    if (!res.ok) {
+      throw new Error(
+        `Login failed (HTTP ${res.status} ${res.statusText || 'Unauthorized'}). Check your Username & Password or use Quick Connect.`
+      );
+    }
+
+    const authJson = await res.json();
+    const token = String(authJson?.AccessToken || '').trim();
+    const userId = String(authJson?.User?.Id || '').trim();
+    const username = String(
+      authJson?.User?.Name || cleanUsername || 'Jellyfin User'
+    ).trim();
+
+    if (!token) {
+      throw new Error(
+        'AuthenticateByName succeeded but did not return an AccessToken.'
+      );
+    }
+
+    return { token, userId, username };
+  }
+
+  /**
+   * 1. Universal Jellyfin & Emby Connector
+   * Clean 2-Way Authentication (Zero API Key complexity):
+   * - Method 1: Quick Connect Session (`authMode: 'session'` or `'quickconnect'` with saved `AccessToken` & `User.Id`)
+   * - Method 2: Username & Password (`POST ${serverUrl}/Users/AuthenticateByName`)
    */
   static async connectJellyfinOrEmby(config: ProviderConfig): Promise<{
     updatedConfig: ProviderConfig;
@@ -676,96 +903,181 @@ export class MusicProviderManager {
     playlists: Playlist[];
     restoredCloudSettings?: BrokeifyCloudSettings | null;
   }> {
-    const cleanUrl = config.serverUrl.trim().replace(/\/+$/, '');
-    const useApiKeyMode =
-      config.authMode === 'apikey' ||
-      isLikelyJellyfinApiKey(config.token) ||
-      isLikelyJellyfinApiKey(config.password);
+    const cleanUrl = (config.serverUrl ?? '').trim().replace(/\/+$/, '');
+    const cleanUsername = (config.username ?? '').trim();
+    const cleanPassword = (config.password ?? '').trim();
 
-    let token = config.token?.trim() || '';
-    let userId = config.userId?.trim() || '';
-    let matchedUserName = config.username?.trim() || 'User';
+    let savedToken = '';
+    let savedUserId = '';
+    if (config.type === 'jellyfin') {
+      try {
+        savedToken = (
+          localStorage.getItem(JELLYFIN_TOKEN_STORAGE_KEY) ?? ''
+        ).trim();
+        savedUserId = (
+          localStorage.getItem(JELLYFIN_USER_ID_STORAGE_KEY) ?? ''
+        ).trim();
+      } catch {
+        // ignore
+      }
+    }
+
+    const activeToken = (config.token?.trim() || savedToken || '').trim();
+
+    if (!cleanUrl) {
+      const msg =
+        '❌ Missing Server URL. Enter your Jellyfin URL (e.g., https://jellyfin.flockingreeds.farm).';
+      return {
+        updatedConfig: {
+          ...config,
+          status: 'error',
+          lastMessage: msg,
+          diagnosticLog: msg,
+        },
+        tracks: [],
+        playlists: [],
+        restoredCloudSettings: null,
+      };
+    }
+
+    if (!activeToken && !cleanPassword) {
+      const msg =
+        '❌ Not signed in. Use Quick Connect or enter your Username & Password.';
+      return {
+        updatedConfig: {
+          ...config,
+          status: 'error',
+          lastMessage: msg,
+          diagnosticLog: msg,
+        },
+        tracks: [],
+        playlists: [],
+        restoredCloudSettings: null,
+      };
+    }
+
+    let token = activeToken;
+    let userId = (config.userId?.trim() || savedUserId || '').trim();
+    let matchedUserName = cleanUsername || 'Jellyfin User';
+
+    // Determine whether we should authenticate with Username + Password:
+    // If we don't have a session token yet, OR if the user explicitly submitted a password in password mode
+    const shouldLoginWithPassword =
+      !token ||
+      (config.authMode === 'password' &&
+        Boolean(cleanUsername) &&
+        Boolean(cleanPassword) &&
+        cleanPassword !== token);
 
     try {
-      if (useApiKeyMode) {
-        // Method A: Direct Jellyfin API Key (GET /Users?api_key={apiKey})
-        const apiKey = (config.token?.trim() || config.password?.trim() || '');
-        if (!apiKey) {
+      if (shouldLoginWithPassword) {
+        if (!cleanUsername) {
           throw new Error(
-            'Missing Jellyfin API Key. Paste your API Key from Jellyfin Dashboard -> API Keys (or switch to Password mode).'
+            'Please enter your Jellyfin Username (or switch to the Quick Connect tab).'
           );
         }
-        token = apiKey;
+        const authResult =
+          await MusicProviderManager.authenticateByUsernamePassword(
+            cleanUrl,
+            cleanUsername,
+            cleanPassword
+          );
+        token = authResult.token;
+        userId = authResult.userId;
+        matchedUserName = authResult.username;
+      }
 
-        const usersUrl = `${cleanUrl}/Users?api_key=${encodeURIComponent(apiKey)}`;
-        const usersRes = await fetch(usersUrl, {
-          method: 'GET',
-        });
-        if (!usersRes.ok) {
-          throw new Error(
-            `GET /Users?api_key=... returned HTTP ${usersRes.status} (${usersRes.statusText || 'Unauthorized'})`
-          );
+      // Persist token & userId to localStorage for Jellyfin
+      if (config.type === 'jellyfin' && token) {
+        try {
+          localStorage.setItem(JELLYFIN_TOKEN_STORAGE_KEY, token);
+          if (userId) {
+            localStorage.setItem(JELLYFIN_USER_ID_STORAGE_KEY, userId);
+          }
+        } catch {
+          // ignore
         }
-        const usersList = await usersRes.json();
-        const matchedUser = matchJellyfinUserFromList(
-          Array.isArray(usersList) ? usersList : [],
-          config.username
-        );
-        if (!matchedUser) {
-          throw new Error(
-            'Authenticated with API Key, but no Jellyfin users were returned from GET /Users.'
-          );
-        }
-        userId = matchedUser.id;
-        matchedUserName = matchedUser.name;
-      } else {
-        // Method B: Username + Password (POST /Users/AuthenticateByName)
-        if (!config.username?.trim()) {
-          throw new Error(
-            'Missing Username for Password login. Enter your Jellyfin username and password (or switch to API Key mode).'
-          );
-        }
-        const authRes = await fetch(`${cleanUrl}/Users/AuthenticateByName`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Emby-Authorization': buildEmbyAuthHeader(),
-          },
-          body: JSON.stringify({
-            Username: config.username.trim(),
-            Pw: config.password || '',
-          }),
-        });
-        if (!authRes.ok) {
-          throw new Error(
-            `POST /Users/AuthenticateByName returned HTTP ${authRes.status} (${authRes.statusText || 'Invalid credentials'})`
-          );
-        }
-        const authJson = await authRes.json();
-        token = String(authJson.AccessToken || token || '').trim();
-        userId = String(authJson.User?.Id || userId || '').trim();
-        matchedUserName = String(
-          authJson.User?.Name || config.username || 'User'
-        );
+      }
 
-        if (!token || !userId) {
-          throw new Error(
-            'AuthenticateByName succeeded but did not return an AccessToken or User.Id.'
+      // If userId is missing from state, extract it from /Users/Me first before requesting items
+      if (!userId && token) {
+        const me = await MusicProviderManager.resolveJellyfinUserFromMe(
+          cleanUrl,
+          token
+        );
+        if (me?.userId) {
+          userId = me.userId;
+          if (me.username && !cleanUsername) {
+            matchedUserName = me.username;
+          }
+        }
+      }
+
+      // Fetch Audio Tracks:
+      // Always prefer user-scoped /Users/${userId}/Items so Quick Connect & non-admin user tokens succeed!
+      const globalAudioUrl = buildJellyfinGlobalAudioItemsUrl(cleanUrl, token);
+      const primaryAudioUrl = userId
+        ? buildJellyfinUserAudioItemsUrl(cleanUrl, userId, token)
+        : globalAudioUrl;
+
+      let itemsRes = await MusicProviderManager.fetchJellyfinGet(
+        primaryAudioUrl,
+        token
+      );
+
+      // If the saved session token expired (401) and we have Username + Password, re-authenticate automatically!
+      if (
+        !itemsRes.ok &&
+        itemsRes.status === 401 &&
+        cleanUsername &&
+        cleanPassword &&
+        cleanPassword !== token
+      ) {
+        const reAuth =
+          await MusicProviderManager.authenticateByUsernamePassword(
+            cleanUrl,
+            cleanUsername,
+            cleanPassword
+          );
+        token = reAuth.token;
+        userId = reAuth.userId;
+        matchedUserName = reAuth.username;
+        if (config.type === 'jellyfin') {
+          try {
+            localStorage.setItem(JELLYFIN_TOKEN_STORAGE_KEY, token);
+            localStorage.setItem(JELLYFIN_USER_ID_STORAGE_KEY, userId);
+          } catch {
+            // ignore
+          }
+        }
+        itemsRes = await MusicProviderManager.fetchJellyfinGet(
+          buildJellyfinUserAudioItemsUrl(cleanUrl, userId, token),
+          token
+        );
+      }
+
+      // If userId was stale, resolve /Users/Me and retry
+      if (!itemsRes.ok && userId) {
+        const refreshedMe =
+          await MusicProviderManager.resolveJellyfinUserFromMe(cleanUrl, token);
+        if (refreshedMe?.userId && refreshedMe.userId !== userId) {
+          userId = refreshedMe.userId;
+          itemsRes = await MusicProviderManager.fetchJellyfinGet(
+            buildJellyfinUserAudioItemsUrl(cleanUrl, userId, token),
+            token
+          );
+        }
+        if (!itemsRes.ok) {
+          itemsRes = await MusicProviderManager.fetchJellyfinGet(
+            globalAudioUrl,
+            token
           );
         }
       }
 
-      // Fetch Real Audio Tracks using ?api_key={token} query param (no custom headers -> avoids CORS preflight!)
-      const itemsUrl = `${cleanUrl}/Users/${encodeURIComponent(
-        userId
-      )}/Items?IncludeItemTypes=Audio&Recursive=true&Fields=MediaSources,NormalizationGain,Album,Artists&Limit=2000&api_key=${encodeURIComponent(
-        token
-      )}`;
-
-      const itemsRes = await fetch(itemsUrl, { method: 'GET' });
       if (!itemsRes.ok) {
         throw new Error(
-          `GET /Users/${userId}/Items (Audio) returned HTTP ${itemsRes.status}`
+          `Jellyfin Audio fetch returned HTTP ${itemsRes.status} (${itemsRes.statusText || 'Unauthorized — try logging out and reconnecting'})`
         );
       }
 
@@ -780,6 +1092,7 @@ export class MusicProviderManager {
         const artist = String(
           item.AlbumArtist ||
             (Array.isArray(item.Artists) && item.Artists[0]) ||
+            (Array.isArray(item.ArtistItems) && item.ArtistItems[0]?.Name) ||
             'Unknown Artist'
         );
         const album = String(item.Album || 'Single');
@@ -814,6 +1127,10 @@ export class MusicProviderManager {
               config.type.toUpperCase()
             );
 
+        const genres: string[] = Array.isArray(item.Genres)
+          ? item.Genres.map((g: any) => String(g))
+          : [];
+
         return {
           id: `${config.type}-${id}`,
           title,
@@ -838,6 +1155,8 @@ export class MusicProviderManager {
           ),
           artworkUrl,
           accentColor: config.type === 'jellyfin' ? '#10b981' : '#a855f7',
+          genre: genres[0] || undefined,
+          tags: genres.length > 0 ? genres : undefined,
           normalizationGain: normGain,
           bitrateKbps: bitrate,
           format: container,
@@ -852,66 +1171,152 @@ export class MusicProviderManager {
         }
       }
 
-      // Fetch Real Playlists using ?api_key={token}
+      // Fetch Real Playlists using multi-strategy discovery so no Jellyfin playlists are missed:
+      // 1. /Users/${userId}/Items?IncludeItemTypes=Playlist&Recursive=true
+      // 2. /Users/${userId}/Views -> playlists collection folder -> /Users/${userId}/Items?ParentId=${viewId}
+      // 3. /Items?IncludeItemTypes=Playlist&Recursive=true
       const fetchedPlaylists: Playlist[] = [];
       try {
-        const playlistsUrl = `${cleanUrl}/Users/${encodeURIComponent(
-          userId
-        )}/Items?IncludeItemTypes=Playlist&Recursive=true&api_key=${encodeURIComponent(
-          token
-        )}`;
-        const plRes = await fetch(playlistsUrl, { method: 'GET' });
-        if (plRes.ok) {
-          const plData = await plRes.json();
-          const rawPlaylists: Record<string, any>[] = Array.isArray(
-            plData.Items
-          )
-            ? plData.Items
-            : [];
+        const rawPlaylistsMap = new Map<string, Record<string, any>>();
 
-          for (const plItem of rawPlaylists) {
-            if (!plItem?.Id) continue;
-            const plId = String(plItem.Id);
-            const plName = String(plItem.Name || 'Jellyfin Playlist');
-            const plItemsUrl = `${cleanUrl}/Playlists/${encodeURIComponent(
-              plId
-            )}/Items?UserId=${encodeURIComponent(
-              userId
-            )}&Fields=MediaSources,NormalizationGain&api_key=${encodeURIComponent(
-              token
-            )}`;
-
-            try {
-              const plTracksRes = await fetch(plItemsUrl, { method: 'GET' });
-              if (plTracksRes.ok) {
-                const plTracksData = await plTracksRes.json();
-                const rawPlTracks: Record<string, any>[] = Array.isArray(
-                  plTracksData.Items
-                )
-                  ? plTracksData.Items
-                  : [];
-                const plTrackIds: string[] = [];
-                for (const rawTr of rawPlTracks) {
-                  if (!rawTr?.Id) continue;
-                  const mapped = mapJellyfinItemToTrack(rawTr);
-                  if (!trackById.has(mapped.id)) {
-                    trackById.set(mapped.id, mapped);
-                  }
-                  plTrackIds.push(mapped.id);
-                }
-                fetchedPlaylists.push({
-                  id: `${config.type}-pl-${plId}`,
-                  name: plName,
-                  description: `Synced from ${config.name} (${plTrackIds.length} tracks)`,
-                  source: config.type,
-                  trackIds: plTrackIds,
-                  createdAt: new Date().toISOString().slice(0, 10),
-                  coverAccent: '#10b981',
-                });
+        const collectPlaylistsFromUrl = async (url: string) => {
+          try {
+            const res = await MusicProviderManager.fetchJellyfinGet(url, token);
+            if (!res.ok) return;
+            const json = await res.json();
+            const items: Record<string, any>[] = Array.isArray(json?.Items)
+              ? json.Items
+              : [];
+            for (const item of items) {
+              if (
+                item?.Id &&
+                (!item.Type ||
+                  String(item.Type).toLowerCase() === 'playlist' ||
+                  String(item.CollectionType || '').toLowerCase() === 'playlists')
+              ) {
+                rawPlaylistsMap.set(String(item.Id), item);
               }
-            } catch {
-              // Skip individual playlist if its items request fails
             }
+          } catch {
+            // ignore individual discovery endpoint error
+          }
+        };
+
+        if (userId) {
+          await collectPlaylistsFromUrl(
+            buildJellyfinUserPlaylistsUrl(cleanUrl, userId, token)
+          );
+        }
+
+        // If 0 playlists found via recursive query, also check /Users/${userId}/Views for a Playlists library view
+        if (rawPlaylistsMap.size === 0 && userId) {
+          try {
+            const viewsRes = await MusicProviderManager.fetchJellyfinGet(
+              `${cleanUrl}/Users/${encodeURIComponent(
+                userId
+              )}/Views?api_key=${encodeURIComponent(token)}`,
+              token
+            );
+            if (viewsRes.ok) {
+              const viewsJson = await viewsRes.json();
+              const views: Record<string, any>[] = Array.isArray(
+                viewsJson?.Items
+              )
+                ? viewsJson.Items
+                : [];
+              for (const v of views) {
+                const colType = String(v?.CollectionType || '').toLowerCase();
+                const vName = String(v?.Name || '').toLowerCase();
+                if (
+                  v?.Id &&
+                  (colType === 'playlists' || vName.includes('playlist'))
+                ) {
+                  await collectPlaylistsFromUrl(
+                    `${cleanUrl}/Users/${encodeURIComponent(
+                      userId
+                    )}/Items?ParentId=${encodeURIComponent(
+                      String(v.Id)
+                    )}&Recursive=true&api_key=${encodeURIComponent(token)}`
+                  );
+                }
+              }
+            }
+          } catch {
+            // ignore
+          }
+        }
+
+        if (rawPlaylistsMap.size === 0) {
+          await collectPlaylistsFromUrl(
+            buildJellyfinGlobalPlaylistsUrl(cleanUrl, token)
+          );
+        }
+
+        for (const [plId, plItem] of rawPlaylistsMap.entries()) {
+          const plName = String(plItem.Name || 'Jellyfin Playlist');
+          const plItemsUrl = buildJellyfinPlaylistItemsUrl(
+            cleanUrl,
+            plId,
+            userId,
+            token
+          );
+
+          try {
+            let plTracksRes = await MusicProviderManager.fetchJellyfinGet(
+              plItemsUrl,
+              token
+            );
+            if (!plTracksRes.ok && userId) {
+              plTracksRes = await MusicProviderManager.fetchJellyfinGet(
+                `${cleanUrl}/Users/${encodeURIComponent(
+                  userId
+                )}/Items?ParentId=${encodeURIComponent(
+                  plId
+                )}&Fields=MediaSources,NormalizationGain,Album,Artists&api_key=${encodeURIComponent(
+                  token
+                )}`,
+                token
+              );
+            }
+            if (!plTracksRes.ok) {
+              plTracksRes = await MusicProviderManager.fetchJellyfinGet(
+                `${cleanUrl}/Items?ParentId=${encodeURIComponent(
+                  plId
+                )}&Fields=MediaSources,NormalizationGain,Album,Artists&api_key=${encodeURIComponent(
+                  token
+                )}`,
+                token
+              );
+            }
+
+            if (plTracksRes.ok) {
+              const plTracksData = await plTracksRes.json();
+              const rawPlTracks: Record<string, any>[] = Array.isArray(
+                plTracksData.Items
+              )
+                ? plTracksData.Items
+                : [];
+              const plTrackIds: string[] = [];
+              for (const rawTr of rawPlTracks) {
+                if (!rawTr?.Id) continue;
+                const mapped = mapJellyfinItemToTrack(rawTr);
+                if (!trackById.has(mapped.id)) {
+                  trackById.set(mapped.id, mapped);
+                }
+                plTrackIds.push(mapped.id);
+              }
+              fetchedPlaylists.push({
+                id: `${config.type}-pl-${plId}`,
+                name: plName,
+                description: `Synced from ${config.name} (${plTrackIds.length} tracks)`,
+                source: config.type,
+                trackIds: plTrackIds,
+                createdAt: new Date().toISOString().slice(0, 10),
+                coverAccent: '#10b981',
+              });
+            }
+          } catch {
+            // Skip individual playlist if its items request fails
           }
         }
       } catch {
@@ -919,14 +1324,31 @@ export class MusicProviderManager {
       }
 
       const allSyncedTracks = Array.from(trackById.values());
-      const diagnosticMsg = `✅ Authenticated as ${matchedUserName} (ID: ${userId}) -> Loaded ${allSyncedTracks.length} songs & ${fetchedPlaylists.length} playlists`;
+
+      // If the user has audio tracks in Jellyfin, ensure there is also a "All Jellyfin Songs" playlist if they have 0 custom playlists
+      if (fetchedPlaylists.length === 0 && allSyncedTracks.length > 0) {
+        fetchedPlaylists.push({
+          id: `${config.type}-pl-all-tracks`,
+          name: `${config.name} · All Songs`,
+          description: `All ${allSyncedTracks.length} tracks synced from ${config.name}`,
+          source: config.type,
+          trackIds: allSyncedTracks.map((t) => t.id),
+          createdAt: new Date().toISOString().slice(0, 10),
+          coverAccent: '#10b981',
+        });
+      }
+
+      const diagnosticMsg = `✅ Connected as ${matchedUserName}! Loaded ${allSyncedTracks.length} tracks & ${fetchedPlaylists.length} playlists`;
 
       const updatedConfig: ProviderConfig = {
         ...config,
         enabled: true,
+        serverUrl: cleanUrl,
+        authMode: 'session',
+        username: matchedUserName || cleanUsername,
+        password: cleanPassword,
         token,
         userId,
-        username: config.username?.trim() || matchedUserName,
         status: 'connected',
         lastMessage: diagnosticMsg,
         diagnosticLog: diagnosticMsg,
@@ -935,7 +1357,7 @@ export class MusicProviderManager {
       };
 
       let restoredCloudSettings: BrokeifyCloudSettings | null = null;
-      if (config.type === 'jellyfin') {
+      if (config.type === 'jellyfin' && userId) {
         const pullRes =
           await MusicProviderManager.pullCloudSettingsFromJellyfin(
             updatedConfig
@@ -950,25 +1372,21 @@ export class MusicProviderManager {
         restoredCloudSettings,
       };
     } catch (err: any) {
-      // ZERO FAKE TRACK FALLBACK: Do NOT mount mock tracks!
-      // Preserve existing token/userId (Zero-Logout) and keep any previously cached real tracks for this server.
+      // ZERO FAKE TRACK FALLBACK: Never mount mock tracks on error!
       const existingRealTracks =
         MusicProviderManager.loadCachedRemoteTracks().filter(
           (t) => t.source === config.type
         );
       const errorDetail =
         err instanceof Error ? err.message : String(err || 'Network / CORS error');
-      const diagError = `❌ ${errorDetail}${
-        existingRealTracks.length > 0
-          ? ` (Zero-Logout: Preserved session & ${existingRealTracks.length} cached tracks)`
-          : ''
-      }`;
+      const diagError = `❌ ${errorDetail}`;
 
       return {
         updatedConfig: {
           ...config,
-          token: token || config.token,
-          userId: userId || config.userId,
+          serverUrl: cleanUrl,
+          username: cleanUsername,
+          password: cleanPassword,
           status: 'error',
           lastMessage: diagError,
           diagnosticLog: diagError,
@@ -1334,5 +1752,173 @@ export class MusicProviderManager {
         format: 'FLAC/MP3',
       },
     ];
+  }
+
+  /**
+   * 5. "Play More Like This" (Smart AI Instant Mix Engine)
+   * 1. If connected to Jellyfin, calls GET {serverUrl}/Items/{trackId}/InstantMix?UserId={userId}&Limit=25&api_key={token}
+   *    (with fallback to direct header auth) to pull Jellyfin's server-analyzed smart radio mix.
+   * 2. If using local/offline/demo tracks or if InstantMix returns empty, executes the client-side similarity algorithm
+   *    (genre, tags, tempo/BPM, vibe) and shuffles up to 25 matching songs into "${track.title} Radio (Instant Mix)".
+   */
+  static async generateInstantMix(
+    seedTrack: Track,
+    catalog: readonly Track[],
+    jellyfinConfig?: ProviderConfig
+  ): Promise<{
+    mixTracks: Track[];
+    playlist: Playlist;
+    usedJellyfinApi: boolean;
+  }> {
+    const cleanServer = (jellyfinConfig?.serverUrl ?? '').trim().replace(/\/+$/, '');
+    const token = (
+      jellyfinConfig?.token ??
+      jellyfinConfig?.password ??
+      ''
+    ).trim();
+    const userId = (jellyfinConfig?.userId ?? '').trim();
+
+    if (cleanServer && token && seedTrack.source === 'jellyfin') {
+      try {
+        const instantMixUrl = buildJellyfinInstantMixUrl(
+          cleanServer,
+          seedTrack.id,
+          token,
+          userId,
+          25
+        );
+        let res = await fetch(instantMixUrl, { method: 'GET' });
+        if (!res.ok) {
+          // Fallback to direct Authorization header without UserId param
+          const fallbackUrl = buildJellyfinInstantMixUrl(
+            cleanServer,
+            seedTrack.id,
+            token,
+            '',
+            25
+          );
+          res = await fetch(fallbackUrl, {
+            method: 'GET',
+            headers: {
+              Authorization: buildEmbyAuthHeader(token),
+              'X-Emby-Authorization': buildEmbyAuthHeader(token),
+            },
+          });
+        }
+
+        if (res.ok) {
+          const data = await res.json();
+          const rawItems: Record<string, any>[] = Array.isArray(data.Items)
+            ? data.Items
+            : [];
+          if (rawItems.length > 0) {
+            const mixTracks: Track[] = rawItems.map((item) => {
+              const id = String(item.Id || '');
+              const title = String(item.Name || 'Untitled Track');
+              const artist = String(
+                item.AlbumArtist ||
+                  (Array.isArray(item.Artists) && item.Artists[0]) ||
+                  'Unknown Artist'
+              );
+              const album = String(item.Album || 'Single');
+              const runTimeTicks = Number(item.RunTimeTicks || 1800000000);
+              const duration = Math.max(1, Math.round(runTimeTicks / 10000000));
+              const normGain =
+                typeof item.NormalizationGain === 'number'
+                  ? Number(item.NormalizationGain.toFixed(2))
+                  : undefined;
+              const genres: string[] = Array.isArray(item.Genres)
+                ? item.Genres.map((g: any) => String(g))
+                : [];
+              const hasImage = Boolean(
+                item.ImageTags?.Primary || item.AlbumPrimaryImageTag
+              );
+              const imageItemId = item.AlbumId || id;
+              const artworkUrl = hasImage
+                ? `${cleanServer}/Items/${encodeURIComponent(
+                    imageItemId
+                  )}/Images/Primary?maxHeight=300&maxWidth=300&quality=85&api_key=${encodeURIComponent(
+                    token
+                  )}`
+                : createAlbumArtworkDataUri(
+                    title,
+                    artist,
+                    '#10b981',
+                    '#06b6d4',
+                    'JELLYFIN'
+                  );
+
+              return {
+                id: `jellyfin-${id}`,
+                title,
+                artist,
+                album,
+                duration,
+                source: 'jellyfin',
+                sourceName: jellyfinConfig?.name || 'Jellyfin Media Server',
+                streamUrl: buildJellyfinStreamUrl(
+                  cleanServer,
+                  id,
+                  token,
+                  userId,
+                  false
+                ),
+                fallbackStreamUrl: buildJellyfinStreamUrl(
+                  cleanServer,
+                  id,
+                  token,
+                  userId,
+                  true
+                ),
+                artworkUrl,
+                accentColor: '#10b981',
+                genre: genres[0] || undefined,
+                tags: genres.length > 0 ? genres : undefined,
+                normalizationGain: normGain,
+                bitrateKbps: 320,
+                format: 'MP3',
+              };
+            });
+
+            const playlist: Playlist = {
+              id: `pl-instantmix-${Date.now()}`,
+              name: `${seedTrack.title} Radio (Instant Mix)`,
+              description: `Jellyfin Smart InstantMix radio seeded from "${seedTrack.title}" by ${seedTrack.artist}.`,
+              source: 'jellyfin',
+              trackIds: mixTracks.map((t) => t.id),
+              createdAt: new Date().toISOString().slice(0, 10),
+              coverAccent: '#a855f7',
+            };
+
+            return {
+              mixTracks,
+              playlist,
+              usedJellyfinApi: true,
+            };
+          }
+        }
+      } catch {
+        // Fall through to client-side similarity algorithm
+      }
+    }
+
+    const mixTracks = buildClientInstantMix(seedTrack, catalog, 25);
+    const playlist: Playlist = {
+      id: `pl-instantmix-${Date.now()}`,
+      name: `${seedTrack.title} Radio (Instant Mix)`,
+      description: `Smart Instant Mix based on "${seedTrack.title}" (${
+        seedTrack.genre || 'genre & tempo affinity'
+      }).`,
+      source: 'mixed',
+      trackIds: mixTracks.map((t) => t.id),
+      createdAt: new Date().toISOString().slice(0, 10),
+      coverAccent: '#a855f7',
+    };
+
+    return {
+      mixTracks,
+      playlist,
+      usedJellyfinApi: false,
+    };
   }
 }
