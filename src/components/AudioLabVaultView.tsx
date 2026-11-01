@@ -6,7 +6,6 @@ import {
   Gauge,
   Sliders,
   Trash2,
-  Volume2,
 } from 'lucide-react';
 import type { EQPresetName, Track } from '../types/music';
 import {
@@ -20,6 +19,7 @@ import {
   preloadTrackToVault,
   removeTrackFromVault,
 } from '../utils/offlineVault';
+import { SlidingToggle } from './SlidingToggle';
 
 interface AudioLabVaultViewProps {
   currentTrack: Track | null;
@@ -124,19 +124,13 @@ export const AudioLabVaultView: React.FC<AudioLabVaultViewProps> = ({
                   synth drops stay at the same comfortable highway volume.
                 </p>
               </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={carVolumeLeveler}
-                onClick={() => onToggleCarVolumeLeveler(!carVolumeLeveler)}
-                className={`px-3.5 py-2 rounded-xl text-xs font-semibold transition-colors whitespace-nowrap shrink-0 min-h-[40px] ${
-                  carVolumeLeveler
-                    ? 'bg-emerald-500 text-zinc-950'
-                    : 'bg-zinc-800 text-zinc-300 hover:text-white'
-                }`}
-              >
-                {carVolumeLeveler ? 'Active (-24dB / 12:1)' : 'Bypassed'}
-              </button>
+              <SlidingToggle
+                checked={carVolumeLeveler}
+                onChange={onToggleCarVolumeLeveler}
+                label={carVolumeLeveler ? 'ON' : 'OFF'}
+                ariaLabel="Toggle Car Mode Volume Leveler"
+                testId="audiolab-toggle-car-leveler"
+              />
             </div>
 
             {/* Toggle 2: ReplayGain / LUFS NormalizationGain */}
@@ -155,21 +149,13 @@ export const AudioLabVaultView: React.FC<AudioLabVaultViewProps> = ({
                   </span>
                 </p>
               </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={lufsNormalizationEnabled}
-                onClick={() =>
-                  onToggleLufsNormalization(!lufsNormalizationEnabled)
-                }
-                className={`px-3.5 py-2 rounded-xl text-xs font-semibold transition-colors whitespace-nowrap shrink-0 min-h-[40px] ${
-                  lufsNormalizationEnabled
-                    ? 'bg-purple-500 text-white'
-                    : 'bg-zinc-800 text-zinc-300 hover:text-white'
-                }`}
-              >
-                {lufsNormalizationEnabled ? 'LUFS On' : 'LUFS Off'}
-              </button>
+              <SlidingToggle
+                checked={lufsNormalizationEnabled}
+                onChange={onToggleLufsNormalization}
+                label={lufsNormalizationEnabled ? 'ON' : 'OFF'}
+                ariaLabel="Toggle Jellyfin Subsonic LUFS GainNode"
+                testId="audiolab-toggle-lufs"
+              />
             </div>
           </div>
         </section>

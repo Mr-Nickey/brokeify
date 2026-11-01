@@ -15,6 +15,8 @@ import {
   serializeCloudSettingsPayload,
   parseCloudSettingsResponse,
   mergeProvidersPreservingAuth,
+  isLikelyJellyfinApiKey,
+  matchJellyfinUserFromList,
 } from './musicLogic';
 import type { BrokeifyCloudSettings, ProviderConfig, Track } from '../types/music';
 
@@ -53,16 +55,18 @@ test('lufsToLinearGain converts dB offsets accurately and clamps extremes', () =
 test('Jellyfin, Subsonic, and Plex URL builders produce spec-compliant endpoints', () => {
   const header = buildEmbyAuthHeader('tok123');
   assert.ok(header.includes('Client="Brokeify"'));
-  assert.ok(header.includes('Device="BrokeifyMobile"'));
+  assert.ok(header.includes('Device="BrokeifyWeb"'));
   assert.ok(header.includes('DeviceId="brokeify-01"'));
   assert.ok(header.includes('Token="tok123"'));
 
-  const jfUniversal = buildJellyfinStreamUrl('https://jf.local/', 'item99', 'secretKey', 'user1', false);
-  assert.ok(jfUniversal.startsWith('https://jf.local/Audio/item99/universal?'));
+  const jfUniversal = buildJellyfinStreamUrl('https://jellyfin.flockingreeds.farm/', 'item99', 'secretKey', 'user1', false);
+  assert.ok(jfUniversal.startsWith('https://jellyfin.flockingreeds.farm/Audio/item99/universal?'));
+  assert.ok(jfUniversal.includes('Container=opus%2Cmp3%2Caac%2Cflac%2Cwav'));
+  assert.ok(jfUniversal.includes('AudioCodec=mp3'));
   assert.ok(jfUniversal.includes('api_key=secretKey'));
 
-  const jfDirect = buildJellyfinStreamUrl('https://jf.local/', 'item99', 'secretKey', 'user1', true);
-  assert.equal(jfDirect, 'https://jf.local/Items/item99/Download?api_key=secretKey');
+  const jfDirect = buildJellyfinStreamUrl('https://jellyfin.flockingreeds.farm/', 'item99', 'secretKey', 'user1', true);
+  assert.equal(jfDirect, 'https://jellyfin.flockingreeds.farm/Items/item99/Download?api_key=secretKey');
 
   const subsonic = buildSubsonicUrl(
     'https://navi.local',
@@ -77,6 +81,24 @@ test('Jellyfin, Subsonic, and Plex URL builders produce spec-compliant endpoints
 
   const plex = buildPlexStreamUrl('http://192.168.1.50:32400/', '/library/parts/104/file.flac', 'plexTok');
   assert.equal(plex, 'http://192.168.1.50:32400/library/parts/104/file.flac?X-Plex-Token=plexTok');
+});
+
+test('isLikelyJellyfinApiKey and matchJellyfinUserFromList support Method A API Key authentication', () => {
+  assert.equal(isLikelyJellyfinApiKey('a1b2c3d4e5f60718293a4b5c6d7e8f90'), true);
+  assert.equal(isLikelyJellyfinApiKey('my-regular-password'), false);
+
+  const sampleUsers = [
+    { Id: 'u-guest', Name: 'Guest', Policy: { IsAdministrator: false } },
+    { Id: 'u-nicky', Name: 'Nicky', Policy: { IsAdministrator: true } },
+  ];
+  assert.deepEqual(matchJellyfinUserFromList(sampleUsers, 'nicky'), {
+    id: 'u-nicky',
+    name: 'Nicky',
+  });
+  assert.deepEqual(matchJellyfinUserFromList(sampleUsers, ''), {
+    id: 'u-nicky',
+    name: 'Nicky',
+  });
 });
 
 test('parseSpotifyExport and crossResolveTrack resolve tracks against catalog', () => {

@@ -160,7 +160,7 @@ export async function clearOfflineVault(): Promise<void> {
  * If a remote stream blocks CORS fetch(), it falls back to synthesizing an offline proxy blob
  * so the 2-song lookahead preloader and offline playlist downloader never fail.
  */
-export async function preloadTrackToVault(track: Track): Promise<Blob> {
+export async function preloadTrackToVault(track: Track): Promise<Blob | null> {
   const existing = await getCachedTrackBlob(track.id);
   if (existing) return existing;
 
@@ -181,23 +181,39 @@ export async function preloadTrackToVault(track: Track): Promise<Blob> {
     return blob;
   }
 
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 6000);
-    const response = await fetch(track.streamUrl, {
-      signal: controller.signal,
-      mode: 'cors',
-    });
-    clearTimeout(timer);
-    if (response.ok) {
-      const blob = await response.blob();
-      if (blob.size > 1024) {
-        await saveTrackBlobToVault(track, blob);
-        return blob;
+  const candidateUrls = [track.streamUrl, track.fallbackStreamUrl].filter(
+    (u): u is string => Boolean(u)
+  );
+
+  for (const url of candidateUrls) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 12000);
+      const response = await fetch(url, {
+        signal: controller.signal,
+        mode: 'cors',
+      });
+      clearTimeout(timer);
+      if (response.ok) {
+        const blob = await response.blob();
+        if (blob.size > 1024) {
+          await saveTrackBlobToVault(track, blob);
+          return blob;
+        }
       }
+    } catch {
+      // Try next candidate URL
     }
-  } catch {
-    // CORS or live stream restriction — generate offline acoustic proxy blob for dead-zone vault
+  }
+
+  // Never substitute fake synth audio for real self-hosted server tracks
+  if (
+    track.source === 'jellyfin' ||
+    track.source === 'emby' ||
+    track.source === 'navidrome' ||
+    track.source === 'plex'
+  ) {
+    return null;
   }
 
   const fallbackBlob = synthesizeWavBlob(track.id, defaultRecipe, 20);

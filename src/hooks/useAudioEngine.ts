@@ -339,23 +339,53 @@ export function useAudioEngine(initialQueue: Track[]) {
         activeObjectUrlRef.current = null;
       }
 
+      const isSelfHostedTrack =
+        track.source === 'jellyfin' ||
+        track.source === 'emby' ||
+        track.source === 'navidrome' ||
+        track.source === 'plex';
+
       if (blob) {
         const objUrl = URL.createObjectURL(blob);
         activeObjectUrlRef.current = objUrl;
-        audio.crossOrigin = 'anonymous';
+        if (!sourceNodeRef.current) {
+          audio.crossOrigin = 'anonymous';
+        }
         audio.src = objUrl;
       } else {
-        audio.crossOrigin = 'anonymous';
+        // For remote self-hosted tracks, omit crossOrigin if Web Audio MediaElementSource hasn't locked it,
+        // or try anonymous first and fall back to direct /Download URL if needed
+        if (!sourceNodeRef.current && isSelfHostedTrack) {
+          audio.removeAttribute('crossOrigin');
+        } else {
+          audio.crossOrigin = 'anonymous';
+        }
         audio.src = track.streamUrl;
       }
 
       if (autoPlay) {
-        ensureAudioGraph();
+        if (!isSelfHostedTrack || blob) {
+          ensureAudioGraph();
+        }
         try {
           await audio.play();
           setIsPlaying(true);
         } catch {
-          // Graceful CORS / stream fallback: synthesize local WAV proxy if remote stream fails
+          // If a real server track failed on universal stream URL, retry with direct Download fallback URL without crossOrigin
+          if (isSelfHostedTrack) {
+            try {
+              audio.removeAttribute('crossOrigin');
+              audio.src = track.fallbackStreamUrl || track.streamUrl;
+              await audio.play();
+              setIsPlaying(true);
+              return;
+            } catch {
+              setIsPlaying(false);
+              return;
+            }
+          }
+
+          // Graceful fallback for built-in / cloud demo streams only
           const fallbackBlob = synthesizeWavBlob(
             track.id,
             track.synthRecipe || {

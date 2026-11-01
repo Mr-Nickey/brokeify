@@ -69,12 +69,57 @@ export function lufsToLinearGain(normalizationGainDb?: number): number {
  */
 export function buildEmbyAuthHeader(token?: string): string {
   const base =
-    'MediaBrowser Client="Brokeify", Device="BrokeifyMobile", DeviceId="brokeify-01", Version="2.0.0"';
+    'MediaBrowser Client="Brokeify", Device="BrokeifyWeb", DeviceId="brokeify-01", Version="2.0.0"';
   return token ? `${base}, Token="${token}"` : base;
 }
 
 /**
- * Builds a Jellyfin or Emby stream URL (/Audio/{itemId}/universal or /Items/{itemId}/Download).
+ * Detects whether a credential string is a 32-character hexadecimal Jellyfin API Key.
+ */
+export function isLikelyJellyfinApiKey(value?: string): boolean {
+  if (!value) return false;
+  return /^[0-9a-f]{32}$/i.test(value.trim());
+}
+
+/**
+ * Matches a Jellyfin user from GET /Users?api_key={apiKey} response array:
+ * 1. Matches where Name.toLowerCase() === username.toLowerCase()
+ * 2. Or picks the first administrator user (Policy.IsAdministrator === true)
+ * 3. Or picks the first user in the list.
+ */
+export function matchJellyfinUserFromList(
+  users: readonly Record<string, any>[],
+  username?: string
+): { id: string; name: string } | null {
+  if (!Array.isArray(users) || users.length === 0) return null;
+  const target = (username || '').trim().toLowerCase();
+
+  if (target) {
+    const exact = users.find(
+      (u) => String(u?.Name || '').trim().toLowerCase() === target
+    );
+    if (exact && exact.Id) {
+      return { id: String(exact.Id), name: String(exact.Name || username) };
+    }
+  }
+
+  const adminUser = users.find((u) => u?.Policy?.IsAdministrator === true && u?.Id);
+  if (adminUser) {
+    return { id: String(adminUser.Id), name: String(adminUser.Name || 'Admin') };
+  }
+
+  const first = users.find((u) => u?.Id);
+  if (first) {
+    return { id: String(first.Id), name: String(first.Name || 'User') };
+  }
+
+  return null;
+}
+
+/**
+ * Builds a Jellyfin or Emby stream URL:
+ * Universal: {serverUrl}/Audio/{itemId}/universal?UserId={userId}&DeviceId=brokeify-01&MaxStreamingBitrate=320000&Container=opus,mp3,aac,flac,wav&AudioCodec=mp3&api_key={token}
+ * Direct fallback: {serverUrl}/Items/{itemId}/Download?api_key={token}
  */
 export function buildJellyfinStreamUrl(
   serverUrl: string,
@@ -91,8 +136,8 @@ export function buildJellyfinStreamUrl(
     UserId: userId,
     DeviceId: 'brokeify-01',
     MaxStreamingBitrate: '320000',
-    Container: 'opus,mp3,aac,m4a,flac,wav',
-    AudioCodec: 'mp3,aac,opus',
+    Container: 'opus,mp3,aac,flac,wav',
+    AudioCodec: 'mp3',
     api_key: token,
   });
   return `${cleanBase}/Audio/${encodeURIComponent(itemId)}/universal?${params.toString()}`;
@@ -323,11 +368,15 @@ export function crossResolveTrack(
  */
 export function buildJellyfinDisplayPrefsUrl(
   serverUrl: string,
-  userId: string
+  userId: string,
+  apiKey?: string
 ): string {
   const cleanBase = serverUrl.trim().replace(/\/+$/, '');
   const safeUser = encodeURIComponent(userId.trim() || 'brokeify-user');
-  return `${cleanBase}/DisplayPreferences/brokeify?userId=${safeUser}&client=Brokeify`;
+  const base = `${cleanBase}/DisplayPreferences/brokeify?userId=${safeUser}&client=Brokeify`;
+  return apiKey?.trim()
+    ? `${base}&api_key=${encodeURIComponent(apiKey.trim())}`
+    : base;
 }
 
 /**

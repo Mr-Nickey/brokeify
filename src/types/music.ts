@@ -13,6 +13,7 @@ export interface ProviderConfig {
   name: string;
   enabled: boolean;
   serverUrl: string;
+  authMode?: 'apikey' | 'password';
   username?: string;
   password?: string;
   token?: string;
@@ -20,7 +21,9 @@ export interface ProviderConfig {
   salt?: string;
   status: 'connected' | 'disconnected' | 'testing' | 'error';
   lastMessage?: string;
+  diagnosticLog?: string;
   trackCount?: number;
+  playlistCount?: number;
 }
 
 export interface SynthRecipe {
@@ -43,6 +46,7 @@ export interface Track {
   source: ProviderType;
   sourceName: string;
   streamUrl: string;
+  fallbackStreamUrl?: string;
   artworkUrl: string;
   accentColor: string;
   /**

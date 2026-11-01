@@ -8,10 +8,8 @@ import {
   ArrowDownToLine,
   Car,
   CheckCircle2,
+  ChevronDown,
   ChevronUp,
-  Compass,
-  Disc3,
-  Gauge,
   ListMusic,
   ListPlus,
   Loader2,
@@ -29,10 +27,10 @@ import {
   Sparkles,
   Volume2,
   VolumeX,
-  WifiOff,
 } from 'lucide-react';
 import { BrokeifyLogo } from './components/BrokeifyLogo';
 import { PWAInstallButton } from './components/PWAInstallButton';
+import { SlidingToggle } from './components/SlidingToggle';
 import { SourcesHubView } from './components/SourcesHubView';
 import { SpotifyImporterView } from './components/SpotifyImporterView';
 import { AudioLabVaultView } from './components/AudioLabVaultView';
@@ -56,8 +54,11 @@ import {
   ROTATING_SPITE_TAGLINES,
 } from './utils/musicLogic';
 import { preloadTrackToVault } from './utils/offlineVault';
+import { createAlbumArtworkDataUri } from './utils/artworkGenerator';
 
 type ActiveTab = 'library' | 'sources' | 'spotify' | 'audiolab';
+
+type CollapsibleSectionKey = 'hero' | 'playlists' | 'catalog' | 'queue';
 
 function formatDuration(sec: number): string {
   const s = Math.max(0, Math.floor(sec));
@@ -65,6 +66,16 @@ function formatDuration(sec: number): string {
   const rem = s % 60;
   return `${mins}:${String(rem).padStart(2, '0')}`;
 }
+
+const SOURCE_LABELS: Record<ProviderType, string> = {
+  jellyfin: 'Jellyfin',
+  emby: 'Emby',
+  navidrome: 'Navidrome',
+  plex: 'Plex',
+  'built-in': 'Built-In Demo Tracks',
+  'radio-browser': 'Radio-Browser',
+  'internet-archive': 'Internet Archive',
+};
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('library');
@@ -86,6 +97,20 @@ export default function App() {
   const [offlineOnlyMode, setOfflineOnlyMode] = useState<boolean>(false);
   const [isCarModeOpen, setIsCarModeOpen] = useState<boolean>(false);
   const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
+
+  // Collapsible sections on the Library screen
+  const [collapsedSections, setCollapsedSections] = useState<
+    Record<CollapsibleSectionKey, boolean>
+  >({
+    hero: false,
+    playlists: false,
+    catalog: false,
+    queue: false,
+  });
+
+  const toggleSection = (key: CollapsibleSectionKey) => {
+    setCollapsedSections((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
 
   // Zero-Logout Persistent Storage & Jellyfin Cloud Sync State
   const [storagePersistStatus, setStoragePersistStatus] = useState<{
@@ -135,21 +160,55 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
-  // Merge Built-In Tracks with any synced Remote Tracks from active providers
-  const allTracks = useMemo(() => {
-    const enabledTypes = new Set(
+  // Enabled provider types
+  const enabledProviderTypes = useMemo(() => {
+    return new Set<ProviderType>(
       providers.filter((p) => p.enabled).map((p) => p.type)
     );
-    const combined = [...BUILT_IN_TRACKS, ...remoteTracks];
+  }, [providers]);
+
+  // Reset sourceFilter to 'all' if the currently selected filter source was toggled OFF
+  useEffect(() => {
+    if (sourceFilter !== 'all' && !enabledProviderTypes.has(sourceFilter)) {
+      setSourceFilter('all');
+    }
+  }, [enabledProviderTypes, sourceFilter]);
+
+  // Merge Built-In Tracks (only when 'built-in' is enabled) with synced Remote Tracks from active providers
+  const allTracks = useMemo(() => {
+    const combined = [
+      ...(enabledProviderTypes.has('built-in') ? BUILT_IN_TRACKS : []),
+      ...remoteTracks,
+    ];
     const seen = new Set<string>();
     return combined.filter((t) => {
       if (seen.has(t.id)) return false;
       seen.add(t.id);
-      return enabledTypes.has(t.source) || t.source === 'built-in';
+      return enabledProviderTypes.has(t.source);
     });
-  }, [providers, remoteTracks]);
+  }, [enabledProviderTypes, remoteTracks]);
 
-  const audio = useAudioEngine(BUILT_IN_TRACKS);
+  // Filter playlists so Built-In Demo playlists hide when Built-In Demo Tracks are toggled OFF
+  const visiblePlaylists = useMemo(() => {
+    return playlists.filter((pl) => {
+      if (pl.source === 'built-in' && !enabledProviderTypes.has('built-in')) {
+        return false;
+      }
+      if (
+        pl.source !== 'mixed' &&
+        pl.source !== 'spotify-import' &&
+        pl.source !== 'built-in' &&
+        !enabledProviderTypes.has(pl.source as ProviderType)
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }, [enabledProviderTypes, playlists]);
+
+  const audio = useAudioEngine(
+    allTracks.length > 0 ? allTracks : BUILT_IN_TRACKS
+  );
 
   const handleApplyRestoredCloudSettings = (
     restored: BrokeifyCloudSettings
@@ -199,7 +258,6 @@ export default function App() {
     if (settings) {
       handleApplyRestoredCloudSettings(settings);
     } else {
-      // No existing cloud settings on server yet — push current state to initialize
       await handlePushCloudSettings(jfConfig);
     }
   };
@@ -237,9 +295,11 @@ export default function App() {
     });
   };
 
-  // Auto-push settings to Jellyfin /DisplayPreferences/brokeify whenever EQ, Car Mode, or Playlists change while Jellyfin is enabled
+  // Auto-push settings to Jellyfin /DisplayPreferences/brokeify whenever EQ, Car Mode, or Playlists change while Jellyfin is connected
   useEffect(() => {
-    const jfConfig = providers.find((p) => p.type === 'jellyfin' && p.enabled);
+    const jfConfig = providers.find(
+      (p) => p.type === 'jellyfin' && p.enabled && p.token && p.userId
+    );
     if (!jfConfig) return;
 
     const snapshot: BrokeifyCloudSettings = {
@@ -276,27 +336,6 @@ export default function App() {
     playlists,
   ]);
 
-  // Fetch initial Radio-Browser & Internet Archive tracks in background on mount
-  useEffect(() => {
-    let mounted = true;
-    const bootstrapPublicCloud = async () => {
-      const existing = MusicProviderManager.loadCachedRemoteTracks();
-      if (existing.length > 0) return;
-      const [radioTracks, iaTracks] = await Promise.all([
-        MusicProviderManager.fetchRadioBrowserStations('rock'),
-        MusicProviderManager.fetchInternetArchiveTracks(),
-      ]);
-      if (!mounted) return;
-      const merged = [...radioTracks.slice(0, 4), ...iaTracks.slice(0, 3)];
-      setRemoteTracks(merged);
-      MusicProviderManager.saveCachedRemoteTracks(merged);
-    };
-    bootstrapPublicCloud();
-    return () => {
-      mounted = false;
-    };
-  }, []);
-
   const handleUpdateProviders = (next: ProviderConfig[]) => {
     setProviders((prev) => {
       const safeMerged = mergeProvidersPreservingAuth(prev, next);
@@ -312,6 +351,21 @@ export default function App() {
       for (const t of newTracks) map.set(t.id, t);
       const updated = Array.from(map.values());
       MusicProviderManager.saveCachedRemoteTracks(updated);
+      return updated;
+    });
+    if (newTracks.length > 0) {
+      audio.setQueue(newTracks);
+    }
+  };
+
+  const handleMergeRemotePlaylists = (newPlaylists: Playlist[]) => {
+    if (newPlaylists.length === 0) return;
+    setPlaylists((prev) => {
+      const byId = new Map<string, Playlist>();
+      for (const pl of prev) byId.set(pl.id, pl);
+      for (const pl of newPlaylists) byId.set(pl.id, pl);
+      const updated = Array.from(byId.values());
+      MusicProviderManager.savePlaylists(updated);
       return updated;
     });
   };
@@ -373,7 +427,9 @@ export default function App() {
 
   // Filtered tracks for main Library view
   const displayedTracks = useMemo(() => {
-    const activePlaylist = playlists.find((p) => p.id === selectedPlaylistId);
+    const activePlaylist = visiblePlaylists.find(
+      (p) => p.id === selectedPlaylistId
+    );
     const playlistTrackSet = activePlaylist
       ? new Set(activePlaylist.trackIds)
       : null;
@@ -403,11 +459,23 @@ export default function App() {
     allTracks,
     audio.cachedTrackIds,
     offlineOnlyMode,
-    playlists,
     searchQuery,
     selectedPlaylistId,
     sourceFilter,
+    visiblePlaylists,
   ]);
+
+  // Dynamic Source Filter Pills: ONLY show sources that are currently toggled ON
+  const activeFilterTabs = useMemo(() => {
+    const enabledList = providers.filter((p) => p.enabled);
+    return [
+      { id: 'all' as const, label: 'All Active Sources' },
+      ...enabledList.map((p) => ({
+        id: p.type,
+        label: SOURCE_LABELS[p.type] || p.name,
+      })),
+    ];
+  }, [providers]);
 
   const activeAmbientColor = audio.currentTrack?.accentColor || '#10b981';
 
@@ -504,79 +572,87 @@ export default function App() {
       </header>
 
       {/* Main Content Container */}
-      <main className="relative z-10 flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 pt-6 space-y-8">
-        {/* Hero / Rotating Spite Tagline & Workspace Utility Bar */}
+      <main className="relative z-10 flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 pt-5 space-y-6">
+        {/* Collapsible Hero / Quick Toggles Bar */}
         <section
-          aria-label="Brokeify Status and Rotating Tagline"
-          className="rounded-2xl border border-zinc-800/90 bg-zinc-900/40 p-4 sm:p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4"
+          aria-label="Brokeify Status and Quick Toggles"
+          className="rounded-2xl border border-zinc-800/90 bg-zinc-900/40 overflow-hidden"
         >
-          <div className="space-y-1">
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-zinc-400">
-              <span className="font-semibold text-emerald-400">
+          <div className="px-4 sm:px-5 py-3.5 flex items-center justify-between gap-4">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 min-w-0">
+              <span className="text-xs font-semibold text-emerald-400 whitespace-nowrap">
                 The All-In-One Free & Self-Hosted Music Aggregator
               </span>
-              <span aria-hidden="true">·</span>
-              <button
-                type="button"
-                onClick={() =>
-                  setTaglineIndex(
-                    (prev) => (prev + 1) % ROTATING_SPITE_TAGLINES.length
-                  )
-                }
-                className="text-zinc-300 hover:text-white underline underline-offset-4 whitespace-nowrap shrink-0"
+              <span className="text-zinc-600 hidden sm:inline" aria-hidden="true">
+                ·
+              </span>
+              <p
+                className="text-sm sm:text-base font-bold text-white tracking-tight truncate"
+                data-testid="rotating-spite-tagline"
               >
-                Next tagline
-              </button>
+                &ldquo;{ROTATING_SPITE_TAGLINES[taglineIndex]}&rdquo;
+              </p>
             </div>
-            <p
-              className="text-base sm:text-lg font-bold text-white tracking-tight"
-              data-testid="rotating-spite-tagline"
-            >
-              &ldquo;{ROTATING_SPITE_TAGLINES[taglineIndex]}&rdquo;
-            </p>
-          </div>
 
-          <div className="flex flex-wrap items-center gap-2.5">
-            {/* Offline Only Mode Toggle */}
             <button
               type="button"
-              role="switch"
-              aria-checked={offlineOnlyMode}
-              onClick={() => setOfflineOnlyMode(!offlineOnlyMode)}
-              className={`inline-flex items-center gap-2 rounded-xl border px-3.5 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 min-h-[40px] ${
-                offlineOnlyMode
-                  ? 'border-amber-500/60 bg-amber-500/15 text-amber-300'
-                  : 'border-zinc-800 bg-zinc-900/90 text-zinc-300 hover:text-white'
-              }`}
+              onClick={() => toggleSection('hero')}
+              aria-expanded={!collapsedSections.hero}
+              aria-label="Toggle Quick Controls section"
+              data-testid="collapse-hero-btn"
+              className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-zinc-400 hover:text-white hover:bg-zinc-800/60 transition-colors shrink-0"
             >
-              <WifiOff className="w-3.5 h-3.5" />
-              <span>
-                Offline Only Mode ({audio.cachedTrackIds.size} cached)
-              </span>
+              <span className="hidden sm:inline">Quick Toggles</span>
+              {collapsedSections.hero ? (
+                <ChevronDown className="w-4 h-4" />
+              ) : (
+                <ChevronUp className="w-4 h-4" />
+              )}
             </button>
-
-            {/* Quick Car Volume Leveler Toggle */}
-            <button
-              type="button"
-              role="switch"
-              aria-checked={audio.carVolumeLeveler}
-              onClick={() =>
-                audio.setCarVolumeLeveler(!audio.carVolumeLeveler)
-              }
-              className={`inline-flex items-center gap-2 rounded-xl border px-3.5 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 min-h-[40px] ${
-                audio.carVolumeLeveler
-                  ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
-                  : 'border-zinc-800 bg-zinc-900/90 text-zinc-400 hover:text-white'
-              }`}
-            >
-              <Gauge className="w-3.5 h-3.5" />
-              <span>
-                Car Leveler: {audio.carVolumeLeveler ? 'ON' : 'OFF'}
-              </span>
-            </button>
-
-            <PWAInstallButton />
           </div>
+
+          {!collapsedSections.hero && (
+            <div className="px-4 sm:px-5 pb-4 pt-2 border-t border-zinc-800/70 flex flex-wrap items-center justify-between gap-4">
+              <div className="flex flex-wrap items-center gap-5">
+                <div className="rounded-xl border border-zinc-800/90 bg-zinc-950/70 px-3.5 py-2 flex items-center">
+                  <SlidingToggle
+                    checked={offlineOnlyMode}
+                    onChange={setOfflineOnlyMode}
+                    label={`Offline Only Mode (${audio.cachedTrackIds.size} cached)`}
+                    ariaLabel="Toggle Offline Only Mode"
+                    size="sm"
+                    testId="hero-toggle-offline-mode"
+                  />
+                </div>
+
+                <div className="rounded-xl border border-zinc-800/90 bg-zinc-950/70 px-3.5 py-2 flex items-center">
+                  <SlidingToggle
+                    checked={audio.carVolumeLeveler}
+                    onChange={audio.setCarVolumeLeveler}
+                    label="Car Leveler"
+                    ariaLabel="Toggle Car Volume Leveler"
+                    size="sm"
+                    testId="hero-toggle-car-leveler"
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setTaglineIndex(
+                      (prev) => (prev + 1) % ROTATING_SPITE_TAGLINES.length
+                    )
+                  }
+                  className="text-xs text-zinc-400 hover:text-white underline underline-offset-4 whitespace-nowrap shrink-0"
+                >
+                  Next tagline
+                </button>
+                <PWAInstallButton />
+              </div>
+            </div>
+          )}
         </section>
 
         {/* Active View Switcher */}
@@ -586,6 +662,9 @@ export default function App() {
             onUpdateProviders={handleUpdateProviders}
             onMergeRemoteTracks={(tracks) => {
               handleMergeRemoteTracks(tracks);
+            }}
+            onMergeRemotePlaylists={(newPlaylists) => {
+              handleMergeRemotePlaylists(newPlaylists);
             }}
             storagePersistStatus={storagePersistStatus}
             cloudSyncStatus={cloudSyncStatus}
@@ -626,29 +705,39 @@ export default function App() {
         )}
 
         {activeTab === 'library' && (
-          <div className="space-y-8">
-            {/* Playlists Strip with One-Tap Offline Downloader */}
-            <section aria-labelledby="playlists-heading" className="space-y-4">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <div>
+          <div className="space-y-6">
+            {/* Collapsible Section: Unified Playlists */}
+            <section
+              aria-labelledby="playlists-heading"
+              className="rounded-2xl border border-zinc-800/90 bg-zinc-900/40 overflow-hidden"
+            >
+              <div className="px-5 py-4 flex flex-wrap items-center justify-between gap-3">
+                <button
+                  type="button"
+                  onClick={() => toggleSection('playlists')}
+                  aria-expanded={!collapsedSections.playlists}
+                  data-testid="collapse-playlists-btn"
+                  className="flex items-center gap-2.5 text-left group"
+                >
                   <h2
                     id="playlists-heading"
-                    className="text-xl font-bold text-white tracking-tight"
+                    className="text-lg font-bold text-white tracking-tight group-hover:text-emerald-400 transition-colors"
                   >
-                    Unified Playlists & One-Tap Offline Vault
+                    Unified Playlists ({visiblePlaylists.length})
                   </h2>
-                  <p className="text-xs text-zinc-400 mt-0.5">
-                    Download any playlist into IndexedDB (`brokeify-offline-vault`)
-                    on Wi-Fi before driving through dead zones.
-                  </p>
-                </div>
+                  {collapsedSections.playlists ? (
+                    <ChevronDown className="w-4 h-4 text-zinc-400" />
+                  ) : (
+                    <ChevronUp className="w-4 h-4 text-zinc-400" />
+                  )}
+                </button>
 
                 <div className="flex items-center gap-2">
                   {selectedPlaylistId && (
                     <button
                       type="button"
                       onClick={() => setSelectedPlaylistId(null)}
-                      className="rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs font-medium text-zinc-300 hover:text-white whitespace-nowrap shrink-0 min-h-[40px]"
+                      className="rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs font-medium text-zinc-300 hover:text-white whitespace-nowrap shrink-0 min-h-[36px]"
                     >
                       Show All Tracks ({allTracks.length})
                     </button>
@@ -656,7 +745,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => setShowNewPlaylistForm(!showNewPlaylistForm)}
-                    className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-800 bg-zinc-900 hover:border-emerald-500/50 px-3.5 py-2 text-xs font-semibold text-white transition-colors whitespace-nowrap shrink-0 min-h-[40px]"
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-800 bg-zinc-900 hover:border-emerald-500/50 px-3 py-1.5 text-xs font-semibold text-white transition-colors whitespace-nowrap shrink-0 min-h-[36px]"
                   >
                     <Plus className="w-3.5 h-3.5 text-emerald-400" />
                     <span>New Playlist</span>
@@ -664,152 +753,193 @@ export default function App() {
                 </div>
               </div>
 
-              {showNewPlaylistForm && (
-                <form
-                  onSubmit={handleCreateCustomPlaylist}
-                  className="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4 flex flex-col sm:flex-row items-center gap-3"
-                >
-                  <label htmlFor="new-playlist-name" className="sr-only">
-                    Playlist Name
-                  </label>
-                  <input
-                    id="new-playlist-name"
-                    type="text"
-                    value={newPlaylistName}
-                    onChange={(e) => setNewPlaylistName(e.target.value)}
-                    placeholder="Enter custom multi-source playlist name..."
-                    className="flex-1 w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3.5 py-2 text-sm text-white focus:border-emerald-500 focus:outline-none"
-                  />
-                  <button
-                    type="submit"
-                    className="w-full sm:w-auto rounded-xl bg-emerald-500 hover:bg-emerald-400 px-4 py-2 text-xs font-semibold text-zinc-950 whitespace-nowrap shrink-0 min-h-[40px]"
-                  >
-                    Create Playlist
-                  </button>
-                </form>
-              )}
-
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {playlists.map((pl) => {
-                  const plTracks = allTracks.filter((t) =>
-                    pl.trackIds.includes(t.id)
-                  );
-                  const allCached =
-                    plTracks.length > 0 &&
-                    plTracks.every((t) => audio.cachedTrackIds.has(t.id));
-                  const isDownloading = downloadingPlaylistId === pl.id;
-                  const isSelected = selectedPlaylistId === pl.id;
-
-                  return (
-                    <div
-                      key={pl.id}
-                      className={`rounded-2xl border p-5 flex flex-col justify-between gap-4 transition-colors ${
-                        isSelected
-                          ? 'border-emerald-500/70 bg-emerald-500/10'
-                          : 'border-zinc-800/90 bg-zinc-900/40 hover:border-zinc-700'
-                      }`}
+              {!collapsedSections.playlists && (
+                <div className="px-5 pb-5 pt-2 border-t border-zinc-800/70 space-y-4">
+                  {showNewPlaylistForm && (
+                    <form
+                      onSubmit={handleCreateCustomPlaylist}
+                      className="rounded-2xl border border-zinc-800 bg-zinc-950/80 p-3.5 flex flex-col sm:flex-row items-center gap-3"
                     >
-                      <div className="space-y-2">
-                        <div className="flex items-start justify-between gap-3">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setSelectedPlaylistId(isSelected ? null : pl.id)
-                            }
-                            className="text-left group"
-                          >
-                            <h3 className="text-base font-bold text-white group-hover:text-emerald-400 transition-colors">
-                              {pl.name}
-                            </h3>
-                            <p className="text-xs text-zinc-400 mt-0.5 line-clamp-2">
-                              {pl.description}
-                            </p>
-                          </button>
+                      <label htmlFor="new-playlist-name" className="sr-only">
+                        Playlist Name
+                      </label>
+                      <input
+                        id="new-playlist-name"
+                        type="text"
+                        value={newPlaylistName}
+                        onChange={(e) => setNewPlaylistName(e.target.value)}
+                        placeholder="Enter custom multi-source playlist name..."
+                        className="flex-1 w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3.5 py-2 text-sm text-white focus:border-emerald-500 focus:outline-none"
+                      />
+                      <button
+                        type="submit"
+                        className="w-full sm:w-auto rounded-xl bg-emerald-500 hover:bg-emerald-400 px-4 py-2 text-xs font-semibold text-zinc-950 whitespace-nowrap shrink-0 min-h-[38px]"
+                      >
+                        Create Playlist
+                      </button>
+                    </form>
+                  )}
 
-                          {/* Spotify-Style Downward Arrow Offline Download Button */}
-                          <button
-                            type="button"
-                            onClick={() => handleDownloadPlaylistOffline(pl)}
-                            disabled={isDownloading}
-                            aria-label={`Download playlist ${pl.name} to Offline Vault`}
-                            title="One-Tap Offline Playlist Downloader"
-                            className={`min-h-[40px] min-w-[40px] px-2.5 rounded-xl border flex items-center justify-center gap-1.5 text-xs font-mono transition-colors whitespace-nowrap shrink-0 ${
-                              allCached
-                                ? 'border-emerald-500/50 bg-emerald-500/20 text-emerald-300'
-                                : 'border-zinc-800 bg-zinc-950 text-zinc-300 hover:border-emerald-500/50 hover:text-white'
+                  {visiblePlaylists.length === 0 ? (
+                    <div className="py-6 text-center text-xs text-zinc-400">
+                      No playlists loaded yet. Connect your Jellyfin server in{' '}
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab('sources')}
+                        className="text-emerald-400 underline font-semibold"
+                      >
+                        Sources Hub
+                      </button>{' '}
+                      to automatically pull your Jellyfin playlists, or create a
+                      new playlist above.
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                      {visiblePlaylists.map((pl) => {
+                        const plTracks = allTracks.filter((t) =>
+                          pl.trackIds.includes(t.id)
+                        );
+                        const allCached =
+                          plTracks.length > 0 &&
+                          plTracks.every((t) => audio.cachedTrackIds.has(t.id));
+                        const isDownloading = downloadingPlaylistId === pl.id;
+                        const isSelected = selectedPlaylistId === pl.id;
+
+                        return (
+                          <div
+                            key={pl.id}
+                            className={`rounded-2xl border p-4 flex flex-col justify-between gap-3.5 transition-colors ${
+                              isSelected
+                                ? 'border-emerald-500/70 bg-emerald-500/10'
+                                : 'border-zinc-800/90 bg-zinc-950/60 hover:border-zinc-700'
                             }`}
                           >
-                            {isDownloading ? (
-                              <>
-                                <Loader2 className="w-4 h-4 animate-spin text-emerald-400" />
-                                <span className="tabular-nums">
-                                  {downloadProgress?.done}/{downloadProgress?.total}
-                                </span>
-                              </>
-                            ) : allCached ? (
-                              <>
-                                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                                <span>Vaulted</span>
-                              </>
-                            ) : (
-                              <>
-                                <ArrowDownToLine className="w-4 h-4" />
-                                <span>Offline</span>
-                              </>
-                            )}
-                          </button>
-                        </div>
-                      </div>
+                            <div className="space-y-1.5">
+                              <div className="flex items-start justify-between gap-3">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setSelectedPlaylistId(
+                                      isSelected ? null : pl.id
+                                    )
+                                  }
+                                  className="text-left group"
+                                >
+                                  <h3 className="text-sm font-bold text-white group-hover:text-emerald-400 transition-colors">
+                                    {pl.name}
+                                  </h3>
+                                  <p className="text-xs text-zinc-400 mt-0.5 line-clamp-2">
+                                    {pl.description}
+                                  </p>
+                                </button>
 
-                      <div className="pt-3 border-t border-zinc-800/70 flex items-center justify-between gap-3">
-                        <div className="text-xs text-zinc-400 font-mono tabular-nums whitespace-nowrap truncate">
-                          <span>{plTracks.length} tracks</span>
-                          <span aria-hidden="true"> · </span>
-                          <span>{String(pl.source).toUpperCase()}</span>
-                        </div>
+                                {/* Spotify-Style Downward Arrow Offline Download Button */}
+                                <button
+                                  type="button"
+                                  onClick={() => handleDownloadPlaylistOffline(pl)}
+                                  disabled={isDownloading}
+                                  aria-label={`Download playlist ${pl.name} to Offline Vault`}
+                                  title="One-Tap Offline Playlist Downloader"
+                                  className={`min-h-[36px] px-2.5 rounded-xl border flex items-center justify-center gap-1.5 text-xs font-mono transition-colors whitespace-nowrap shrink-0 ${
+                                    allCached
+                                      ? 'border-emerald-500/50 bg-emerald-500/20 text-emerald-300'
+                                      : 'border-zinc-800 bg-zinc-900 text-zinc-300 hover:border-emerald-500/50 hover:text-white'
+                                  }`}
+                                >
+                                  {isDownloading ? (
+                                    <>
+                                      <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-400" />
+                                      <span className="tabular-nums">
+                                        {downloadProgress?.done}/
+                                        {downloadProgress?.total}
+                                      </span>
+                                    </>
+                                  ) : allCached ? (
+                                    <>
+                                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                                      <span>Vaulted</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <ArrowDownToLine className="w-3.5 h-3.5" />
+                                      <span>Offline</span>
+                                    </>
+                                  )}
+                                </button>
+                              </div>
+                            </div>
 
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (plTracks.length > 0) {
-                              audio.playSpecificTrack(plTracks[0], plTracks);
-                            }
-                          }}
-                          className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 px-3.5 py-2 text-xs font-bold text-zinc-950 transition-colors whitespace-nowrap shrink-0 min-h-[38px]"
-                        >
-                          <Play className="w-3.5 h-3.5 fill-current" />
-                          <span>Play Playlist</span>
-                        </button>
-                      </div>
+                            <div className="pt-2.5 border-t border-zinc-800/70 flex items-center justify-between gap-3">
+                              <div className="text-xs text-zinc-400 font-mono tabular-nums whitespace-nowrap truncate">
+                                <span>{plTracks.length} tracks</span>
+                                <span aria-hidden="true"> · </span>
+                                <span>{String(pl.source).toUpperCase()}</span>
+                              </div>
+
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (plTracks.length > 0) {
+                                    audio.playSpecificTrack(
+                                      plTracks[0],
+                                      plTracks
+                                    );
+                                  }
+                                }}
+                                className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 px-3 py-1.5 text-xs font-bold text-zinc-950 transition-colors whitespace-nowrap shrink-0 min-h-[34px]"
+                              >
+                                <Play className="w-3 h-3 fill-current" />
+                                <span>Play</span>
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
                     </div>
-                  );
-                })}
-              </div>
+                  )}
+                </div>
+              )}
             </section>
 
-            {/* Unified Multi-Source Track Catalog & Queue */}
+            {/* Unified Multi-Source Track Catalog & Active Queue */}
             <section
               aria-labelledby="catalog-heading"
               className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start"
             >
-              {/* Left 8 Columns: Search, Source Filter, Track Table */}
-              <div className="lg:col-span-8 rounded-2xl border border-zinc-800/90 bg-zinc-900/40 p-5 sm:p-6 space-y-5">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-zinc-800/80 pb-4">
-                  <div>
-                    <h2
-                      id="catalog-heading"
-                      className="text-lg font-bold text-white tracking-tight"
-                    >
-                      {selectedPlaylistId
-                        ? playlists.find((p) => p.id === selectedPlaylistId)
-                            ?.name || 'Playlist Tracks'
-                        : 'Aggregated Multi-Source Stream Catalog'}
-                    </h2>
-                    <p className="text-xs text-zinc-400 mt-0.5">
-                      Showing {displayedTracks.length} of {allTracks.length} tracks
-                      {offlineOnlyMode ? ' (Offline Only Mode active)' : ''}
-                    </p>
-                  </div>
+              {/* Left 8 Columns: Collapsible Stream Catalog */}
+              <div className="lg:col-span-8 rounded-2xl border border-zinc-800/90 bg-zinc-900/40 overflow-hidden">
+                <div className="px-5 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <button
+                    type="button"
+                    onClick={() => toggleSection('catalog')}
+                    aria-expanded={!collapsedSections.catalog}
+                    data-testid="collapse-catalog-btn"
+                    className="flex items-center gap-2.5 text-left group"
+                  >
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h2
+                          id="catalog-heading"
+                          className="text-lg font-bold text-white tracking-tight group-hover:text-emerald-400 transition-colors"
+                        >
+                          {selectedPlaylistId
+                            ? visiblePlaylists.find(
+                                (p) => p.id === selectedPlaylistId
+                              )?.name || 'Playlist Tracks'
+                            : 'Stream Catalog'}
+                        </h2>
+                        {collapsedSections.catalog ? (
+                          <ChevronDown className="w-4 h-4 text-zinc-400" />
+                        ) : (
+                          <ChevronUp className="w-4 h-4 text-zinc-400" />
+                        )}
+                      </div>
+                      <p className="text-xs text-zinc-400 mt-0.5">
+                        Showing {displayedTracks.length} of {allTracks.length}{' '}
+                        tracks from active sources
+                      </p>
+                    </div>
+                  </button>
 
                   {/* Search Input */}
                   <div className="relative w-full sm:w-64">
@@ -818,223 +948,260 @@ export default function App() {
                       type="search"
                       value={searchQuery}
                       onChange={(e) => setSearchQuery(e.target.value)}
-                      placeholder="Filter title, artist, source..."
+                      placeholder="Filter title, artist, album..."
                       aria-label="Filter tracks by title, artist, or source"
                       className="w-full rounded-xl border border-zinc-800 bg-zinc-950 pl-9 pr-3.5 py-2 text-xs text-white placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
                     />
                   </div>
                 </div>
 
-                {/* Interactive Source Filter Segmented Control */}
-                <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
-                  {(
-                    [
-                      { id: 'all', label: 'All Sources' },
-                      { id: 'built-in', label: 'Free Cloud' },
-                      { id: 'radio-browser', label: 'Radio-Browser' },
-                      { id: 'internet-archive', label: 'Internet Archive' },
-                      { id: 'jellyfin', label: 'Jellyfin' },
-                      { id: 'navidrome', label: 'Navidrome' },
-                      { id: 'plex', label: 'Plex' },
-                    ] as const
-                  ).map((tab) => (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      onClick={() => setSourceFilter(tab.id)}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 min-h-[36px] ${
-                        sourceFilter === tab.id
-                          ? 'bg-emerald-500 text-zinc-950 font-semibold'
-                          : 'bg-zinc-950 text-zinc-400 hover:text-white border border-zinc-800/80'
-                      }`}
+                {!collapsedSections.catalog && (
+                  <div className="px-5 pb-5 pt-3 border-t border-zinc-800/70 space-y-4">
+                    {/* Dynamic Source Filter Pills (ONLY enabled sources!) */}
+                    <div
+                      className="flex items-center gap-1.5 overflow-x-auto pb-1"
+                      data-testid="active-source-filters"
                     >
-                      {tab.label}
-                    </button>
-                  ))}
-                </div>
-
-                {/* Track List */}
-                {displayedTracks.length === 0 ? (
-                  <div className="py-12 text-center space-y-3">
-                    <p className="text-sm text-zinc-400">
-                      No tracks match your current filter.
-                    </p>
-                    {offlineOnlyMode && (
-                      <button
-                        type="button"
-                        onClick={() => setOfflineOnlyMode(false)}
-                        className="rounded-xl bg-zinc-800 px-4 py-2 text-xs font-semibold text-white hover:bg-zinc-700"
-                      >
-                        Disable Offline Only Mode
-                      </button>
-                    )}
-                  </div>
-                ) : (
-                  <div className="divide-y divide-zinc-800/70">
-                    {displayedTracks.map((track, idx) => {
-                      const isCurrent = audio.currentTrack?.id === track.id;
-                      const isCached = audio.cachedTrackIds.has(track.id);
-                      const isPreloading = audio.preloadingTrackIds.has(
-                        track.id
-                      );
-
-                      return (
-                        <div
-                          key={track.id}
-                          className={`py-3 px-2 rounded-xl flex items-center justify-between gap-3 transition-colors ${
-                            isCurrent
-                              ? 'bg-emerald-500/10'
-                              : 'hover:bg-zinc-950/60'
+                      {activeFilterTabs.map((tab) => (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          onClick={() => setSourceFilter(tab.id)}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 min-h-[36px] ${
+                            sourceFilter === tab.id
+                              ? 'bg-emerald-500 text-zinc-950 font-semibold'
+                              : 'bg-zinc-950 text-zinc-400 hover:text-white border border-zinc-800/80'
                           }`}
                         >
-                          <div className="flex items-center gap-3 min-w-0 flex-1">
-                            <span className="w-6 text-xs font-mono text-zinc-500 tabular-nums text-right shrink-0">
-                              {String(idx + 1).padStart(2, '0')}
-                            </span>
+                          {tab.label}
+                        </button>
+                      ))}
+                    </div>
 
-                            <img
-                              src={track.artworkUrl}
-                              alt={track.title}
-                              referrerPolicy="no-referrer"
-                              className="w-11 h-11 rounded-xl border border-zinc-800 object-cover shrink-0"
-                            />
+                    {/* Track List */}
+                    {displayedTracks.length === 0 ? (
+                      <div className="py-12 text-center space-y-3">
+                        <p className="text-sm text-zinc-300 font-semibold">
+                          No tracks match your active sources or filter.
+                        </p>
+                        <p className="text-xs text-zinc-400 max-w-md mx-auto">
+                          Open{' '}
+                          <button
+                            type="button"
+                            onClick={() => setActiveTab('sources')}
+                            className="text-emerald-400 underline font-semibold"
+                          >
+                            Sources Hub
+                          </button>{' '}
+                          to authenticate your Jellyfin server (`https://jellyfin.flockingreeds.farm`) with your API Key or Password, or toggle Built-In Demo Tracks ON.
+                        </p>
+                        {offlineOnlyMode && (
+                          <button
+                            type="button"
+                            onClick={() => setOfflineOnlyMode(false)}
+                            className="rounded-xl bg-zinc-800 px-4 py-2 text-xs font-semibold text-white hover:bg-zinc-700"
+                          >
+                            Disable Offline Only Mode
+                          </button>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="divide-y divide-zinc-800/70">
+                        {displayedTracks.map((track, idx) => {
+                          const isCurrent = audio.currentTrack?.id === track.id;
+                          const isCached = audio.cachedTrackIds.has(track.id);
+                          const isPreloading = audio.preloadingTrackIds.has(
+                            track.id
+                          );
 
-                            <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-2">
-                                <span
-                                  className={`text-sm font-semibold truncate ${
-                                    isCurrent
-                                      ? 'text-emerald-400'
-                                      : 'text-white'
-                                  }`}
-                                >
-                                  {track.title}
-                                </span>
-                              </div>
-
-                              {/* Unboxed clean metadata with typographic separators */}
-                              <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-zinc-400">
-                                <span className="truncate">{track.artist}</span>
-                                <span aria-hidden="true">·</span>
-                                <span className="font-mono text-zinc-300">
-                                  {track.sourceName}
-                                </span>
-                                <span aria-hidden="true">·</span>
-                                <span className="font-mono tabular-nums">
-                                  {formatDuration(track.duration)}
-                                </span>
-                                {track.normalizationGain !== undefined && (
-                                  <>
-                                    <span aria-hidden="true">·</span>
-                                    <span className="font-mono tabular-nums text-zinc-400">
-                                      LUFS {track.normalizationGain > 0 ? `+${track.normalizationGain}` : track.normalizationGain}dB
-                                    </span>
-                                  </>
-                                )}
-                                {isPreloading ? (
-                                  <>
-                                    <span aria-hidden="true">·</span>
-                                    <span className="text-amber-300 font-mono inline-flex items-center gap-1">
-                                      <Loader2 className="w-3 h-3 animate-spin" />
-                                      Pre-loading
-                                    </span>
-                                  </>
-                                ) : (
-                                  isCached && (
-                                    <>
-                                      <span aria-hidden="true">·</span>
-                                      <span
-                                        className="text-emerald-400 font-mono font-semibold inline-flex items-center gap-1"
-                                        data-testid="preloaded-indicator"
-                                      >
-                                        <CheckCircle2 className="w-3 h-3" />
-                                        Pre-loaded
-                                      </span>
-                                    </>
-                                  )
-                                )}
-                              </div>
-                            </div>
-                          </div>
-
-                          <div className="flex items-center gap-2 shrink-0">
-                            <button
-                              type="button"
-                              onClick={() => audio.queueTrackNext(track)}
-                              title="Queue to Play Next"
-                              className="hidden sm:inline-flex items-center gap-1 rounded-xl border border-zinc-800 bg-zinc-950 hover:border-purple-500/50 hover:text-purple-300 px-2.5 py-2 text-xs font-medium text-zinc-400 transition-colors whitespace-nowrap shrink-0 min-h-[40px]"
-                            >
-                              <ListPlus className="w-3.5 h-3.5" />
-                              <span>Play Next</span>
-                            </button>
-
-                            <button
-                              type="button"
-                              onClick={() => {
-                                if (isCurrent) {
-                                  audio.togglePlayPause();
-                                } else {
-                                  audio.playSpecificTrack(
-                                    track,
-                                    displayedTracks
-                                  );
-                                }
-                              }}
-                              aria-label={
-                                isCurrent && audio.isPlaying
-                                  ? `Pause ${track.title}`
-                                  : `Play ${track.title}`
-                              }
-                              className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-bold transition-colors whitespace-nowrap shrink-0 min-h-[40px] ${
-                                isCurrent && audio.isPlaying
-                                  ? 'bg-emerald-500 text-zinc-950'
-                                  : 'bg-zinc-800 hover:bg-emerald-500 hover:text-zinc-950 text-white'
+                          return (
+                            <div
+                              key={track.id}
+                              className={`py-3 px-2 rounded-xl flex items-center justify-between gap-3 transition-colors ${
+                                isCurrent
+                                  ? 'bg-emerald-500/10'
+                                  : 'hover:bg-zinc-950/60'
                               }`}
                             >
-                              {isCurrent && audio.isPlaying ? (
-                                <>
-                                  <Pause className="w-3.5 h-3.5 fill-current" />
-                                  <span>Pause</span>
-                                </>
-                              ) : (
-                                <>
-                                  <Play className="w-3.5 h-3.5 fill-current" />
-                                  <span>Play</span>
-                                </>
-                              )}
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
+                              <div className="flex items-center gap-3 min-w-0 flex-1">
+                                <span className="w-6 text-xs font-mono text-zinc-500 tabular-nums text-right shrink-0">
+                                  {String(idx + 1).padStart(2, '0')}
+                                </span>
+
+                                <img
+                                  src={track.artworkUrl}
+                                  alt={track.title}
+                                  referrerPolicy="no-referrer"
+                                  onError={(e) => {
+                                    e.currentTarget.onerror = null;
+                                    e.currentTarget.src =
+                                      createAlbumArtworkDataUri(
+                                        track.title,
+                                        track.artist,
+                                        track.accentColor || '#10b981',
+                                        '#09090b'
+                                      );
+                                  }}
+                                  className="w-11 h-11 rounded-xl border border-zinc-800 object-cover shrink-0"
+                                />
+
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex items-center gap-2">
+                                    <span
+                                      className={`text-sm font-semibold truncate ${
+                                        isCurrent
+                                          ? 'text-emerald-400'
+                                          : 'text-white'
+                                      }`}
+                                    >
+                                      {track.title}
+                                    </span>
+                                  </div>
+
+                                  <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-zinc-400">
+                                    <span className="truncate">
+                                      {track.artist}
+                                    </span>
+                                    <span aria-hidden="true">·</span>
+                                    <span className="font-mono text-zinc-300">
+                                      {track.sourceName}
+                                    </span>
+                                    <span aria-hidden="true">·</span>
+                                    <span className="font-mono tabular-nums">
+                                      {formatDuration(track.duration)}
+                                    </span>
+                                    {track.normalizationGain !== undefined && (
+                                      <>
+                                        <span aria-hidden="true">·</span>
+                                        <span className="font-mono tabular-nums text-zinc-400">
+                                          LUFS{' '}
+                                          {track.normalizationGain > 0
+                                            ? `+${track.normalizationGain}`
+                                            : track.normalizationGain}
+                                          dB
+                                        </span>
+                                      </>
+                                    )}
+                                    {isPreloading ? (
+                                      <>
+                                        <span aria-hidden="true">·</span>
+                                        <span className="text-amber-300 font-mono inline-flex items-center gap-1">
+                                          <Loader2 className="w-3 h-3 animate-spin" />
+                                          Pre-loading
+                                        </span>
+                                      </>
+                                    ) : (
+                                      isCached && (
+                                        <>
+                                          <span aria-hidden="true">·</span>
+                                          <span
+                                            className="text-emerald-400 font-mono font-semibold inline-flex items-center gap-1"
+                                            data-testid="preloaded-indicator"
+                                          >
+                                            <CheckCircle2 className="w-3 h-3" />
+                                            Pre-loaded
+                                          </span>
+                                        </>
+                                      )
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div className="flex items-center gap-2 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => audio.queueTrackNext(track)}
+                                  title="Queue to Play Next"
+                                  className="hidden sm:inline-flex items-center gap-1 rounded-xl border border-zinc-800 bg-zinc-950 hover:border-purple-500/50 hover:text-purple-300 px-2.5 py-2 text-xs font-medium text-zinc-400 transition-colors whitespace-nowrap shrink-0 min-h-[40px]"
+                                >
+                                  <ListPlus className="w-3.5 h-3.5" />
+                                  <span>Play Next</span>
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (isCurrent) {
+                                      audio.togglePlayPause();
+                                    } else {
+                                      audio.playSpecificTrack(
+                                        track,
+                                        displayedTracks
+                                      );
+                                    }
+                                  }}
+                                  aria-label={
+                                    isCurrent && audio.isPlaying
+                                      ? `Pause ${track.title}`
+                                      : `Play ${track.title}`
+                                  }
+                                  className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-bold transition-colors whitespace-nowrap shrink-0 min-h-[40px] ${
+                                    isCurrent && audio.isPlaying
+                                      ? 'bg-emerald-500 text-zinc-950'
+                                      : 'bg-zinc-800 hover:bg-emerald-500 hover:text-zinc-950 text-white'
+                                  }`}
+                                >
+                                  {isCurrent && audio.isPlaying ? (
+                                    <>
+                                      <Pause className="w-3.5 h-3.5 fill-current" />
+                                      <span>Pause</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Play className="w-3.5 h-3.5 fill-current" />
+                                      <span>Play</span>
+                                    </>
+                                  )}
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
 
-              {/* Right 4 Columns: Active Queue & 2-Song Lookahead Preloader Monitor */}
+              {/* Right 4 Columns: Collapsible Active Queue & 2-Song Lookahead Preloader Monitor */}
               <aside
                 aria-labelledby="queue-sidebar-heading"
-                className="lg:col-span-4 rounded-2xl border border-zinc-800/90 bg-zinc-900/40 p-5 sm:p-6 space-y-4"
+                className="lg:col-span-4 rounded-2xl border border-zinc-800/90 bg-zinc-900/40 overflow-hidden"
               >
-                <div className="flex items-center justify-between border-b border-zinc-800/80 pb-3">
-                  <div>
-                    <h3
-                      id="queue-sidebar-heading"
-                      className="text-base font-bold text-white"
-                    >
-                      Active Queue & Lookahead
-                    </h3>
+                <div className="px-5 py-4 flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => toggleSection('queue')}
+                    aria-expanded={!collapsedSections.queue}
+                    data-testid="collapse-queue-btn"
+                    className="text-left group"
+                  >
+                    <div className="flex items-center gap-2">
+                      <h3
+                        id="queue-sidebar-heading"
+                        className="text-base font-bold text-white group-hover:text-emerald-400 transition-colors"
+                      >
+                        Active Queue ({audio.queue.length})
+                      </h3>
+                      {collapsedSections.queue ? (
+                        <ChevronDown className="w-4 h-4 text-zinc-400" />
+                      ) : (
+                        <ChevronUp className="w-4 h-4 text-zinc-400" />
+                      )}
+                    </div>
                     <p className="text-xs text-zinc-400">
-                      Auto-fetches Track N+1 & N+2 into IndexedDB
+                      2-Song Lookahead Preloader
                     </p>
-                  </div>
+                  </button>
+
                   <div className="flex items-center gap-1.5">
                     <button
                       type="button"
                       onClick={audio.toggleShuffle}
                       aria-label="Shuffle Queue"
                       title="True Fisher-Yates Shuffle"
-                      className={`p-2 rounded-xl border transition-colors min-h-[40px] min-w-[40px] flex items-center justify-center ${
+                      className={`p-2 rounded-xl border transition-colors min-h-[38px] min-w-[38px] flex items-center justify-center ${
                         audio.shuffleEnabled
                           ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-400'
                           : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-white'
@@ -1046,7 +1213,7 @@ export default function App() {
                       type="button"
                       onClick={audio.cycleRepeatMode}
                       aria-label={`Repeat mode: ${audio.repeatMode}`}
-                      className={`p-2 rounded-xl border transition-colors min-h-[40px] min-w-[40px] flex items-center justify-center ${
+                      className={`p-2 rounded-xl border transition-colors min-h-[38px] min-w-[38px] flex items-center justify-center ${
                         audio.repeatMode !== 'off'
                           ? 'border-purple-500/50 bg-purple-500/15 text-purple-300'
                           : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-white'
@@ -1061,54 +1228,57 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="divide-y divide-zinc-800/60 max-h-[420px] overflow-y-auto pr-1">
-                  {audio.queue.slice(0, 12).map((qTrack, idx) => {
-                    const isCurrent = idx === audio.currentIndex;
-                    const isNextTwo =
-                      idx === (audio.currentIndex + 1) % audio.queue.length ||
-                      idx === (audio.currentIndex + 2) % audio.queue.length;
-                    const isCached = audio.cachedTrackIds.has(qTrack.id);
+                {!collapsedSections.queue && (
+                  <div className="px-5 pb-5 pt-2 border-t border-zinc-800/70 divide-y divide-zinc-800/60 max-h-[420px] overflow-y-auto">
+                    {audio.queue.slice(0, 15).map((qTrack, idx) => {
+                      const isCurrent = idx === audio.currentIndex;
+                      const isNextTwo =
+                        idx ===
+                          (audio.currentIndex + 1) % audio.queue.length ||
+                        idx === (audio.currentIndex + 2) % audio.queue.length;
+                      const isCached = audio.cachedTrackIds.has(qTrack.id);
 
-                    return (
-                      <div
-                        key={`${qTrack.id}-q-${idx}`}
-                        className={`py-2.5 flex items-center justify-between gap-2 ${
-                          isCurrent ? 'text-emerald-400' : 'text-zinc-200'
-                        }`}
-                      >
-                        <div className="min-w-0 flex-1">
-                          <div className="text-xs font-semibold truncate">
-                            {idx === audio.currentIndex ? '▶ ' : ''}
-                            {qTrack.title}
-                          </div>
-                          <div className="text-[11px] text-zinc-400 flex items-center gap-1.5 mt-0.5">
-                            <span className="truncate">{qTrack.artist}</span>
-                            <span aria-hidden="true">·</span>
-                            {isCached ? (
-                              <span className="text-emerald-400 font-mono font-semibold">
-                                Pre-loaded
-                              </span>
-                            ) : isNextTwo ? (
-                              <span className="text-amber-300 font-mono">
-                                Lookahead
-                              </span>
-                            ) : (
-                              <span className="font-mono">Queued</span>
-                            )}
-                          </div>
-                        </div>
-
-                        <button
-                          type="button"
-                          onClick={() => audio.playSpecificTrack(qTrack)}
-                          className="rounded-lg bg-zinc-800/90 hover:bg-emerald-500 hover:text-zinc-950 px-2.5 py-1.5 text-xs font-semibold text-zinc-300 transition-colors shrink-0 min-h-[34px]"
+                      return (
+                        <div
+                          key={`${qTrack.id}-q-${idx}`}
+                          className={`py-2.5 flex items-center justify-between gap-2 ${
+                            isCurrent ? 'text-emerald-400' : 'text-zinc-200'
+                          }`}
                         >
-                          Play
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
+                          <div className="min-w-0 flex-1">
+                            <div className="text-xs font-semibold truncate">
+                              {idx === audio.currentIndex ? '▶ ' : ''}
+                              {qTrack.title}
+                            </div>
+                            <div className="text-[11px] text-zinc-400 flex items-center gap-1.5 mt-0.5">
+                              <span className="truncate">{qTrack.artist}</span>
+                              <span aria-hidden="true">·</span>
+                              {isCached ? (
+                                <span className="text-emerald-400 font-mono font-semibold">
+                                  Pre-loaded
+                                </span>
+                              ) : isNextTwo ? (
+                                <span className="text-amber-300 font-mono">
+                                  Lookahead
+                                </span>
+                              ) : (
+                                <span className="font-mono">Queued</span>
+                              )}
+                            </div>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() => audio.playSpecificTrack(qTrack)}
+                            className="rounded-lg bg-zinc-800/90 hover:bg-emerald-500 hover:text-zinc-950 px-2.5 py-1.5 text-xs font-semibold text-zinc-300 transition-colors shrink-0 min-h-[34px]"
+                          >
+                            Play
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </aside>
             </section>
           </div>
@@ -1143,6 +1313,15 @@ export default function App() {
                 src={audio.currentTrack.artworkUrl}
                 alt={audio.currentTrack.title}
                 referrerPolicy="no-referrer"
+                onError={(e) => {
+                  e.currentTarget.onerror = null;
+                  e.currentTarget.src = createAlbumArtworkDataUri(
+                    audio.currentTrack?.title || 'Brokeify',
+                    audio.currentTrack?.artist || 'Jellyfin',
+                    '#10b981',
+                    '#09090b'
+                  );
+                }}
                 className="w-9 h-9 sm:w-11 sm:h-11 rounded-xl border border-zinc-800 object-cover shrink-0"
               />
             )}
