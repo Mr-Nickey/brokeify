@@ -5,14 +5,16 @@ import {
   Gauge,
   Pause,
   Play,
+  Repeat,
+  Repeat1,
   Shuffle,
   SkipBack,
   SkipForward,
   Sliders,
+  Sparkles,
   X,
 } from 'lucide-react';
-import type { EQPresetName, Track } from '../types/music';
-import { EQ_PRESETS } from '../utils/musicLogic';
+import type { EQPresetName, RepeatMode, Track } from '../types/music';
 
 interface CarModeOverlayProps {
   isOpen: boolean;
@@ -25,8 +27,12 @@ interface CarModeOverlayProps {
   onNext: () => void;
   onPrevious: () => void;
   onSeek: (time: number) => void;
+  repeatMode: RepeatMode;
+  onCycleRepeat: () => void;
   carVolumeLeveler: boolean;
   onToggleCarVolumeLeveler: (next: boolean) => void;
+  crossfadeSeconds: number;
+  onChangeCrossfadeSeconds: (sec: number) => void;
   shuffleEnabled: boolean;
   onToggleShuffle: () => void;
   eqPreset: EQPresetName;
@@ -59,8 +65,12 @@ export const CarModeOverlay: React.FC<CarModeOverlayProps> = ({
   onNext,
   onPrevious,
   onSeek,
+  repeatMode,
+  onCycleRepeat,
   carVolumeLeveler,
   onToggleCarVolumeLeveler,
+  crossfadeSeconds,
+  onChangeCrossfadeSeconds,
   shuffleEnabled,
   onToggleShuffle,
   eqPreset,
@@ -71,30 +81,30 @@ export const CarModeOverlay: React.FC<CarModeOverlayProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-[#09090b] text-white flex flex-col justify-between p-5 sm:p-8 select-none overflow-y-auto"
+      className="fixed inset-0 z-50 bg-[#06090e] text-white flex flex-col justify-between p-5 sm:p-8 select-none overflow-y-auto"
       role="dialog"
       aria-modal="true"
       aria-label="Car Mode High-Contrast Driving Interface"
     >
-      {/* Top Bar: Giant Exit & Status */}
-      <div className="flex items-center justify-between gap-4 border-b border-zinc-800 pb-4">
+      {/* Top Bar: Giant Exit & Android Auto Status */}
+      <div className="winamp-titlebar rounded-2xl px-4 py-3 flex items-center justify-between gap-4 border border-zinc-700/80">
         <div className="flex items-center gap-3">
-          <div className="w-12 h-12 rounded-2xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center">
-            <Car className="w-6 h-6 text-emerald-400" />
+          <div className="w-11 h-11 rounded-xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center">
+            <Car className="w-6 h-6 text-[#00ff66]" />
           </div>
           <div>
-            <div className="text-lg sm:text-xl font-bold tracking-tight text-white">
-              BROKEIFY CAR HUD
+            <div className="text-base sm:text-lg font-mono font-bold tracking-wider text-white">
+              BROKEIFY CAR DECK // ANDROID AUTO READY
             </div>
-            <div className="text-xs sm:text-sm text-zinc-400 flex items-center gap-2">
-              <span>Bluetooth MediaSession Active</span>
+            <div className="text-xs text-zinc-300 font-mono flex flex-wrap items-center gap-2">
+              <span>Skip Song &amp; Repeat Active</span>
               <span aria-hidden="true">·</span>
               {isCurrentTrackCached ? (
-                <span className="text-emerald-400 font-semibold inline-flex items-center gap-1">
-                  <CheckCircle2 className="w-3.5 h-3.5" /> Pre-loaded in Vault
+                <span className="text-[#00ff66] font-semibold inline-flex items-center gap-1">
+                  <CheckCircle2 className="w-3.5 h-3.5" /> Cached in Vault
                 </span>
               ) : (
-                <span>Live Stream</span>
+                <span>Direct Stream</span>
               )}
             </div>
           </div>
@@ -103,7 +113,7 @@ export const CarModeOverlay: React.FC<CarModeOverlayProps> = ({
         <button
           type="button"
           onClick={onClose}
-          className="inline-flex items-center gap-2 rounded-2xl border-2 border-zinc-700 bg-zinc-900 hover:bg-zinc-800 px-6 py-3.5 text-base font-bold text-white transition-colors min-h-[56px]"
+          className="inline-flex items-center gap-2 rounded-xl border-2 border-zinc-600 bg-zinc-900 hover:bg-zinc-800 px-5 py-3 text-sm sm:text-base font-bold text-white transition-colors min-h-[52px]"
         >
           <X className="w-5 h-5" />
           <span>Exit Car Mode</span>
@@ -111,27 +121,26 @@ export const CarModeOverlay: React.FC<CarModeOverlayProps> = ({
       </div>
 
       {/* Center: Giant High-Contrast Track Metadata & Progress */}
-      <div className="my-auto py-6 space-y-6 max-w-4xl mx-auto w-full">
-        <div className="flex flex-col sm:flex-row items-center gap-6">
+      <div className="my-auto py-5 space-y-6 max-w-4xl mx-auto w-full">
+        <div className="winamp-lcd rounded-3xl border border-zinc-800 p-5 flex flex-col sm:flex-row items-center gap-6">
           {currentTrack && (
             <img
               src={currentTrack.artworkUrl}
               alt={currentTrack.title}
               referrerPolicy="no-referrer"
-              className="w-28 h-28 sm:w-36 sm:h-36 rounded-3xl border border-zinc-800 object-cover shrink-0 shadow-2xl"
+              className="w-24 h-24 sm:w-32 sm:h-32 rounded-2xl border border-zinc-700 object-cover shrink-0 shadow-2xl"
             />
           )}
-          <div className="text-center sm:text-left min-w-0 flex-1 space-y-2">
-            <div className="text-xs sm:text-sm font-mono uppercase tracking-wider text-emerald-400">
-              {currentTrack?.sourceName || 'Free Cloud'} · LUFS{' '}
-              {currentTrack?.normalizationGain ?? 0} dB
+          <div className="text-center sm:text-left min-w-0 flex-1 space-y-1.5">
+            <div className="text-xs sm:text-sm font-mono uppercase tracking-wider text-[#00ff66]">
+              {(currentTrack?.format || 'AUDIO').toUpperCase()} · XFADE{' '}
+              {crossfadeSeconds > 0 ? `${crossfadeSeconds}S` : 'OFF'}
             </div>
             <h2 className="text-2xl sm:text-4xl font-bold text-white truncate">
               {currentTrack?.title || 'Ready to Roll'}
             </h2>
             <p className="text-lg sm:text-2xl text-zinc-300 font-medium truncate">
-              {currentTrack?.artist || 'Select a track'} ·{' '}
-              <span className="text-zinc-400">{currentTrack?.album}</span>
+              {currentTrack?.artist || 'Select a track'}
             </p>
           </div>
         </div>
@@ -147,39 +156,45 @@ export const CarModeOverlay: React.FC<CarModeOverlayProps> = ({
             onChange={(e) => onSeek(parseFloat(e.target.value))}
             className="w-full h-4 cursor-pointer"
           />
-          <div className="flex justify-between text-base sm:text-lg font-mono tabular-nums text-zinc-300">
+          <div className="flex justify-between text-base sm:text-lg font-mono tabular-nums text-[#00ff66]">
             <span>{formatSec(currentTime)}</span>
             <span>{formatSec(duration)}</span>
           </div>
         </div>
 
-        {/* Giant Transport Buttons */}
-        <div className="grid grid-cols-3 gap-4 sm:gap-6 pt-2">
+        {/* Simple Giant 4-Button Car Transport: PREVIOUS SONG | PLAY/PAUSE | SKIP SONG | REPEAT SONG */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 pt-1">
           <button
             type="button"
             onClick={onPrevious}
-            aria-label="Previous Track"
-            className="h-24 sm:h-28 rounded-3xl border-2 border-zinc-800 bg-zinc-900 hover:bg-zinc-800 active:scale-[0.98] flex flex-col items-center justify-center gap-1.5 text-white transition-transform"
+            aria-label="Previous or Restart Song"
+            className="h-24 sm:h-28 rounded-3xl border-2 border-zinc-700 bg-zinc-900 hover:bg-zinc-800 active:scale-[0.98] flex flex-col items-center justify-center gap-1.5 text-white transition-transform"
           >
-            <SkipBack className="w-9 h-9" />
-            <span className="text-xs sm:text-sm font-bold">PREVIOUS</span>
+            <SkipBack className="w-8 h-8" />
+            <span className="text-xs sm:text-sm font-mono font-bold">
+              PREV SONG
+            </span>
           </button>
 
           <button
             type="button"
             onClick={onTogglePlayPause}
-            aria-label={isPlaying ? 'Pause Track' : 'Play Track'}
-            className="h-24 sm:h-28 rounded-3xl bg-emerald-500 hover:bg-emerald-400 active:scale-[0.98] flex flex-col items-center justify-center gap-1.5 text-zinc-950 shadow-xl transition-transform"
+            aria-label={isPlaying ? 'Pause Song' : 'Play Song'}
+            className="h-24 sm:h-28 rounded-3xl bg-[#00ff66] hover:bg-emerald-400 active:scale-[0.98] flex flex-col items-center justify-center gap-1.5 text-zinc-950 shadow-xl transition-transform"
           >
             {isPlaying ? (
               <>
-                <Pause className="w-11 h-11 fill-current" />
-                <span className="text-xs sm:text-sm font-extrabold">PAUSE</span>
+                <Pause className="w-10 h-10 fill-current" />
+                <span className="text-xs sm:text-sm font-mono font-extrabold">
+                  PAUSE
+                </span>
               </>
             ) : (
               <>
-                <Play className="w-11 h-11 fill-current" />
-                <span className="text-xs sm:text-sm font-extrabold">PLAY</span>
+                <Play className="w-10 h-10 fill-current" />
+                <span className="text-xs sm:text-sm font-mono font-extrabold">
+                  PLAY
+                </span>
               </>
             )}
           </button>
@@ -187,75 +202,129 @@ export const CarModeOverlay: React.FC<CarModeOverlayProps> = ({
           <button
             type="button"
             onClick={onNext}
-            aria-label="Next Track"
-            className="h-24 sm:h-28 rounded-3xl border-2 border-zinc-800 bg-zinc-900 hover:bg-zinc-800 active:scale-[0.98] flex flex-col items-center justify-center gap-1.5 text-white transition-transform"
+            aria-label="Skip Song"
+            data-testid="carmode-skip-song-btn"
+            className="h-24 sm:h-28 rounded-3xl border-2 border-emerald-500/60 bg-zinc-900 hover:bg-zinc-800 active:scale-[0.98] flex flex-col items-center justify-center gap-1.5 text-white transition-transform"
           >
-            <SkipForward className="w-9 h-9" />
-            <span className="text-xs sm:text-sm font-bold">NEXT</span>
+            <SkipForward className="w-8 h-8 text-[#00ff66]" />
+            <span className="text-xs sm:text-sm font-mono font-bold">
+              SKIP SONG
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={onCycleRepeat}
+            aria-label={`Repeat Song Mode: ${repeatMode}`}
+            data-testid="carmode-repeat-song-btn"
+            className={`h-24 sm:h-28 rounded-3xl border-2 active:scale-[0.98] flex flex-col items-center justify-center gap-1.5 transition-transform ${
+              repeatMode === 'one'
+                ? 'border-amber-400 bg-amber-500/20 text-amber-300'
+                : repeatMode === 'all'
+                ? 'border-purple-500 bg-purple-500/20 text-purple-200'
+                : 'border-zinc-700 bg-zinc-900 text-zinc-300'
+            }`}
+          >
+            {repeatMode === 'one' ? (
+              <Repeat1 className="w-8 h-8 text-amber-300" />
+            ) : (
+              <Repeat className="w-8 h-8" />
+            )}
+            <span className="text-xs sm:text-sm font-mono font-bold uppercase">
+              {repeatMode === 'one'
+                ? 'REPEAT 1'
+                : repeatMode === 'all'
+                ? 'REPEAT ALL'
+                : 'REPEAT OFF'}
+            </span>
           </button>
         </div>
       </div>
 
       {/* Bottom Strip: Giant 1-Tap Car Audio Controls */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 border-t border-zinc-800 pt-5">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 border-t border-zinc-800 pt-4">
         <button
           type="button"
           onClick={() => onToggleCarVolumeLeveler(!carVolumeLeveler)}
-          className={`min-h-[64px] rounded-2xl border-2 px-5 py-3 flex items-center justify-between text-left transition-colors ${
+          className={`min-h-[60px] rounded-2xl border-2 px-4 py-2.5 flex items-center justify-between text-left transition-colors ${
             carVolumeLeveler
-              ? 'border-emerald-500 bg-emerald-500/15 text-white'
+              ? 'border-[#00ff66] bg-emerald-500/15 text-white'
               : 'border-zinc-800 bg-zinc-900 text-zinc-300'
           }`}
         >
-          <div className="flex items-center gap-3">
-            <Gauge className="w-6 h-6 text-emerald-400 shrink-0" />
+          <div className="flex items-center gap-2.5">
+            <Gauge className="w-5 h-5 text-[#00ff66] shrink-0" />
             <div>
-              <div className="text-sm font-bold">Car Volume Leveler</div>
-              <div className="text-xs text-zinc-400">
-                Compressor -24dB / 12:1
+              <div className="text-xs font-bold">FLAC/MP3 Stabilizer</div>
+              <div className="text-[11px] text-zinc-400 font-mono">
+                Aggressive Leveler
               </div>
             </div>
           </div>
-          <span className="text-sm font-mono font-bold text-emerald-400">
+          <span className="text-xs font-mono font-bold text-[#00ff66]">
             {carVolumeLeveler ? 'ON' : 'OFF'}
           </span>
         </button>
 
         <button
           type="button"
+          onClick={() =>
+            onChangeCrossfadeSeconds(crossfadeSeconds > 0 ? 0 : 4)
+          }
+          className={`min-h-[60px] rounded-2xl border-2 px-4 py-2.5 flex items-center justify-between text-left transition-colors ${
+            crossfadeSeconds > 0
+              ? 'border-sky-400 bg-sky-500/15 text-white'
+              : 'border-zinc-800 bg-zinc-900 text-zinc-300'
+          }`}
+        >
+          <div className="flex items-center gap-2.5">
+            <Sparkles className="w-5 h-5 text-sky-400 shrink-0" />
+            <div>
+              <div className="text-xs font-bold">Seamless Crossfade</div>
+              <div className="text-[11px] text-zinc-400 font-mono">
+                Smooth transitions
+              </div>
+            </div>
+          </div>
+          <span className="text-xs font-mono font-bold text-sky-400">
+            {crossfadeSeconds > 0 ? `${crossfadeSeconds}S` : 'OFF'}
+          </span>
+        </button>
+
+        <button
+          type="button"
           onClick={onToggleShuffle}
-          className={`min-h-[64px] rounded-2xl border-2 px-5 py-3 flex items-center justify-between text-left transition-colors ${
+          className={`min-h-[60px] rounded-2xl border-2 px-4 py-2.5 flex items-center justify-between text-left transition-colors ${
             shuffleEnabled
               ? 'border-purple-500 bg-purple-500/15 text-white'
               : 'border-zinc-800 bg-zinc-900 text-zinc-300'
           }`}
         >
-          <div className="flex items-center gap-3">
-            <Shuffle className="w-6 h-6 text-purple-400 shrink-0" />
+          <div className="flex items-center gap-2.5">
+            <Shuffle className="w-5 h-5 text-purple-400 shrink-0" />
             <div>
-              <div className="text-sm font-bold">Fisher-Yates Shuffle</div>
-              <div className="text-xs text-zinc-400">True unbiased queue</div>
+              <div className="text-xs font-bold">Shuffle Queue</div>
+              <div className="text-[11px] text-zinc-400 font-mono">
+                Fisher-Yates
+              </div>
             </div>
           </div>
-          <span className="text-sm font-mono font-bold text-purple-400">
+          <span className="text-xs font-mono font-bold text-purple-400">
             {shuffleEnabled ? 'ON' : 'OFF'}
           </span>
         </button>
 
-        <div className="sm:col-span-2 lg:col-span-1 min-h-[64px] rounded-2xl border-2 border-zinc-800 bg-zinc-900 px-4 py-2.5 flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2 shrink-0">
-            <Sliders className="w-5 h-5 text-emerald-400" />
-            <span className="text-xs font-bold text-zinc-300">EQ:</span>
-          </div>
-          <div className="flex items-center gap-1.5 overflow-x-auto">
+        <div className="min-h-[60px] rounded-2xl border-2 border-zinc-800 bg-zinc-900 px-3 py-2 flex items-center justify-between gap-1.5">
+          <Sliders className="w-4 h-4 text-[#00ff66] shrink-0" />
+          <div className="flex items-center gap-1 overflow-x-auto">
             {CAR_PRESETS.map((preset) => (
               <button
                 key={preset}
                 type="button"
                 onClick={() => onApplyPreset(preset)}
-                className={`px-3 py-2 rounded-xl text-xs font-bold whitespace-nowrap shrink-0 min-h-[44px] ${
+                className={`px-2.5 py-1.5 rounded-lg text-[11px] font-mono font-bold whitespace-nowrap shrink-0 min-h-[38px] ${
                   eqPreset === preset
-                    ? 'bg-emerald-500 text-zinc-950'
+                    ? 'bg-[#00ff66] text-zinc-950'
                     : 'bg-zinc-800 text-zinc-300'
                 }`}
               >

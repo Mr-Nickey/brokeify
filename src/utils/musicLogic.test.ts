@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   fisherYatesShuffle,
   lufsToLinearGain,
+  computeTrackStabilizationGain,
   buildEmbyAuthHeader,
   buildJellyfinStreamUrl,
   buildSubsonicUrl,
@@ -30,6 +31,8 @@ import {
   buildJellyfinPlaylistItemsUrl,
   buildJellyfinGlobalAudioItemsUrl,
   buildJellyfinGlobalPlaylistsUrl,
+  VISUAL_THEMES,
+  isValidVisualTheme,
 } from './musicLogic';
 import type { BrokeifyCloudSettings, ProviderConfig, Track } from '../types/music';
 
@@ -336,5 +339,55 @@ test('buildJellyfinInstantMixUrl and buildClientInstantMix generate smart radio 
   assert.equal(mix[1].id, 's2'); // High-affinity Synthwave track prioritized ahead of Acoustic track
   assert.equal(mix[2].id, 's3');
 });
+
+test('computeTrackStabilizationGain balances loud FLAC files and quiet 240kbps MP3 files in aggressive mode', () => {
+  const flacTrack = {
+    format: 'FLAC',
+    bitrateKbps: 1411,
+    normalizationGain: 0,
+    streamUrl: 'https://jellyfin.local/Audio/1/stream.flac',
+  };
+  const mp3Track = {
+    format: 'MP3',
+    bitrateKbps: 240,
+    normalizationGain: 0,
+    streamUrl: 'https://jellyfin.local/Audio/2/stream.mp3',
+  };
+
+  const flacStab = computeTrackStabilizationGain(flacTrack, {
+    carVolumeLeveler: true,
+    lufsNormalizationEnabled: true,
+    stabilizerStrength: 'aggressive',
+  });
+  const mp3Stab = computeTrackStabilizationGain(mp3Track, {
+    carVolumeLeveler: true,
+    lufsNormalizationEnabled: true,
+    stabilizerStrength: 'aggressive',
+  });
+
+  // In aggressive mode, FLAC is attenuated (< 0.85 preamp, 0.58 stream ceiling) while 240kbps MP3 is boosted (> 2.0 preamp, 1.0 stream ceiling)
+  assert.ok(flacStab.webAudioGain < 0.85);
+  assert.equal(flacStab.htmlElementScale, 0.58);
+  assert.ok(mp3Stab.webAudioGain > 2.0);
+  assert.equal(mp3Stab.htmlElementScale, 1.0);
+});
+
+test('VISUAL_THEMES includes both dark and light skins with CSS filters and zero trademarked names', () => {
+  const darkSkins = VISUAL_THEMES.filter((t) => t.mode === 'dark');
+  const lightSkins = VISUAL_THEMES.filter((t) => t.mode === 'light');
+  assert.ok(darkSkins.length >= 2);
+  assert.ok(lightSkins.length >= 2);
+  assert.ok(isValidVisualTheme('cyber-deck'));
+  assert.ok(isValidVisualTheme('platinum-light'));
+  assert.ok(!isValidVisualTheme('unknown-skin'));
+
+  for (const theme of VISUAL_THEMES) {
+    const combined = `${theme.name} ${theme.description} ${theme.badge}`.toLowerCase();
+    assert.ok(!combined.includes('winamp'));
+    assert.ok(!combined.includes('windows xp'));
+    assert.ok(!combined.includes('milkdrop'));
+  }
+});
+
 
 

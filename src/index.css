@@ -10,7 +10,10 @@
 
   body {
     font-family: var(--font-sans);
-    background-color: #09090b;
+    background-color: #070a0f;
+    background-image:
+      radial-gradient(circle at 12% 0%, rgba(16, 185, 129, 0.08) 0%, transparent 45%),
+      radial-gradient(circle at 88% 8%, rgba(56, 189, 248, 0.07) 0%, transparent 45%);
     color: #f4f4f5;
     overflow-x: hidden;
   }
@@ -26,23 +29,146 @@
   }
 }
 
+/* Modern Nostalgia: Late-90s / Early-2000s Stereo Deck Chrome */
+.winamp-titlebar {
+  background: linear-gradient(180deg, #1e293b 0%, #0f172a 48%, #090d16 100%);
+  box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.25), inset 0 -1px 0 rgba(0, 0, 0, 0.7);
+}
+
+.winamp-bezel {
+  background: linear-gradient(180deg, #0d131c 0%, #080b11 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.85),
+    0 10px 28px -8px rgba(0, 0, 0, 0.75);
+}
+
+.winamp-lcd {
+  background-color: #04080c;
+  background-image: repeating-linear-gradient(
+    0deg,
+    rgba(0, 255, 102, 0.03) 0px,
+    rgba(0, 255, 102, 0.03) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.9), 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+/* ============================================================================
+   VISUAL THEME & SKIN ENGINE (CSS Filter Overlays + Dark & Light Skins)
+   ============================================================================ */
+
+/* 1. Cyber Deck '99 (Default Dark) */
+[data-visual-theme="cyber-deck"] {
+  filter: none;
+}
+
+/* 2. Classic Stereo '98 (Dark — Warm Charcoal & Gold Contrast Filter) */
+[data-visual-theme="classic-rack"] {
+  filter: contrast(1.07) saturate(1.15) sepia(0.09);
+  background-color: #0a0c10;
+}
+[data-visual-theme="classic-rack"] .winamp-titlebar {
+  background: linear-gradient(180deg, #27272a 0%, #18181b 52%, #09090b 100%);
+  box-shadow: inset 0 1px 0 rgba(251, 191, 36, 0.22), inset 0 -1px 0 rgba(0, 0, 0, 0.8);
+}
+
+/* 3. Modular Studio (Dark — High-Density Slate & Electric Cyan Filter) */
+[data-visual-theme="modular-bento"] {
+  filter: contrast(1.05) saturate(1.22) hue-rotate(-14deg);
+  background-color: #060913;
+}
+[data-visual-theme="modular-bento"] .winamp-titlebar {
+  background: linear-gradient(180deg, #1e1b4b 0%, #0f172a 55%, #060913 100%);
+}
+
+/* 4. Amber Phosphor (Dark — Vintage Warm Amber CRT Filter Overlay) */
+[data-visual-theme="amber-crt"] {
+  filter: sepia(0.36) hue-rotate(-18deg) saturate(1.42) contrast(1.08);
+  background-color: #0c0804;
+}
+
+/* 5. Platinum '99 (Light — Brushed Silver & Cool Platinum Desktop Skin) */
+[data-visual-theme="platinum-light"] {
+  filter: contrast(1.03) saturate(1.05);
+  background-color: #e2e8f0 !important;
+  color: #0f172a !important;
+}
+[data-visual-theme="platinum-light"] .winamp-titlebar {
+  background: linear-gradient(180deg, #f8fafc 0%, #cbd5e1 52%, #94a3b8 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), inset 0 -1px 0 rgba(15, 23, 42, 0.25);
+  border-color: #94a3b8 !important;
+}
+[data-visual-theme="platinum-light"] .winamp-bezel {
+  background: linear-gradient(180deg, #f8fafc 0%, #e2e8f0 100%);
+  border-color: #cbd5e1 !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.95),
+    0 8px 22px -6px rgba(15, 23, 42, 0.14);
+}
+[data-visual-theme="platinum-light"] .winamp-bezel h1,
+[data-visual-theme="platinum-light"] .winamp-bezel h2,
+[data-visual-theme="platinum-light"] .winamp-bezel h3,
+[data-visual-theme="platinum-light"] .winamp-titlebar span {
+  color: #0f172a;
+}
+
+/* 6. Solar Daylight (Light — Warm Ivory & Glacier-Blue Daytime Cabin Skin) */
+[data-visual-theme="solar-light"] {
+  filter: contrast(1.04) saturate(1.08) sepia(0.06);
+  background-color: #f8fafc !important;
+  color: #0f172a !important;
+}
+[data-visual-theme="solar-light"] .winamp-titlebar {
+  background: linear-gradient(180deg, #ffffff 0%, #e0f2fe 55%, #bae6fd 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.95), inset 0 -1px 0 rgba(2, 132, 199, 0.25);
+  border-color: #7dd3fc !important;
+}
+[data-visual-theme="solar-light"] .winamp-bezel {
+  background: linear-gradient(180deg, #ffffff 0%, #f1f5f9 100%);
+  border-color: #cbd5e1 !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 1),
+    0 8px 22px -6px rgba(2, 132, 199, 0.12);
+}
+[data-visual-theme="solar-light"] .winamp-bezel h1,
+[data-visual-theme="solar-light"] .winamp-bezel h2,
+[data-visual-theme="solar-light"] .winamp-bezel h3,
+[data-visual-theme="solar-light"] .winamp-titlebar span {
+  color: #0f172a;
+}
+
+/* Keep recessed digital LCD scopes dark with crisp phosphor text even inside Light Skins */
+[data-visual-theme="platinum-light"] .winamp-lcd,
+[data-visual-theme="solar-light"] .winamp-lcd {
+  background-color: #071018 !important;
+  color: #f8fafc !important;
+}
+[data-visual-theme="platinum-light"] .winamp-lcd h2,
+[data-visual-theme="platinum-light"] .winamp-lcd h3,
+[data-visual-theme="solar-light"] .winamp-lcd h2,
+[data-visual-theme="solar-light"] .winamp-lcd h3 {
+  color: #ffffff !important;
+}
+
 /* Custom subtle scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 ::-webkit-scrollbar-track {
-  background: #09090b;
+  background: #070a0f;
 }
 ::-webkit-scrollbar-thumb {
   background: #27272a;
   border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #3f3f46;
+  background: #10b981;
 }
 
-/* Range Input Styling for Audio Scrubber & EQ */
+/* Range Input Styling for Audio Scrubber, Crossfade, & EQ */
 input[type="range"] {
-  accent-color: #10b981;
+  accent-color: #00ff66;
 }

@@ -104,6 +104,16 @@ export interface SpotifyResolvedItem {
 
 export type RepeatMode = 'off' | 'all' | 'one';
 
+export type StabilizerStrength = 'off' | 'normal' | 'aggressive';
+
+export type VisualThemeId =
+  | 'cyber-deck'
+  | 'classic-rack'
+  | 'modular-bento'
+  | 'amber-crt'
+  | 'platinum-light'
+  | 'solar-light';
+
 export interface BrokeifyAudioPreferences {
   eqPreset: EQPresetName;
   eqGains: number[];
@@ -111,6 +121,10 @@ export interface BrokeifyAudioPreferences {
   lufsNormalizationEnabled: boolean;
   shuffleEnabled: boolean;
   repeatMode: RepeatMode;
+  crossfadeSeconds?: number;
+  offlinePreloadCount?: number;
+  stabilizerStrength?: StabilizerStrength;
+  visualTheme?: VisualThemeId;
 }
 
 export interface BrokeifyCloudSettings {

@@ -5,7 +5,85 @@ import type {
   SpotifyImportedItem,
   SpotifyResolvedItem,
   Track,
+  VisualThemeId,
 } from '../types/music';
+
+export interface VisualThemeDefinition {
+  id: VisualThemeId;
+  name: string;
+  mode: 'dark' | 'light';
+  badge: string;
+  description: string;
+  cssFilter: string;
+  swatches: [string, string, string];
+}
+
+export const VISUAL_THEMES: readonly VisualThemeDefinition[] = [
+  {
+    id: 'cyber-deck',
+    name: "Cyber Deck '99",
+    mode: 'dark',
+    badge: 'DEFAULT DARK',
+    description:
+      'Obsidian stereo rack with phosphor emerald LCD readouts and cyan wave scopes.',
+    cssFilter: 'none',
+    swatches: ['#070a0f', '#00ff66', '#38bdf8'],
+  },
+  {
+    id: 'classic-rack',
+    name: "Classic Stereo '98",
+    mode: 'dark',
+    badge: 'CLASSIC DARK',
+    description:
+      'Late-90s charcoal component deck with warm gold-tinted meters and high-contrast bevels.',
+    cssFilter: 'contrast(1.07) saturate(1.15) sepia(0.09)',
+    swatches: ['#111827', '#fbbf24', '#10b981'],
+  },
+  {
+    id: 'modular-bento',
+    name: 'Modular Studio',
+    mode: 'dark',
+    badge: 'STUDIO DARK',
+    description:
+      'High-density slate studio panels with cool electric cyan and ultraviolet spectrums.',
+    cssFilter: 'contrast(1.05) saturate(1.22) hue-rotate(-14deg)',
+    swatches: ['#090d16', '#38bdf8', '#a855f7'],
+  },
+  {
+    id: 'amber-crt',
+    name: 'Amber Phosphor',
+    mode: 'dark',
+    badge: 'CRT DARK',
+    description:
+      'Warm vintage amber CRT monitor filter with deep night-driving eye comfort.',
+    cssFilter: 'sepia(0.36) hue-rotate(-18deg) saturate(1.42) contrast(1.08)',
+    swatches: ['#140d06', '#f59e0b', '#fb923c'],
+  },
+  {
+    id: 'platinum-light',
+    name: "Platinum '99",
+    mode: 'light',
+    badge: 'SILVER LIGHT',
+    description:
+      'Classic late-90s brushed silver & platinum desktop skin with recessed dark LCD scopes.',
+    cssFilter: 'contrast(1.03) saturate(1.05)',
+    swatches: ['#e2e8f0', '#0f172a', '#059669'],
+  },
+  {
+    id: 'solar-light',
+    name: 'Solar Daylight',
+    mode: 'light',
+    badge: 'DAYLIGHT',
+    description:
+      'Warm ivory & glacier-blue daytime cabin skin engineered for bright sunlight legibility.',
+    cssFilter: 'contrast(1.04) saturate(1.08) sepia(0.06)',
+    swatches: ['#f8fafc', '#0284c7', '#10b981'],
+  },
+];
+
+export function isValidVisualTheme(value?: string): value is VisualThemeId {
+  return VISUAL_THEMES.some((t) => t.id === value);
+}
 
 export const ROTATING_SPITE_TAGLINES: readonly string[] = [
   'Zero subscriptions. Powered by spite and hard drives.',
@@ -62,6 +140,137 @@ export function lufsToLinearGain(normalizationGainDb?: number): number {
   }
   const clampedDb = Math.max(-12, Math.min(9, normalizationGainDb));
   return Number(Math.pow(10, clampedDb / 20).toFixed(4));
+}
+
+/**
+ * Computes multi-stage loudness stabilization for mixed FLAC + MP3 (e.g. 240kbps) libraries.
+ * Returns:
+ * - `webAudioGain`: linear multiplier for Web Audio `GainNode` (can boost > 1.0 into the DynamicsCompressorNode)
+ * - `htmlElementScale`: relative [0.25 .. 1.0] ceiling for direct HTML5 `<audio>` elements where volume cannot exceed 1.0.
+ *   In 'aggressive' mode, hot un-normalized FLAC/WAV tracks are attenuated to ~0.58 on direct HTML5 streams while quiet
+ *   <=256kbps MP3 tracks play at full 1.0 ceiling (and receive +5.5dB boost when routed through the Web Audio DSP graph).
+ */
+export function computeTrackStabilizationGain(
+  track: Pick<
+    Track,
+    'format' | 'bitrateKbps' | 'normalizationGain' | 'streamUrl'
+  > | null,
+  options: {
+    carVolumeLeveler: boolean;
+    lufsNormalizationEnabled: boolean;
+    stabilizerStrength?: 'off' | 'normal' | 'aggressive';
+  }
+): { webAudioGain: number; htmlElementScale: number; profileLabel: string } {
+  if (!track) {
+    return { webAudioGain: 1.0, htmlElementScale: 1.0, profileLabel: 'Unity' };
+  }
+
+  const strength = options.carVolumeLeveler
+    ? options.stabilizerStrength || 'aggressive'
+    : 'off';
+
+  const fmt = (track.format || '').trim().toUpperCase();
+  const urlLower = (track.streamUrl || '').toLowerCase();
+  const bitrate = track.bitrateKbps || 0;
+
+  const isLossless =
+    fmt.includes('FLAC') ||
+    fmt.includes('WAV') ||
+    fmt.includes('ALAC') ||
+    fmt.includes('PCM') ||
+    urlLower.includes('.flac') ||
+    urlLower.includes('.wav') ||
+    bitrate >= 700;
+
+  const isLowMidBitrateMp3 =
+    !isLossless &&
+    (fmt.includes('MP3') ||
+      fmt.includes('MPEG') ||
+      urlLower.includes('.mp3') ||
+      (bitrate > 0 && bitrate <= 265));
+
+  const hasExplicitLufs =
+    typeof track.normalizationGain === 'number' &&
+    !Number.isNaN(track.normalizationGain) &&
+    Math.abs(track.normalizationGain) > 0.05;
+
+  const baseLufsLinear = options.lufsNormalizationEnabled
+    ? lufsToLinearGain(track.normalizationGain)
+    : 1.0;
+
+  if (strength === 'off') {
+    const htmlScale = Math.max(0.25, Math.min(1.0, baseLufsLinear));
+    return {
+      webAudioGain: baseLufsLinear,
+      htmlElementScale: htmlScale,
+      profileLabel: 'Bypass',
+    };
+  }
+
+  if (strength === 'normal') {
+    // Standard stabilization: mild FLAC trim (-2.5dB) and mild MP3 boost (+2.5dB)
+    const codecDbOffset = hasExplicitLufs
+      ? 0
+      : isLossless
+      ? -2.5
+      : isLowMidBitrateMp3
+      ? 2.5
+      : 0.5;
+    const codecLinear = Math.pow(10, codecDbOffset / 20);
+    const webGain = Number((baseLufsLinear * codecLinear * 1.18).toFixed(3));
+    const htmlScale = isLossless
+      ? Math.min(0.76, baseLufsLinear * 0.78)
+      : Math.min(1.0, baseLufsLinear * 1.0);
+    return {
+      webAudioGain: Math.max(0.35, Math.min(2.4, webGain)),
+      htmlElementScale: Number(Math.max(0.3, Math.min(1.0, htmlScale)).toFixed(3)),
+      profileLabel: isLossless
+        ? 'Standard FLAC Trim (-2.5dB)'
+        : 'Standard MP3 Boost (+2.5dB)',
+    };
+  }
+
+  // 'aggressive' mode: Designed specifically for libraries mixing loud FLACs with quiet 192-256kbps MP3s
+  const aggressiveCodecDb = hasExplicitLufs
+    ? isLossless
+      ? -1.5
+      : 2.0
+    : isLossless
+    ? -4.8 // Tame hot brickwalled FLAC masters by -4.8dB
+    : isLowMidBitrateMp3
+    ? 5.5 // Boost quiet 240kbps MP3s by +5.5dB into the brickwall compressor
+    : 2.5;
+
+  const codecLinear = Math.pow(10, aggressiveCodecDb / 20);
+  const makeupBoost = 1.32;
+  const webGain = Number(
+    Math.max(0.35, Math.min(2.8, baseLufsLinear * codecLinear * makeupBoost)).toFixed(3)
+  );
+
+  // For direct HTML5 <audio> elements (where max volume is 1.0), scale FLAC down to ~0.58 of master volume
+  // so switching to a 240kbps MP3 (at 1.0 of master volume) has matching perceived loudness!
+  let htmlScale = 0.85;
+  if (hasExplicitLufs) {
+    // Map [-10dB .. +6dB] relative to a 0.72 reference point so positive LUFS tracks can be louder than negative LUFS tracks
+    htmlScale = Math.max(0.35, Math.min(1.0, 0.72 * baseLufsLinear));
+    if (isLossless) htmlScale = Math.min(htmlScale, 0.65);
+  } else if (isLossless) {
+    htmlScale = 0.58;
+  } else if (isLowMidBitrateMp3) {
+    htmlScale = 1.0;
+  } else {
+    htmlScale = 0.88;
+  }
+
+  return {
+    webAudioGain: webGain,
+    htmlElementScale: Number(htmlScale.toFixed(3)),
+    profileLabel: isLossless
+      ? 'Aggressive FLAC Tamer (-4.8dB)'
+      : isLowMidBitrateMp3
+      ? 'Aggressive MP3 Booster (+5.5dB)'
+      : 'Aggressive AGC Active',
+  };
 }
 
 /**
@@ -638,6 +847,23 @@ export function parseCloudSettingsResponse(
         ),
         shuffleEnabled: Boolean(parsed.audioPrefs.shuffleEnabled ?? false),
         repeatMode: parsed.audioPrefs.repeatMode || 'all',
+        crossfadeSeconds:
+          typeof parsed.audioPrefs.crossfadeSeconds === 'number'
+            ? Math.max(0, Math.min(12, parsed.audioPrefs.crossfadeSeconds))
+            : 4,
+        offlinePreloadCount:
+          typeof parsed.audioPrefs.offlinePreloadCount === 'number'
+            ? Math.max(2, Math.min(12, Math.round(parsed.audioPrefs.offlinePreloadCount)))
+            : 4,
+        stabilizerStrength:
+          parsed.audioPrefs.stabilizerStrength === 'off' ||
+          parsed.audioPrefs.stabilizerStrength === 'normal' ||
+          parsed.audioPrefs.stabilizerStrength === 'aggressive'
+            ? parsed.audioPrefs.stabilizerStrength
+            : 'aggressive',
+        visualTheme: isValidVisualTheme(parsed.audioPrefs.visualTheme)
+          ? parsed.audioPrefs.visualTheme
+          : 'cyber-deck',
       },
       providers: Array.isArray(parsed.providers) ? parsed.providers : [],
       playlists: Array.isArray(parsed.playlists) ? parsed.playlists : [],
