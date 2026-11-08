@@ -1,0 +1,16 @@
+{
+  "version": "0.0.0.1",
+  "channel": "beta",
+  "displayVersion": "v0.0.0.1-beta",
+  "codename": "Homelab Beta Deck",
+  "repository": "Mr-Nickey/brokeify",
+  "branch": "main",
+  "releasedAt": "2026-11-08",
+  "changelog": [
+    "v0.0.0.1-beta: Initial self-hosted Docker full-stack beta release on Port 3487",
+    "Added Per-Device Jellyfin Login Gate with Zero-Reentry shared homelab profile",
+    "Added Cross-Device Playback Handoff (pause on phone, resume on Chromecast/TV)",
+    "Added Lidarr, slskd, YouTube Music & Internet Archive download engines",
+    "Added Diagnostic & Error Logger (Settings -> 4. Debug & Error Logs) and GitHub Version Checker"
+  ]
+}

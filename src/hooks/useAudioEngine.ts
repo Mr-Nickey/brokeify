@@ -843,12 +843,25 @@ export function useAudioEngine(initialQueue: Track[]) {
   );
 
   // Load and play track from Offline Vault Blob or Multi-Candidate Progressive HTTP Stream URL
+  const pendingRemoteSeekSecRef = useRef<number>(0);
+
   const loadAndPlayTrack = useCallback(
-    async (track: Track, autoPlay: boolean) => {
+    async (track: Track, autoPlay: boolean, initialSeekSec = 0) => {
       const requestId = ++loadRequestIdRef.current;
       isRebufferingRef.current = false;
+      const targetSeek = Math.max(
+        0,
+        initialSeekSec || pendingRemoteSeekSecRef.current || 0
+      );
+      if (autoPlay) {
+        pendingRemoteSeekSecRef.current = 0;
+      }
+
       const useCrossfade =
-        autoPlay && isCrossfadeTransitionRef.current && crossfadeSeconds > 0;
+        autoPlay &&
+        targetSeek === 0 &&
+        isCrossfadeTransitionRef.current &&
+        crossfadeSeconds > 0;
       isCrossfadeTransitionRef.current = false;
 
       if (useCrossfade) {
@@ -860,7 +873,7 @@ export function useAudioEngine(initialQueue: Track[]) {
 
       crossfadeTriggeredForTrackRef.current = null;
       setDuration(track.duration || 180);
-      setCurrentTime(0);
+      setCurrentTime(targetSeek);
       setBufferedAheadSeconds(0);
 
       if (activeObjectUrlRef.current) {
@@ -888,7 +901,17 @@ export function useAudioEngine(initialQueue: Track[]) {
             useCrossfade ? crossfadeSeconds : 0
           );
           try {
+            if (targetSeek > 0) {
+              try {
+                audio.currentTime = targetSeek;
+              } catch {}
+            }
             await audio.play();
+            if (targetSeek > 0 && Math.abs((audio.currentTime || 0) - targetSeek) > 2) {
+              try {
+                audio.currentTime = targetSeek;
+              } catch {}
+            }
             setIsPlaying(true);
             return;
           } catch {
@@ -902,6 +925,11 @@ export function useAudioEngine(initialQueue: Track[]) {
           }
         } else {
           audio.volume = getEffectiveHtmlVolume(track);
+          if (targetSeek > 0) {
+            try {
+              audio.currentTime = targetSeek;
+            } catch {}
+          }
           return;
         }
       }
@@ -950,12 +978,24 @@ export function useAudioEngine(initialQueue: Track[]) {
           await waitForStreamPreBuffer(audio, streamBufferSeconds);
           if (requestId !== loadRequestIdRef.current) return;
 
+          if (targetSeek > 0) {
+            try {
+              audio.currentTime = targetSeek;
+              setCurrentTime(targetSeek);
+            } catch {}
+          }
+
           startIncomingVolumeRamp(
             audio,
             track,
             useCrossfade ? crossfadeSeconds : 0
           );
           await audio.play();
+          if (targetSeek > 0 && Math.abs((audio.currentTime || 0) - targetSeek) > 2) {
+            try {
+              audio.currentTime = targetSeek;
+            } catch {}
+          }
           if (requestId === loadRequestIdRef.current) {
             setIsBuffering(false);
             setIsPlaying(true);
@@ -1582,6 +1622,57 @@ export function useAudioEngine(initialQueue: Track[]) {
     return () => clearInterval(interval);
   }, [isPlaying, currentTrack?.bpm]);
 
+  const pausePlayback = useCallback(() => {
+    isRebufferingRef.current = false;
+    setIsBuffering(false);
+    audioRef.current?.pause();
+    setIsPlaying(false);
+  }, []);
+
+  /**
+   * Cross-Device Playback Handoff:
+   * Cues (or immediately plays) the track, queue, and exact timestamp (`positionSec`) from another device
+   * so pressing Pause on your Phone and pressing Play on your Chromecast / TV / PC continues seamlessly!
+   */
+  const cueRemoteSession = useCallback(
+    async (
+      track: Track,
+      customQueue?: Track[],
+      positionSec = 0,
+      autoPlay = false
+    ) => {
+      const nextQueue =
+        customQueue && customQueue.length > 0
+          ? customQueue
+          : queue.length > 0
+          ? queue
+          : [track];
+
+      setQueue(nextQueue);
+      const idx = nextQueue.findIndex((t) => t.id === track.id);
+      if (idx >= 0) {
+        setCurrentIndex(idx);
+      } else {
+        setQueue([track, ...nextQueue]);
+        setCurrentIndex(0);
+      }
+
+      const safePos = Math.max(0, Number(positionSec) || 0);
+      setDuration(track.duration || 180);
+      setCurrentTime(safePos);
+      pendingRemoteSeekSecRef.current = safePos;
+
+      if (autoPlay) {
+        await loadAndPlayTrack(track, true, safePos);
+      } else if (audioRef.current && audioRef.current.src) {
+        try {
+          audioRef.current.currentTime = safePos;
+        } catch {}
+      }
+    },
+    [loadAndPlayTrack, queue]
+  );
+
   return {
     queue,
     setQueue,
@@ -1630,6 +1721,8 @@ export function useAudioEngine(initialQueue: Track[]) {
     frequencyData,
     waveformData,
     togglePlayPause,
+    pausePlayback,
+    cueRemoteSession,
     playNext,
     playPrevious,
     seekTo,

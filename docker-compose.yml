@@ -3,13 +3,13 @@ services:
     build: https://github.com/Mr-Nickey/brokeify.git#main
     container_name: brokeify
     restart: unless-stopped
-    # Host Port 3487 -> Container Port 3000
-    # 3487 is intentionally chosen so it never collides with common homelab ports
-    # (3000 Grafana/UptimeKuma, 5001 Dockge, 5030 slskd, 8080 qBittorrent, 8096 Jellyfin, 4533 Navidrome)
+    # Port 3487 both inside and outside the container so it never collides with
+    # Port 3000 (Open WebUI, Grafana, UptimeKuma), 5001 (Dockge), 5030 (slskd), or 8096 (Jellyfin)
     ports:
-      - "3487:3000"
+      - "3487:3487"
     environment:
       - NODE_ENV=production
-      - PORT=3000
+      - PORT=3487
     volumes:
       - ./data:/app/data
+      - ./downloads:/app/downloads

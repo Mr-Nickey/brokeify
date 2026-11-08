@@ -35,6 +35,7 @@ import type {
 import { MusicProviderManager } from '../services/MusicProviderManager';
 import { buildJellyfinDisplayPrefsUrl } from '../utils/musicLogic';
 import { SlidingToggle } from './SlidingToggle';
+import { VersionChecker } from './VersionChecker';
 
 interface SourcesHubViewProps {
   providers: ProviderConfig[];
@@ -52,6 +53,7 @@ interface SourcesHubViewProps {
   serverConfigPath?: string;
   onUpdateServerIntegrations?: (next: BrokeifyServerIntegrations) => void;
   onSaveServerConfigNow?: () => Promise<void>;
+  onLockDeviceForLogin?: () => void;
 }
 
 const RADIO_TAGS = [
@@ -79,6 +81,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
   serverConfigPath = '/app/data/config.json',
   onUpdateServerIntegrations,
   onSaveServerConfigNow,
+  onLockDeviceForLogin,
 }) => {
   const [testingId, setTestingId] = useState<string | null>(null);
   const [selectedRadioTag, setSelectedRadioTag] = useState<string>('rock');
@@ -93,6 +96,11 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
   const [confirmingLogoutType, setConfirmingLogoutType] =
     useState<ProviderType | null>(null);
   const [isSavingConfigFile, setIsSavingConfigFile] = useState<boolean>(false);
+  const [isTestingLidarr, setIsTestingLidarr] = useState<boolean>(false);
+  const [lidarrTestStatus, setLidarrTestStatus] = useState<{
+    ok: boolean;
+    message: string;
+  } | null>(null);
 
   const jellyfinProvider =
     providers.find((p) => p.type === 'jellyfin') || providers[0];
@@ -602,7 +610,10 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
 
   return (
     <div className="space-y-8">
-      {/* Section 0: Persistent Docker Server Storage (/app/data/config.json) + slskd & ListenBrainz Keys + 1-Click Backup */}
+      {/* GitHub Repository Version & Update Checker */}
+      <VersionChecker />
+
+      {/* Section 0: Persistent Docker Server Storage (/app/data/config.json) + Per-Device Jellyfin Login + slskd, Lidarr, YouTube Music & ListenBrainz Keys */}
       {serverIntegrations && onUpdateServerIntegrations && (
         <section
           aria-labelledby="docker-config-heading"
@@ -610,21 +621,28 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
           className="rounded-2xl border border-emerald-500/40 bg-zinc-900/60 p-5 sm:p-6 space-y-5"
         >
           <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-zinc-800/80 pb-4">
-            <div className="space-y-1">
+            <div className="space-y-1.5">
               <div className="flex items-center gap-2.5">
                 <Database className="w-5 h-5 text-[#00ff66] shrink-0" />
                 <h2
                   id="docker-config-heading"
                   className="text-lg font-bold text-white tracking-tight font-mono"
                 >
-                  Persistent Server Storage ({serverConfigPath}) &amp; Explo Replacement Keys
+                  Persistent Server Storage ({serverConfigPath}) &amp; Auto-Downloader Setup
                 </h2>
               </div>
-              <p className="text-xs text-zinc-300">
-                All settings, Jellyfin tokens, <code className="text-[#00ff66]">slskd</code> credentials,{' '}
-                <code className="text-purple-300">ListenBrainz</code> tokens, and custom playlists are saved directly on your server in{' '}
-                <code className="text-[#00ff66]">{serverConfigPath}</code> so every device opening{' '}
-                <code className="text-[#00ff66]">your Brokeify domain</code> is logged in automatically.
+              <p className="text-xs sm:text-sm text-zinc-300 leading-relaxed max-w-3xl">
+                <strong className="text-[#00ff66]">Plain-English Summary:</strong>{' '}
+                Your <code className="text-white">slskd</code>,{' '}
+                <code className="text-white">Lidarr</code>,{' '}
+                <code className="text-white">ListenBrainz</code>, custom themes,
+                playlists, and live playback position are saved on your server
+                in <code className="text-[#00ff66]">{serverConfigPath}</code>{' '}
+                (port <code className="text-[#00ff66]">3487</code>) AND mirrored
+                to your Jellyfin profile. When you open your domain on any new
+                device (phone, Chromecast, TV, or car stereo), you simply log
+                into Jellyfin once and all your keys &amp; live playback
+                position load automatically — zero re-typing!
               </p>
             </div>
 
@@ -665,21 +683,76 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
             </div>
           </div>
 
+          {/* Per-Device Jellyfin Login Security + Instant Profile Sync Banner */}
+          <div className="rounded-xl border border-emerald-500/30 bg-zinc-950/90 p-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <Lock className="w-4 h-4 text-[#00ff66] shrink-0" />
+                <span className="text-xs font-mono font-bold uppercase text-white">
+                  Per-Device Jellyfin Login Gate &amp; Cross-Device Handoff
+                </span>
+              </div>
+              <p className="text-xs text-zinc-400 leading-relaxed max-w-2xl">
+                Requires each new device on your domain to sign into your
+                Jellyfin account first (via Password or 6-Digit TV Quick
+                Connect). Once signed in, that device automatically gets all
+                your saved <code className="text-zinc-200">slskd</code>,{' '}
+                <code className="text-zinc-200">Lidarr</code>, and{' '}
+                <code className="text-zinc-200">ListenBrainz</code> keys plus
+                live pause/play handoff between your Phone and Chromecast/TV.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3 shrink-0">
+              <SlidingToggle
+                checked={serverIntegrations.requireDeviceLogin !== false}
+                onChange={(nextChecked) =>
+                  onUpdateServerIntegrations({
+                    ...serverIntegrations,
+                    requireDeviceLogin: nextChecked,
+                  })
+                }
+                label={
+                  serverIntegrations.requireDeviceLogin !== false
+                    ? 'Require Login on New Devices: ON'
+                    : 'Require Login on New Devices: OFF'
+                }
+                ariaLabel="Require Jellyfin Login on Each New Device"
+                testId="toggle-require-device-login"
+              />
+
+              {onLockDeviceForLogin && (
+                <button
+                  type="button"
+                  onClick={onLockDeviceForLogin}
+                  data-testid="lock-this-device-btn"
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-900 hover:border-amber-400/50 hover:text-amber-300 px-3 py-2 text-xs font-mono font-bold text-zinc-300 transition-colors min-h-[38px]"
+                >
+                  <Lock className="w-3.5 h-3.5" />
+                  <span>Lock This Device</span>
+                </button>
+              )}
+            </div>
+          </div>
+
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {/* slskd Configuration Card */}
+            {/* 1. slskd Configuration Card */}
             <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-4 space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-mono font-bold uppercase text-[#00ff66]">
-                  1. slskd Downloader Engine (Replaces Explo)
+              <div className="space-y-1">
+                <span className="text-xs font-mono font-bold uppercase text-[#00ff66] block">
+                  1. slskd Downloader (Soulseek P2P FLAC / 320k MP3)
                 </span>
-                <span className="text-[10px] font-mono text-zinc-400">
-                  POST /api/v0/searches + /transfers/downloads
-                </span>
+                <p className="text-[11px] text-zinc-400 leading-relaxed">
+                  Connects Brokeify to your <code className="text-white">slskd</code>{' '}
+                  container so clicking &ldquo;Grab Album&rdquo; or &ldquo;Grab
+                  Missing&rdquo; downloads high-bitrate audio straight to your
+                  server.
+                </p>
               </div>
 
               <div className="space-y-2.5">
                 <div>
-                  <label className="block text-xs text-zinc-400 mb-1">
+                  <label className="block text-xs text-zinc-300 mb-1">
                     slskd Internal Docker / LAN URL
                   </label>
                   <input
@@ -698,7 +771,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                 </div>
 
                 <div>
-                  <label className="block text-xs text-zinc-400 mb-1">
+                  <label className="block text-xs text-zinc-300 mb-1">
                     slskd API Key (X-API-Key)
                   </label>
                   <input
@@ -718,20 +791,244 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
               </div>
             </div>
 
-            {/* ListenBrainz Configuration Card */}
+            {/* 2. Lidarr Automated Music Manager Card */}
+            <div
+              data-testid="lidarr-config-card"
+              className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-4 space-y-3"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="space-y-1">
+                  <span className="text-xs font-mono font-bold uppercase text-amber-300 block">
+                    2. Lidarr Automated Music Manager (Arr Stack)
+                  </span>
+                  <p className="text-[11px] text-zinc-400 leading-relaxed">
+                    Connects to <code className="text-white">Lidarr</code> so
+                    Brokeify can add monitored artists/albums and trigger
+                    indexer searches directly in your Arr stack.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  disabled={isTestingLidarr}
+                  onClick={async () => {
+                    setIsTestingLidarr(true);
+                    setLidarrTestStatus(null);
+                    try {
+                      const resp = await fetch('/api/lidarr/test', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          lidarrUrl: serverIntegrations.lidarrUrl,
+                          lidarrApiKey: serverIntegrations.lidarrApiKey,
+                        }),
+                      });
+                      const data = await resp.json();
+                      if (resp.ok && data.ok) {
+                        setLidarrTestStatus({
+                          ok: true,
+                          message: data.message || 'Connected to Lidarr!',
+                        });
+                        if (data.rootFolderPath) {
+                          onUpdateServerIntegrations({
+                            ...serverIntegrations,
+                            lidarrRootFolderPath: data.rootFolderPath,
+                            lidarrQualityProfileId:
+                              data.qualityProfileId ||
+                              serverIntegrations.lidarrQualityProfileId ||
+                              1,
+                            lidarrMetadataProfileId:
+                              data.metadataProfileId ||
+                              serverIntegrations.lidarrMetadataProfileId ||
+                              1,
+                          });
+                        }
+                      } else {
+                        setLidarrTestStatus({
+                          ok: false,
+                          message:
+                            data.error || 'Could not connect to Lidarr.',
+                        });
+                      }
+                    } catch {
+                      setLidarrTestStatus({
+                        ok: false,
+                        message: 'Network error testing Lidarr.',
+                      });
+                    } finally {
+                      setIsTestingLidarr(false);
+                    }
+                  }}
+                  data-testid="test-lidarr-btn"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/15 hover:bg-amber-500/25 px-2.5 py-1.5 text-[11px] font-mono font-bold text-amber-300 transition-colors shrink-0"
+                >
+                  {isTestingLidarr ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <RefreshCw className="w-3.5 h-3.5" />
+                  )}
+                  <span>Test Lidarr</span>
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label className="block text-xs text-zinc-300 mb-1">
+                    Lidarr Internal Docker / LAN URL
+                  </label>
+                  <input
+                    type="text"
+                    value={serverIntegrations.lidarrUrl ?? 'http://lidarr:8686'}
+                    onChange={(e) =>
+                      onUpdateServerIntegrations({
+                        ...serverIntegrations,
+                        lidarrUrl: e.target.value,
+                      })
+                    }
+                    placeholder="http://lidarr:8686 or http://192.168.1.x:8686"
+                    data-testid="input-lidarr-url"
+                    className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs text-zinc-300 mb-1">
+                    Lidarr Root Folder Path
+                  </label>
+                  <input
+                    type="text"
+                    value={serverIntegrations.lidarrRootFolderPath ?? '/music'}
+                    onChange={(e) =>
+                      onUpdateServerIntegrations({
+                        ...serverIntegrations,
+                        lidarrRootFolderPath: e.target.value,
+                      })
+                    }
+                    placeholder="/music"
+                    data-testid="input-lidarr-root-folder"
+                    className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+                  />
+                </div>
+
+                <div className="sm:col-span-2">
+                  <label className="block text-xs text-zinc-300 mb-1">
+                    Lidarr API Key (Settings &rarr; General &rarr; Security)
+                  </label>
+                  <input
+                    type="password"
+                    value={serverIntegrations.lidarrApiKey ?? ''}
+                    onChange={(e) =>
+                      onUpdateServerIntegrations({
+                        ...serverIntegrations,
+                        lidarrApiKey: e.target.value,
+                      })
+                    }
+                    placeholder="Enter 32-character Lidarr API key..."
+                    data-testid="input-lidarr-apikey"
+                    className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+                  />
+                </div>
+              </div>
+
+              {lidarrTestStatus && (
+                <div
+                  className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-mono ${
+                    lidarrTestStatus.ok
+                      ? 'border-emerald-500/40 bg-emerald-950/30 text-emerald-300'
+                      : 'border-rose-500/40 bg-rose-950/30 text-rose-300'
+                  }`}
+                >
+                  {lidarrTestStatus.message}
+                </div>
+              )}
+            </div>
+
+            {/* 3. YouTube Music & Multi-Source Downloader Card */}
             <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-4 space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-mono font-bold uppercase text-purple-300">
-                  2. ListenBrainz Weekly Exploration &amp; Scrobbler
+              <div className="space-y-1">
+                <span className="text-xs font-mono font-bold uppercase text-rose-300 block">
+                  3. YouTube Music &amp; Multi-Downloader Priority
                 </span>
-                <span className="text-[10px] font-mono text-zinc-400">
-                  playing_now + single scrobbles
-                </span>
+                <p className="text-[11px] text-zinc-400 leading-relaxed">
+                  Choose which download engine Brokeify uses by default: Auto
+                  waterfall (<code className="text-white">slskd</code> &rarr;{' '}
+                  <code className="text-white">Lidarr</code> &rarr;{' '}
+                  <code className="text-white">YouTube Music</code>) or a
+                  specific engine.
+                </p>
               </div>
 
               <div className="space-y-2.5">
                 <div>
-                  <label className="block text-xs text-zinc-400 mb-1">
+                  <label className="block text-xs text-zinc-300 mb-1">
+                    Default Downloader Mode
+                  </label>
+                  <select
+                    value={serverIntegrations.preferredDownloader || 'auto'}
+                    onChange={(e) =>
+                      onUpdateServerIntegrations({
+                        ...serverIntegrations,
+                        preferredDownloader: e.target.value as
+                          | 'auto'
+                          | 'slskd'
+                          | 'lidarr'
+                          | 'youtube'
+                          | 'archive',
+                      })
+                    }
+                    data-testid="settings-preferred-downloader"
+                    className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+                  >
+                    <option value="auto">
+                      Auto Waterfall (slskd → Lidarr → YouTube Music)
+                    </option>
+                    <option value="slskd">slskd Only (Soulseek P2P)</option>
+                    <option value="lidarr">
+                      Lidarr Only (Automated Indexers)
+                    </option>
+                    <option value="youtube">YouTube Music Only (yt-dlp)</option>
+                    <option value="archive">Internet Archive Only</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs text-zinc-300 mb-1">
+                    Server Music Download Folder
+                  </label>
+                  <input
+                    type="text"
+                    value={
+                      serverIntegrations.downloadDir || '/app/downloads'
+                    }
+                    onChange={(e) =>
+                      onUpdateServerIntegrations({
+                        ...serverIntegrations,
+                        downloadDir: e.target.value,
+                      })
+                    }
+                    placeholder="/app/downloads"
+                    className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* 4. ListenBrainz Configuration Card */}
+            <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-4 space-y-3">
+              <div className="space-y-1">
+                <span className="text-xs font-mono font-bold uppercase text-purple-300 block">
+                  4. ListenBrainz Mixes &amp; Auto-Scrobbler
+                </span>
+                <p className="text-[11px] text-zinc-400 leading-relaxed">
+                  Pulls your personal Weekly Exploration &amp; Weekly Jams
+                  playlists and records every song you listen to so your
+                  recommendations keep getting better.
+                </p>
+              </div>
+
+              <div className="space-y-2.5">
+                <div>
+                  <label className="block text-xs text-zinc-300 mb-1">
                     ListenBrainz Username
                   </label>
                   <input
@@ -750,8 +1047,8 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                 </div>
 
                 <div>
-                  <label className="block text-xs text-zinc-400 mb-1">
-                    ListenBrainz User Token (for Automatic Scrobbling)
+                  <label className="block text-xs text-zinc-300 mb-1">
+                    ListenBrainz User Token (for Scrobbling)
                   </label>
                   <input
                     type="password"

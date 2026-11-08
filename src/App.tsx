@@ -5,21 +5,24 @@
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   ArrowDownToLine,
+  BarChart3,
   Car,
   Check,
   CheckCircle2,
+  CheckSquare,
   ChevronUp,
-  Coffee,
   Compass,
   Database,
   Disc,
   Gauge,
   History,
+  Link2,
   ListMusic,
   ListPlus,
   Loader2,
-  Moon,
+  MoreVertical,
   Music,
   Palette,
   Pause,
@@ -27,6 +30,7 @@ import {
   Play,
   Plus,
   Radio,
+  RefreshCw,
   Repeat,
   Repeat1,
   RotateCcw,
@@ -39,21 +43,23 @@ import {
   SkipForward,
   Sliders,
   Sparkles,
+  Square,
   Star,
-  Sun,
   Trash2,
   Users,
   Volume2,
   VolumeX,
   X,
+  Bug,
 } from 'lucide-react';
 import { BrokeifyLogo } from './components/BrokeifyLogo';
-import { BuyMeACoffeeModal } from './components/BuyMeACoffeeModal';
 import { SlidingToggle } from './components/SlidingToggle';
 import { SourcesHubView } from './components/SourcesHubView';
-import { SpotifyImporterView } from './components/SpotifyImporterView';
 import { AudioLabVaultView } from './components/AudioLabVaultView';
 import { RequestDiscoverView } from './components/RequestDiscoverView';
+import { ThemesCustomCssView } from './components/ThemesCustomCssView';
+import { MaintainerrStatsView } from './components/MaintainerrStatsView';
+import { DebugLogsView } from './components/DebugLogsView';
 import { CarModeOverlay } from './components/CarModeOverlay';
 import { NowPlayingDrawer } from './components/NowPlayingDrawer';
 import { BrokeifyOnboardingModal } from './components/BrokeifyOnboardingModal';
@@ -61,32 +67,84 @@ import { WinampVisualizer } from './components/WinampVisualizer';
 import { useAudioEngine } from './hooks/useAudioEngine';
 import { MusicProviderManager } from './services/MusicProviderManager';
 import type {
+  AutopilotPlaylistRule,
+  AutopilotScheduleInterval,
   BrokeifyCloudSettings,
   BrokeifyServerIntegrations,
   CloudSyncStatus,
+  CrossDevicePlaybackSession,
+  CustomThemeConfig,
+  DiscoveryFilterConfig,
+  PicardOrganizerConfig,
   Playlist,
   ProviderConfig,
   ProviderType,
   SlskdGrabJob,
   SlskdReadyNotification,
   Track,
+  TrackPlayStatRecord,
 } from './types/music';
 import {
+  compileUserCustomThemeCss,
   dedupeAndSpreadTracks,
+  DEFAULT_CUSTOM_THEME,
+  DEFAULT_DISCOVERY_FILTERS,
   mergePlaylistsPreservingCustomNames,
   mergeProvidersPreservingAuth,
   smartAntiRepeatShuffle,
   VISUAL_THEMES,
 } from './utils/musicLogic';
+import {
+  getClientDebugLogs,
+  installGlobalErrorCapture,
+  logDebugError,
+  logDebugEvent,
+  subscribeDebugLogs,
+} from './utils/debugLogger';
 import { preloadTrackToVault } from './utils/offlineVault';
 import { createAlbumArtworkDataUri } from './utils/artworkGenerator';
 
 type CoreTab = 'library' | 'discover' | 'nowplaying' | 'settings';
-type LibrarySubTab = 'playlists' | 'songs' | 'albums' | 'artists';
-type SettingsSectionTab = 'sources' | 'audiolab' | 'spotify';
+type LibrarySubTab = 'playlists' | 'songs' | 'albums' | 'artists' | 'stats';
+type SettingsSectionTab = 'sources' | 'audiolab' | 'themes' | 'debug';
 
 const PINNED_PLAYLIST_STORAGE_KEY = 'brokeify_pinned_playlist_id_v1';
 const RECENT_TRACKS_STORAGE_KEY = 'brokeify_recent_track_ids_v1';
+const DEVICE_VERIFIED_STORAGE_KEY = 'brokeify_device_verified_v1';
+const DEVICE_ID_STORAGE_KEY = 'brokeify_device_id_v1';
+
+function getOrCreateDeviceIdentity(): { deviceId: string; deviceName: string } {
+  let deviceId = 'dev-default';
+  try {
+    const existing = localStorage.getItem(DEVICE_ID_STORAGE_KEY);
+    if (existing) {
+      deviceId = existing;
+    } else {
+      deviceId = `dev-${Date.now().toString(36)}-${Math.random()
+        .toString(36)
+        .slice(2, 6)}`;
+      localStorage.setItem(DEVICE_ID_STORAGE_KEY, deviceId);
+    }
+  } catch {
+    // ignore
+  }
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+  let deviceName = 'Web Browser';
+  if (/CrKey|Chromecast|Android TV|BRAVIA|SmartTV|Tizen|Web0S/i.test(ua)) {
+    deviceName = 'Smart TV / Chromecast';
+  } else if (/Android/i.test(ua)) {
+    deviceName = 'Android Phone / Auto';
+  } else if (/iPhone|iPad|iPod/i.test(ua)) {
+    deviceName = 'iPhone / CarPlay';
+  } else if (/Windows/i.test(ua)) {
+    deviceName = 'Windows PC';
+  } else if (/Macintosh/i.test(ua)) {
+    deviceName = 'Mac';
+  } else if (/Linux/i.test(ua)) {
+    deviceName = 'Linux Desktop';
+  }
+  return { deviceId, deviceName };
+}
 
 function formatDuration(sec: number): string {
   const s = Math.max(0, Math.floor(sec));
@@ -160,7 +218,6 @@ export default function App() {
   const [offlineOnlyMode, setOfflineOnlyMode] = useState<boolean>(false);
   const [isCarModeOpen, setIsCarModeOpen] = useState<boolean>(false);
   const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
-  const [isBmcModalOpen, setIsBmcModalOpen] = useState<boolean>(false);
   const [isOnboardingOpen, setIsOnboardingOpen] = useState<boolean>(() =>
     !MusicProviderManager.hasCompletedOnboarding(
       MusicProviderManager.loadProviders()
@@ -204,7 +261,27 @@ export default function App() {
   const [editingPlaylistNameInput, setEditingPlaylistNameInput] =
     useState<string>('');
 
-  // Server-Side Persistent Storage (/app/data/config.json) & slskd / ListenBrainz State
+  // Playlist Three-Dots (⋯) Menu & Multi-Select Bulk Delete State
+  const [openMenuPlaylistId, setOpenMenuPlaylistId] = useState<string | null>(
+    null
+  );
+  const [isPlaylistSelectMode, setIsPlaylistSelectMode] =
+    useState<boolean>(false);
+  const [selectedPlaylistIdsForDelete, setSelectedPlaylistIdsForDelete] =
+    useState<Set<string>>(new Set());
+  const [playlistsPendingDeletion, setPlaylistsPendingDeletion] = useState<
+    Playlist[]
+  >([]);
+
+  // Autopilot Link Playlist Modal State
+  const [autopilotModalPlaylist, setAutopilotModalPlaylist] =
+    useState<Playlist | null>(null);
+  const [autopilotSpotifyUrlInput, setAutopilotSpotifyUrlInput] =
+    useState<string>('');
+  const [autopilotScheduleInput, setAutopilotScheduleInput] =
+    useState<AutopilotScheduleInterval>('weekly');
+
+  // Server-Side Persistent Storage (/app/data/config.json) & slskd / Lidarr / ListenBrainz / Filters / Theme / Autopilot State
   const [serverConfigPath, setServerConfigPath] = useState<string>(
     '/app/data/config.json'
   );
@@ -214,11 +291,47 @@ export default function App() {
       jellyfinToken: '',
       jellyfinUserId: '',
       jellyfinUsername: '',
+      requireDeviceLogin: true,
       slskdUrl: 'http://slskd:5030',
       slskdApiKey: '',
+      lidarrUrl: 'http://lidarr:8686',
+      lidarrApiKey: '',
+      lidarrRootFolderPath: '/music',
+      lidarrQualityProfileId: 1,
+      lidarrMetadataProfileId: 1,
       listenbrainzUsername: '',
       listenbrainzToken: '',
+      preferredDownloader: 'auto',
+      downloadDir: '/app/downloads',
+      youtubeAudioFormat: 'mp3',
     });
+  const [discoveryFilters, setDiscoveryFilters] =
+    useState<DiscoveryFilterConfig>(DEFAULT_DISCOVERY_FILTERS);
+  const [customTheme, setCustomTheme] =
+    useState<CustomThemeConfig>(DEFAULT_CUSTOM_THEME);
+  const [picardConfig, setPicardConfig] = useState<PicardOrganizerConfig>({
+    enabled: true,
+    useMusicBrainzPicard: true,
+    useAiMetadataCleanup: true,
+    folderTemplate: '{Artist}/{Album} ({Year})/{TrackNumber} - {Title}.{ext}',
+    targetMusicRoot: '/app/downloads/organized',
+  });
+  const [autopilotRules, setAutopilotRules] = useState<AutopilotPlaylistRule[]>(
+    []
+  );
+  const [playStats, setPlayStats] = useState<
+    Record<string, TrackPlayStatRecord>
+  >({});
+
+  // Cross-Device Playback Handoff Session & Debug Error Badge State
+  const deviceIdentity = useMemo(() => getOrCreateDeviceIdentity(), []);
+  const [remotePlaybackSession, setRemotePlaybackSession] =
+    useState<CrossDevicePlaybackSession | null>(null);
+  const lastCuedRemoteSessionKeyRef = useRef<string>('');
+  const [debugErrorCount, setDebugErrorCount] = useState<number>(() =>
+    getClientDebugLogs().filter((l) => l.level === 'error').length
+  );
+
   const [slskdJobs, setSlskdJobs] = useState<SlskdGrabJob[]>([]);
   const [readyNotifications, setReadyNotifications] = useState<
     SlskdReadyNotification[]
@@ -240,9 +353,14 @@ export default function App() {
     ) {
       return;
     }
-    MusicProviderManager.fetchJellyfinMusic(jfProv).then(
-      ({ updatedConfig, tracks, playlists: syncedPlaylists }) => {
+    MusicProviderManager.fetchJellyfinMusic(jfProv)
+      .then(({ updatedConfig, tracks, playlists: syncedPlaylists }) => {
         if (updatedConfig.status === 'connected') {
+          try {
+            localStorage.setItem(DEVICE_VERIFIED_STORAGE_KEY, 'true');
+          } catch {
+            // ignore
+          }
           setProviders((prev) => {
             const next = prev.map((p) => {
               if (p.id === updatedConfig.id) return updatedConfig;
@@ -293,21 +411,55 @@ export default function App() {
               return prevPin;
             });
           }
+        } else if (updatedConfig.status === 'error') {
+          logDebugEvent(
+            'error',
+            'jellyfin',
+            updatedConfig.lastMessage || 'Jellyfin sync failed',
+            {
+              endpoint: updatedConfig.serverUrl,
+              details: updatedConfig.diagnosticLog,
+            }
+          );
         }
-      }
-    );
+      })
+      .catch((err) => {
+        logDebugError('jellyfin', 'Failed to sync Jellyfin library', err, {
+          endpoint: jfProv.serverUrl,
+        });
+      });
   };
 
-  // Call navigator.storage.persist() on app startup, load /api/config from server, and auto-sync Jellyfin
+  const refreshAutopilotRules = async () => {
+    try {
+      const resp = await fetch('/api/autopilot');
+      if (resp.ok) {
+        const data = await resp.json();
+        if (Array.isArray(data.rules)) {
+          setAutopilotRules(data.rules);
+        }
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  // Call navigator.storage.persist() on app startup, load /api/config from server, and enforce Per-Device Jellyfin Login Gate
   useEffect(() => {
     let mounted = true;
+    installGlobalErrorCapture();
+    const unsubLogs = subscribeDebugLogs((logs) => {
+      if (mounted) {
+        setDebugErrorCount(logs.filter((l) => l.level === 'error').length);
+      }
+    });
+
     MusicProviderManager.ensurePersistentStorage().then((res) => {
       if (mounted) {
         setStoragePersistStatus(res);
       }
     });
 
-    // 1. Load persistent server-side /api/config (/app/data/config.json) so any device opening Brokeify is logged in immediately
     fetch('/api/config')
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
@@ -327,9 +479,35 @@ export default function App() {
           setServerIntegrations((prev) => ({
             ...prev,
             ...srv.integrations,
+            requireDeviceLogin: srv.integrations.requireDeviceLogin !== false,
+            lidarrUrl: srv.integrations.lidarrUrl || prev.lidarrUrl || 'http://lidarr:8686',
             listenbrainzUsername:
               srv.integrations.listenbrainzUsername || '',
           }));
+        }
+        if (srv.discoveryFilters) {
+          setDiscoveryFilters((prev) => ({
+            ...prev,
+            ...srv.discoveryFilters,
+          }));
+        }
+        if (srv.customTheme) {
+          setCustomTheme((prev) => ({
+            ...prev,
+            ...srv.customTheme,
+          }));
+        }
+        if (srv.picardConfig) {
+          setPicardConfig((prev) => ({
+            ...prev,
+            ...srv.picardConfig,
+          }));
+        }
+        if (Array.isArray(srv.autopilotRules)) {
+          setAutopilotRules(srv.autopilotRules);
+        }
+        if (srv.playStats && typeof srv.playStats === 'object') {
+          setPlayStats(srv.playStats);
         }
         if (srv.customPlaylistNames) {
           MusicProviderManager.saveCustomPlaylistNames(srv.customPlaylistNames);
@@ -337,6 +515,21 @@ export default function App() {
         if (srv.audioPrefs) {
           audio.restoreAudioPreferences(srv.audioPrefs);
         }
+        if (srv.playbackSession && srv.playbackSession.track) {
+          setRemotePlaybackSession(srv.playbackSession);
+        }
+
+        let isDeviceVerified = false;
+        try {
+          isDeviceVerified = Boolean(
+            localStorage.getItem('jellyfin_token') ||
+              localStorage.getItem(DEVICE_VERIFIED_STORAGE_KEY)
+          );
+        } catch {
+          // ignore
+        }
+        const requireLoginOnEachDevice =
+          srv.integrations?.requireDeviceLogin !== false;
 
         let activeProvs = MusicProviderManager.loadProviders();
         if (Array.isArray(srv.providers) && srv.providers.length > 0) {
@@ -345,8 +538,36 @@ export default function App() {
             srv.providers
           );
         }
-        // Also hydrate Jellyfin provider from srv.integrations if token is stored there
-        if (srv.integrations?.jellyfinUrl && srv.integrations?.jellyfinToken) {
+
+        if (
+          srv.integrations?.jellyfinUrl &&
+          requireLoginOnEachDevice &&
+          !isDeviceVerified
+        ) {
+          // Per-Device Jellyfin Login Gate: pre-fill Server URL & Username on this new device,
+          // require Jellyfin login once, and automatically unlock all slskd/Lidarr/ListenBrainz keys upon login!
+          activeProvs = activeProvs.map((p) =>
+            p.type === 'jellyfin'
+              ? {
+                  ...p,
+                  enabled: true,
+                  serverUrl: srv.integrations.jellyfinUrl || p.serverUrl,
+                  username: srv.integrations.jellyfinUsername || p.username,
+                  token: '',
+                  password: '',
+                  status: 'disconnected' as const,
+                  lastMessage:
+                    'Sign in to Jellyfin on this device to unlock your saved slskd, Lidarr, ListenBrainz & playback session.',
+                }
+              : p
+          );
+          setProviders(activeProvs);
+          MusicProviderManager.saveProviders(activeProvs);
+          setIsOnboardingOpen(true);
+        } else if (
+          srv.integrations?.jellyfinUrl &&
+          srv.integrations?.jellyfinToken
+        ) {
           activeProvs = activeProvs.map((p) =>
             p.type === 'jellyfin'
               ? {
@@ -360,12 +581,15 @@ export default function App() {
                 }
               : p
           );
+          setProviders(activeProvs);
+          MusicProviderManager.saveProviders(activeProvs);
           setIsOnboardingOpen(false);
-        }
-        setProviders(activeProvs);
-        MusicProviderManager.saveProviders(activeProvs);
-        if (MusicProviderManager.hasCompletedOnboarding(activeProvs)) {
-          setIsOnboardingOpen(false);
+        } else {
+          setProviders(activeProvs);
+          MusicProviderManager.saveProviders(activeProvs);
+          if (MusicProviderManager.hasCompletedOnboarding(activeProvs)) {
+            setIsOnboardingOpen(false);
+          }
         }
 
         if (Array.isArray(srv.playlists) && srv.playlists.length > 0) {
@@ -383,11 +607,12 @@ export default function App() {
 
         hasLoadedServerConfigRef.current = true;
         const jfProv = activeProvs.find((p) => p.type === 'jellyfin');
-        if (jfProv) {
+        if (jfProv && jfProv.token) {
           syncJellyfinProvider(jfProv);
         }
       })
-      .catch(() => {
+      .catch((err) => {
+        logDebugError('system', 'Failed to load /api/config on startup', err);
         hasLoadedServerConfigRef.current = true;
         const initialProviders = MusicProviderManager.loadProviders();
         const jfProv = initialProviders.find((p) => p.type === 'jellyfin');
@@ -396,8 +621,15 @@ export default function App() {
 
     return () => {
       mounted = false;
+      unsubLogs();
     };
   }, []);
+
+  // Inject user Custom CSS & Custom Colors live into document head
+  const compiledUserCss = useMemo(
+    () => compileUserCustomThemeCss(customTheme),
+    [customTheme]
+  );
 
   // Auto-dismiss toast after 4.5s
   useEffect(() => {
@@ -455,10 +687,12 @@ export default function App() {
 
   const audio = useAudioEngine(allTracks);
 
-  // Track Recently Played whenever currentTrack changes
+  // Track Recently Played & record Maintainerr play stats whenever currentTrack changes
   useEffect(() => {
-    const currentId = audio.currentTrack?.id;
-    if (!currentId) return;
+    const currentTrack = audio.currentTrack;
+    if (!currentTrack?.id) return;
+    const currentId = currentTrack.id;
+
     setRecentTrackIds((prev) => {
       const next = [currentId, ...prev.filter((id) => id !== currentId)].slice(
         0,
@@ -471,6 +705,27 @@ export default function App() {
       }
       return next;
     });
+
+    // Record play count in backend /app/data/config.json for Maintainerr stats
+    fetch('/api/stats/record-play', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        trackId: currentTrack.id,
+        title: currentTrack.title,
+        artist: currentTrack.artist,
+      }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (data?.ok && data.stat) {
+          setPlayStats((prev) => ({
+            ...prev,
+            [currentTrack.id]: data.stat,
+          }));
+        }
+      })
+      .catch(() => {});
   }, [audio.currentTrack?.id]);
 
   // Resolved Pinned Favorite Playlist
@@ -504,6 +759,7 @@ export default function App() {
   const handleStartRenamePlaylist = (pl: Playlist) => {
     setEditingPlaylistId(pl.id);
     setEditingPlaylistNameInput(pl.name);
+    setOpenMenuPlaylistId(null);
   };
 
   // Save custom playlist name while keeping real originalName intact
@@ -566,6 +822,44 @@ export default function App() {
     setToastMessage(`Restored real playlist name: "${realName}"`);
   };
 
+  // Toggle selection of a playlist for multi-delete
+  const handleToggleSelectPlaylistForDelete = (plId: string) => {
+    setSelectedPlaylistIdsForDelete((prev) => {
+      const next = new Set(prev);
+      if (next.has(plId)) next.delete(plId);
+      else next.add(plId);
+      return next;
+    });
+  };
+
+  // Confirm & execute safe playlist deletion (deletes ONLY the playlist containers, NEVER the songs or albums)
+  const handleConfirmDeletePlaylists = () => {
+    if (playlistsPendingDeletion.length === 0) return;
+    const idsToDelete = new Set(playlistsPendingDeletion.map((p) => p.id));
+
+    setPlaylists((prev) => {
+      const remaining = prev.filter((p) => !idsToDelete.has(p.id));
+      MusicProviderManager.savePlaylists(remaining);
+      return remaining;
+    });
+
+    if (selectedPlaylistId && idsToDelete.has(selectedPlaylistId)) {
+      setSelectedPlaylistId(null);
+    }
+    if (pinnedPlaylistId && idsToDelete.has(pinnedPlaylistId)) {
+      setPinnedPlaylistId(null);
+    }
+
+    const deletedCount = playlistsPendingDeletion.length;
+    setPlaylistsPendingDeletion([]);
+    setSelectedPlaylistIdsForDelete(new Set());
+    setIsPlaylistSelectMode(false);
+    setOpenMenuPlaylistId(null);
+    setToastMessage(
+      `🗑️ Deleted ${deletedCount} playlist(s). All songs and albums remain untouched in your library!`
+    );
+  };
+
   // Play playlist in order (1 click, with duplicate-song collapse when Smart Anti-Repeat is active)
   const handlePlayPlaylistInOrder = (pl: Playlist) => {
     const rawTracks = getTracksForPlaylist(pl);
@@ -599,6 +893,47 @@ export default function App() {
     if (restored.audioPrefs) {
       audio.restoreAudioPreferences(restored.audioPrefs);
     }
+    if (restored.integrations) {
+      setServerIntegrations((prev) => ({
+        ...prev,
+        ...restored.integrations,
+        slskdUrl: restored.integrations?.slskdUrl || prev.slskdUrl,
+        slskdApiKey: restored.integrations?.slskdApiKey || prev.slskdApiKey,
+        lidarrUrl: restored.integrations?.lidarrUrl || prev.lidarrUrl,
+        lidarrApiKey: restored.integrations?.lidarrApiKey || prev.lidarrApiKey,
+        listenbrainzUsername:
+          restored.integrations?.listenbrainzUsername ||
+          prev.listenbrainzUsername,
+        listenbrainzToken:
+          restored.integrations?.listenbrainzToken || prev.listenbrainzToken,
+      }));
+    }
+    if (restored.customTheme) {
+      setCustomTheme((prev) => ({ ...prev, ...restored.customTheme }));
+    }
+    if (restored.discoveryFilters) {
+      setDiscoveryFilters((prev) => ({
+        ...prev,
+        ...restored.discoveryFilters,
+      }));
+    }
+    if (restored.picardConfig) {
+      setPicardConfig((prev) => ({ ...prev, ...restored.picardConfig }));
+    }
+    if (Array.isArray(restored.autopilotRules)) {
+      setAutopilotRules(restored.autopilotRules);
+    }
+    if (restored.customPlaylistNames) {
+      MusicProviderManager.saveCustomPlaylistNames(
+        restored.customPlaylistNames
+      );
+    }
+    if (restored.pinnedPlaylistId) {
+      setPinnedPlaylistId(restored.pinnedPlaylistId);
+    }
+    if (restored.playbackSession && restored.playbackSession.track) {
+      setRemotePlaybackSession(restored.playbackSession);
+    }
     if (Array.isArray(restored.providers) && restored.providers.length > 0) {
       setProviders((prev) => {
         const merged = mergeProvidersPreservingAuth(
@@ -630,7 +965,7 @@ export default function App() {
     setCloudSyncStatus({
       state: 'restored',
       lastSyncedAt: restored.updatedAt,
-      message: `Restored EQ (${restored.audioPrefs.eqPreset}), Stabilizer (${restored.audioPrefs.carVolumeLeveler ? 'ON' : 'OFF'}), servers & playlists from Jellyfin`,
+      message: `Restored EQ (${restored.audioPrefs.eqPreset}), slskd/Lidarr/ListenBrainz keys, themes & playlists from Jellyfin`,
     });
   };
 
@@ -664,7 +999,7 @@ export default function App() {
     if (!jfConfig) return;
 
     const snapshot: BrokeifyCloudSettings = {
-      version: 1,
+      version: 2,
       updatedAt: new Date().toISOString(),
       audioPrefs: {
         eqPreset: audio.eqPreset,
@@ -682,6 +1017,14 @@ export default function App() {
       },
       providers,
       playlists,
+      integrations: serverIntegrations,
+      customTheme,
+      discoveryFilters,
+      picardConfig,
+      autopilotRules,
+      customPlaylistNames: MusicProviderManager.loadCustomPlaylistNames(),
+      pinnedPlaylistId,
+      playbackSession: remotePlaybackSession,
     };
 
     const res = await MusicProviderManager.pushCloudSettingsToJellyfin(
@@ -695,62 +1038,11 @@ export default function App() {
     });
   };
 
-  // Auto-push settings to Jellyfin /DisplayPreferences/brokeify whenever EQ, Crossfade, Preload, Buffer, Visual Theme, or Playlists change
-  useEffect(() => {
-    const jfConfig = providers.find(
-      (p) => p.type === 'jellyfin' && p.enabled && p.token && p.userId
-    );
-    if (!jfConfig) return;
-
-    const snapshot: BrokeifyCloudSettings = {
-      version: 1,
-      updatedAt: new Date().toISOString(),
-      audioPrefs: {
-        eqPreset: audio.eqPreset,
-        eqGains: audio.eqGains,
-        carVolumeLeveler: audio.carVolumeLeveler,
-        stabilizerStrength: audio.stabilizerStrength,
-        lufsNormalizationEnabled: audio.lufsNormalizationEnabled,
-        crossfadeSeconds: audio.crossfadeSeconds,
-        offlinePreloadCount: audio.offlinePreloadCount,
-        streamBufferSeconds: audio.streamBufferSeconds,
-        shuffleEnabled: audio.shuffleEnabled,
-        smartAntiRepeatEnabled: audio.smartAntiRepeatEnabled,
-        repeatMode: audio.repeatMode,
-        visualTheme: audio.visualTheme,
-      },
-      providers,
-      playlists,
-    };
-    MusicProviderManager.pushCloudSettingsToJellyfin(jfConfig, snapshot).then(
-      (res) => {
-        setCloudSyncStatus({
-          state: 'pushed',
-          lastSyncedAt: snapshot.updatedAt,
-          message: res.message,
-        });
-      }
-    );
-  }, [
-    audio.eqPreset,
-    audio.eqGains,
-    audio.carVolumeLeveler,
-    audio.stabilizerStrength,
-    audio.lufsNormalizationEnabled,
-    audio.crossfadeSeconds,
-    audio.offlinePreloadCount,
-    audio.streamBufferSeconds,
-    audio.shuffleEnabled,
-    audio.smartAntiRepeatEnabled,
-    audio.repeatMode,
-    audio.visualTheme,
-    providers,
-    playlists,
-  ]);
-
   // Persist configuration to /api/config (/app/data/config.json) on the backend server
   const saveConfigToServer = async (
-    overrideIntegrations?: BrokeifyServerIntegrations
+    overrideIntegrations?: BrokeifyServerIntegrations,
+    overrideFilters?: DiscoveryFilterConfig,
+    overrideTheme?: CustomThemeConfig
   ) => {
     const jfProv = providers.find((p) => p.type === 'jellyfin');
     const activeIntegrations: BrokeifyServerIntegrations = {
@@ -777,6 +1069,10 @@ export default function App() {
           config: {
             version: 2,
             integrations: activeIntegrations,
+            discoveryFilters: overrideFilters || discoveryFilters,
+            customTheme: overrideTheme || customTheme,
+            picardConfig,
+            autopilotRules,
             audioPrefs: {
               eqPreset: audio.eqPreset,
               eqGains: audio.eqGains,
@@ -819,6 +1115,9 @@ export default function App() {
     playlists,
     pinnedPlaylistId,
     serverIntegrations,
+    discoveryFilters,
+    customTheme,
+    picardConfig,
     audio.eqPreset,
     audio.eqGains,
     audio.carVolumeLeveler,
@@ -832,6 +1131,144 @@ export default function App() {
     audio.repeatMode,
     audio.visualTheme,
   ]);
+
+  // Cross-Device Playback Handoff: push live play/pause/timestamp state to /api/playback-session
+  const quantizedPlaybackBucket = Math.floor(audio.currentTime / 4);
+  useEffect(() => {
+    const tr = audio.currentTrack;
+    if (!tr || !hasLoadedServerConfigRef.current) return;
+    // Only push when playing or when user explicitly pauses/seeks on this device
+    if (
+      !audio.isPlaying &&
+      remotePlaybackSession &&
+      remotePlaybackSession.deviceId !== deviceIdentity.deviceId &&
+      remotePlaybackSession.track?.id === tr.id
+    ) {
+      return;
+    }
+
+    const activePlaylist = selectedPlaylistId
+      ? visiblePlaylists.find((p) => p.id === selectedPlaylistId) || null
+      : null;
+
+    const sessionPayload: CrossDevicePlaybackSession = {
+      trackId: tr.id,
+      track: tr,
+      positionSec: Math.max(0, Math.floor(audio.currentTime || 0)),
+      durationSec: Math.max(1, Math.floor(audio.duration || tr.duration || 180)),
+      isPlaying: audio.isPlaying,
+      playlistId: selectedPlaylistId,
+      playlistName: activePlaylist?.name || null,
+      queueTrackIds: audio.queue.slice(0, 60).map((q) => q.id),
+      shuffleEnabled: audio.shuffleEnabled,
+      repeatMode: audio.repeatMode,
+      deviceName: deviceIdentity.deviceName,
+      deviceId: deviceIdentity.deviceId,
+      updatedAt: new Date().toISOString(),
+    };
+
+    fetch('/api/playback-session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sessionPayload }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (data?.ok && data.playbackSession) {
+          setRemotePlaybackSession(data.playbackSession);
+        }
+      })
+      .catch(() => {});
+  }, [
+    audio.currentTrack?.id,
+    audio.isPlaying,
+    quantizedPlaybackBucket,
+    selectedPlaylistId,
+    deviceIdentity.deviceId,
+    deviceIdentity.deviceName,
+  ]);
+
+  // Poll /api/playback-session every 4 seconds so pausing on Phone cues the exact timestamp on Chromecast/TV/PC
+  useEffect(() => {
+    const pollPlaybackSession = async () => {
+      try {
+        const resp = await fetch('/api/playback-session');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const sess: CrossDevicePlaybackSession | null =
+          data?.playbackSession || null;
+        if (!sess || !sess.track) return;
+
+        setRemotePlaybackSession(sess);
+
+        // If another device started playing while this device was playing, pause here so two rooms don't collide
+        if (
+          sess.deviceId !== deviceIdentity.deviceId &&
+          sess.isPlaying &&
+          audio.isPlaying
+        ) {
+          const ageMs =
+            Date.now() - new Date(sess.updatedAt || 0).getTime();
+          if (ageMs < 10000) {
+            audio.pausePlayback();
+            setToastMessage(
+              `⏸️ Paused here — playback handed off to ${sess.deviceName}`
+            );
+          }
+          return;
+        }
+
+        // If this device is paused/idle and another device paused or is playing a track, auto-cue it at that timestamp!
+        if (!audio.isPlaying && sess.deviceId !== deviceIdentity.deviceId) {
+          const sessionKey = `${sess.track.id}-${Math.floor(
+            sess.positionSec / 3
+          )}-${sess.deviceId}`;
+          if (lastCuedRemoteSessionKeyRef.current !== sessionKey) {
+            lastCuedRemoteSessionKeyRef.current = sessionKey;
+            const byId = new Map(allTracks.map((t) => [t.id, t]));
+            const resolvedQueue = Array.isArray(sess.queueTrackIds)
+              ? sess.queueTrackIds
+                  .map((id) => byId.get(id))
+                  .filter((t): t is Track => Boolean(t))
+              : [];
+            audio.cueRemoteSession(
+              sess.track,
+              resolvedQueue.length > 0 ? resolvedQueue : [sess.track],
+              sess.positionSec || 0,
+              false
+            );
+          }
+        }
+      } catch {
+        // ignore offline poll
+      }
+    };
+
+    pollPlaybackSession();
+    const timer = setInterval(pollPlaybackSession, 4000);
+    return () => clearInterval(timer);
+  }, [audio.isPlaying, allTracks, deviceIdentity.deviceId]);
+
+  const handleResumeRemoteSessionNow = () => {
+    if (!remotePlaybackSession?.track) return;
+    const byId = new Map(allTracks.map((t) => [t.id, t]));
+    const resolvedQueue = Array.isArray(remotePlaybackSession.queueTrackIds)
+      ? remotePlaybackSession.queueTrackIds
+          .map((id) => byId.get(id))
+          .filter((t): t is Track => Boolean(t))
+      : [];
+    audio.cueRemoteSession(
+      remotePlaybackSession.track,
+      resolvedQueue.length > 0 ? resolvedQueue : [remotePlaybackSession.track],
+      remotePlaybackSession.positionSec || 0,
+      true
+    );
+    setToastMessage(
+      `▶ Resumed "${remotePlaybackSession.track.title}" at ${formatDuration(
+        remotePlaybackSession.positionSec || 0
+      )} from ${remotePlaybackSession.deviceName}`
+    );
+  };
 
   // Poll /api/slskd/status every 6 seconds to update transfer progress & display "is ready to play!" banners
   const fetchSlskdStatus = async () => {
@@ -848,7 +1285,6 @@ export default function App() {
             data.notifications.length > prev.length &&
             data.notifications[0]
           ) {
-            // Auto-sync Jellyfin when a new download completes!
             const jfProv = providers.find((p) => p.type === 'jellyfin');
             if (jfProv) syncJellyfinProvider(jfProv);
           }
@@ -866,7 +1302,7 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Automatic ListenBrainz Scrobbling (playing_now on track start + single listen at 50% or 240s)
+  // Automatic ListenBrainz Scrobbling
   useEffect(() => {
     const tr = audio.currentTrack;
     if (!tr || !audio.isPlaying || !serverIntegrations.listenbrainzToken) {
@@ -923,7 +1359,7 @@ export default function App() {
     serverIntegrations.listenbrainzToken,
   ]);
 
-  // Permanently delete a duplicate track from the Jellyfin server's hard drive via DELETE /api/jellyfin/items/:id
+  // Permanently delete a single duplicate track from Jellyfin hard drive
   const handleDeleteTrackFromJellyfin = async (track: Track) => {
     setDeletingTrackId(track.id);
     try {
@@ -964,9 +1400,86 @@ export default function App() {
     }
   };
 
+  // Bulk delete tracks from Jellyfin hard drive (Maintainerr mode)
+  const handleBulkDeleteTracksFromJellyfin = async (tracksToDelete: Track[]) => {
+    if (tracksToDelete.length === 0) return;
+    const jfProv = providers.find((p) => p.type === 'jellyfin');
+    const itemIds = tracksToDelete.map((t) => t.id);
+
+    try {
+      const resp = await fetch('/api/jellyfin/items/bulk-delete', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-jellyfin-url': jfProv?.serverUrl || '',
+          'x-jellyfin-token': jfProv?.token || '',
+        },
+        body: JSON.stringify({ itemIds }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      const deletedSet = new Set<string>(
+        Array.isArray(data.deletedIds) && data.deletedIds.length > 0
+          ? data.deletedIds
+          : itemIds
+      );
+      setRemoteTracks((prev) => {
+        const remaining = prev.filter((t) => !deletedSet.has(t.id));
+        MusicProviderManager.saveCachedRemoteTracks(remaining);
+        return remaining;
+      });
+      audio.setQueue(audio.queue.filter((t) => !deletedSet.has(t.id)));
+      setToastMessage(
+        data.message ||
+          `🗑️ Removed ${deletedSet.size} track(s) from library!`
+      );
+    } catch (err) {
+      setToastMessage(
+        `⚠️ ${err instanceof Error ? err.message : 'Bulk delete failed'}`
+      );
+    }
+  };
+
   const handleUpdateProviders = (next: ProviderConfig[]) => {
+    const jf = next.find((p) => p.type === 'jellyfin');
+    if (jf && jf.status === 'connected' && jf.token) {
+      try {
+        localStorage.setItem(DEVICE_VERIFIED_STORAGE_KEY, 'true');
+      } catch {
+        // ignore
+      }
+    }
     setProviders(next);
     MusicProviderManager.saveProviders(next);
+  };
+
+  const handleLockDeviceForLogin = () => {
+    try {
+      localStorage.removeItem('jellyfin_token');
+      localStorage.removeItem('jellyfin_user_id');
+      localStorage.removeItem(DEVICE_VERIFIED_STORAGE_KEY);
+    } catch {
+      // ignore
+    }
+    setProviders((prev) => {
+      const updated = prev.map((p) =>
+        p.type === 'jellyfin'
+          ? {
+              ...p,
+              token: '',
+              password: '',
+              status: 'disconnected' as const,
+              lastMessage:
+                'Device locked. Sign into Jellyfin to unlock your saved slskd, Lidarr & ListenBrainz profile.',
+            }
+          : p
+      );
+      MusicProviderManager.saveProviders(updated);
+      return updated;
+    });
+    setIsOnboardingOpen(true);
+    setToastMessage(
+      '🔒 Locked this device. Sign into Jellyfin to unlock all saved homelab settings!'
+    );
   };
 
   const handleMergeRemoteTracks = (newTracks: Track[]) => {
@@ -999,22 +1512,6 @@ export default function App() {
       MusicProviderManager.savePlaylists(updated);
       return updated;
     });
-    setPinnedPlaylistId((prevPin) => {
-      if (
-        !prevPin ||
-        prevPin === 'pl-night-drive' ||
-        prevPin === 'pl-spite-anthem'
-      ) {
-        const nextPin = newPlaylists[0].id;
-        try {
-          localStorage.setItem(PINNED_PLAYLIST_STORAGE_KEY, nextPin);
-        } catch {
-          // ignore
-        }
-        return nextPin;
-      }
-      return prevPin;
-    });
   };
 
   const handleLogoutProvider = async (type: ProviderType) => {
@@ -1032,7 +1529,10 @@ export default function App() {
 
   const handleSaveResolvedPlaylist = (newPl: Playlist) => {
     setPlaylists((prev) => {
-      const updated = [{ ...newPl, originalName: newPl.originalName || newPl.name }, ...prev];
+      const updated = [
+        { ...newPl, originalName: newPl.originalName || newPl.name },
+        ...prev,
+      ];
       MusicProviderManager.savePlaylists(updated);
       return updated;
     });
@@ -1203,11 +1703,24 @@ export default function App() {
   const activeVisualSkin =
     VISUAL_THEMES.find((t) => t.id === audio.visualTheme) || VISUAL_THEMES[0];
 
+  const headerTitle = customTheme.customAppName?.trim() || 'BROKEIFY';
+  const headerTagline =
+    customTheme.customTagline?.trim() ||
+    `'99 RETRO DECK // ${activeVisualSkin.name.toUpperCase()}`;
+
   return (
     <div
       data-visual-theme={audio.visualTheme}
       className="min-h-screen bg-[#070a0f] text-zinc-100 flex flex-col relative pb-36 transition-colors duration-300"
     >
+      {/* Live User Custom CSS & Custom Accent Color Injection */}
+      {compiledUserCss && (
+        <style
+          id="brokeify-user-custom-css"
+          dangerouslySetInnerHTML={{ __html: compiledUserCss }}
+        />
+      )}
+
       {/* Dynamic Ambient Glow Behind Player */}
       <div
         aria-hidden="true"
@@ -1230,11 +1743,11 @@ export default function App() {
         </div>
       )}
 
-      {/* Ultra-Clean Retro Stereo Metallic Top Header Bar */}
+      {/* Universal Responsive Top Header Bar (Never Overlaps on Half-Windows, Phones, Car Screens, or 72-inch TVs) */}
       <header className="sticky top-0 z-30 winamp-titlebar border-b border-zinc-700/80">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-3">
+        <div className="w-full max-w-[1920px] mx-auto px-3 sm:px-6 xl:px-10 py-2 flex flex-wrap items-center justify-between gap-2.5">
           {/* Left: Brokeify Logo + Core Navigation Tabs */}
-          <div className="flex items-center gap-4 min-w-0">
+          <div className="flex flex-wrap items-center gap-3 min-w-0">
             <button
               type="button"
               onClick={() => setActiveTab('library')}
@@ -1243,18 +1756,18 @@ export default function App() {
               <BrokeifyLogo size={28} />
               <div className="leading-none">
                 <span className="text-base font-extrabold tracking-tight text-white font-display group-hover:text-[#00ff66] transition-colors block">
-                  BROKEIFY
+                  {headerTitle}
                 </span>
                 <span className="text-[9px] font-mono text-[#00ff66] tracking-widest uppercase hidden sm:block">
-                  &apos;99 RETRO DECK // {activeVisualSkin.name.toUpperCase()}
+                  {headerTagline}
                 </span>
               </div>
             </button>
 
-            {/* Desktop Core 4-Tab Navigation (Library, Request / Discover, Now Playing, Settings) */}
+            {/* Core 4-Tab Navigation (Wraps cleanly on medium windows so nothing ever collides with Car Mode) */}
             <nav
               aria-label="Primary Navigation"
-              className="hidden md:flex items-center gap-1 rounded-xl border border-zinc-700/80 bg-zinc-950/80 p-1 text-xs font-mono font-semibold"
+              className="hidden md:flex flex-wrap items-center gap-1 rounded-xl border border-zinc-700/80 bg-zinc-950/80 p-1 text-xs font-mono font-semibold"
             >
               <button
                 type="button"
@@ -1313,8 +1826,8 @@ export default function App() {
             </nav>
           </div>
 
-          {/* Right: Car Mode 🚗 and Settings ⚙️ on the far right */}
-          <div className="flex items-center gap-2 shrink-0">
+          {/* Right: Car Mode 🚗 and Settings ⚙️ */}
+          <div className="flex items-center gap-2 shrink-0 ml-auto">
             <button
               type="button"
               onClick={() => setIsCarModeOpen(true)}
@@ -1323,7 +1836,7 @@ export default function App() {
               className="inline-flex items-center gap-1.5 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-3 py-1.5 text-xs font-mono font-bold text-zinc-950 transition-colors whitespace-nowrap shrink-0 min-h-[36px]"
             >
               <Car className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Car Mode</span>
+              <span>Car Mode</span>
               <span aria-hidden="true">🚗</span>
             </button>
 
@@ -1335,7 +1848,7 @@ export default function App() {
               data-testid="navbar-settings-btn"
               aria-label="Settings"
               title="Settings"
-              className={`inline-flex items-center justify-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-mono font-semibold transition-colors min-h-[36px] ${
+              className={`inline-flex items-center justify-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-mono font-semibold transition-colors whitespace-nowrap min-h-[36px] ${
                 activeTab === 'settings'
                   ? 'border-[#00ff66] bg-emerald-500/20 text-[#00ff66]'
                   : 'border-zinc-700 bg-zinc-900 text-zinc-200 hover:text-white hover:border-zinc-600'
@@ -1348,8 +1861,54 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main Content Container */}
-      <main className="relative z-10 flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 pt-5 space-y-6">
+      {/* Main Content Container — Fluid up to 1920px so 32" & 72" TVs, Chromecasts, Laptops, Car Displays & Phones all look crisp */}
+      <main className="relative z-10 flex-1 w-full max-w-[1920px] mx-auto px-3 sm:px-6 xl:px-10 pt-5 space-y-6">
+        {/* Cross-Device Playback Handoff Banner ("Pause on Phone -> Press Play on Chromecast / TV and Keep Listening") */}
+        {remotePlaybackSession?.track &&
+          remotePlaybackSession.deviceId !== deviceIdentity.deviceId && (
+            <div
+              role="region"
+              aria-label="Cross-Device Playback Handoff"
+              data-testid="cross-device-handoff-banner"
+              className="winamp-bezel rounded-2xl border border-purple-500/60 bg-purple-950/35 px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 shadow-lg"
+            >
+              <div className="flex items-center gap-3 min-w-0">
+                <Radio className="w-4 h-4 text-[#00ff66] shrink-0 animate-pulse" />
+                <div className="text-xs font-mono text-zinc-200 truncate">
+                  <span className="font-bold text-purple-300 uppercase">
+                    {remotePlaybackSession.isPlaying
+                      ? `Now Playing on ${remotePlaybackSession.deviceName}: `
+                      : `Paused on ${remotePlaybackSession.deviceName}: `}
+                  </span>
+                  <strong className="text-white">
+                    {remotePlaybackSession.track.title}
+                  </strong>{' '}
+                  <span className="text-zinc-400">
+                    — {remotePlaybackSession.track.artist}
+                  </span>{' '}
+                  <span className="text-[#00ff66] font-bold">
+                    ({formatDuration(remotePlaybackSession.positionSec || 0)})
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleResumeRemoteSessionNow}
+                  data-testid="btn-resume-handoff-here"
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-3.5 py-1.5 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[34px]"
+                >
+                  <Play className="w-3.5 h-3.5 fill-current" />
+                  <span>
+                    Resume Here (
+                    {formatDuration(remotePlaybackSession.positionSec || 0)})
+                  </span>
+                </button>
+              </div>
+            </div>
+          )}
+
         {/* Celebratory slskd Download Completed & Jellyfin Refreshed Notification Banner */}
         {readyNotifications.length > 0 && (
           <div
@@ -1398,7 +1957,7 @@ export default function App() {
            ===================================================================== */}
         {activeTab === 'library' && (
           <div className="space-y-6">
-            {/* Hero Quick-Row: Compact Fixed-Width Boxes with Text Cutoff so Long Track/Playlist Names Never Stretch Cards */}
+            {/* Hero Quick-Row: Compact Fixed-Width Boxes with Text Cutoff */}
             {(pinnedFavoritePlaylist || recentlyPlayedTracks.length > 0) && (
               <section
                 aria-label="Quick Launch Recently Played and Favorite Playlists"
@@ -1431,7 +1990,6 @@ export default function App() {
                 </div>
 
                 <div className="p-3.5 flex items-stretch gap-3 overflow-x-auto">
-                  {/* Pinned Favorite Playlist Quick Card (Strict Fixed Width w-[235px] max-w-[235px] with Truncate Cutoff) */}
                   {pinnedFavoritePlaylist && (
                     <div
                       data-testid="quicklaunch-pinned-playlist-card"
@@ -1490,8 +2048,7 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* Recently Played Track Cards (Strict w-[200px] max-w-[200px] Cutoff so Long Track Titles Never Stretch Boxes) */}
-                  {recentlyPlayedTracks.slice(0, 6).map((track) => {
+                  {recentlyPlayedTracks.slice(0, 8).map((track) => {
                     const isCurrent = audio.currentTrack?.id === track.id;
                     return (
                       <button
@@ -1541,13 +2098,13 @@ export default function App() {
               </section>
             )}
 
-            {/* Sub-Tabs Segmented Control + Search Filter Bar */}
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-zinc-800/80 pb-3">
+            {/* Sub-Tabs Segmented Control + Search Filter Bar (Flex-Wrap so buttons never clip off the right edge) */}
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800/80 pb-3">
               <div
                 role="tablist"
                 aria-label="Library View Mode"
                 data-testid="library-subtabs"
-                className="inline-flex items-center gap-1 rounded-xl border border-zinc-700/80 bg-zinc-900/90 p-1 self-start font-mono"
+                className="flex flex-wrap items-center gap-1 rounded-xl border border-zinc-700/80 bg-zinc-900/90 p-1 font-mono"
               >
                 <button
                   type="button"
@@ -1555,7 +2112,7 @@ export default function App() {
                   aria-selected={librarySubTab === 'playlists'}
                   onClick={() => setLibrarySubTab('playlists')}
                   data-testid="subtab-playlists"
-                  className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-bold transition-colors min-h-[34px] ${
+                  className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold transition-colors whitespace-nowrap min-h-[34px] ${
                     librarySubTab === 'playlists'
                       ? 'bg-[#00ff66] text-zinc-950'
                       : 'text-zinc-400 hover:text-white'
@@ -1571,7 +2128,7 @@ export default function App() {
                   aria-selected={librarySubTab === 'songs'}
                   onClick={() => setLibrarySubTab('songs')}
                   data-testid="subtab-songs"
-                  className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-bold transition-colors min-h-[34px] ${
+                  className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold transition-colors whitespace-nowrap min-h-[34px] ${
                     librarySubTab === 'songs'
                       ? 'bg-[#00ff66] text-zinc-950'
                       : 'text-zinc-400 hover:text-white'
@@ -1587,7 +2144,7 @@ export default function App() {
                   aria-selected={librarySubTab === 'albums'}
                   onClick={() => setLibrarySubTab('albums')}
                   data-testid="subtab-albums"
-                  className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-bold transition-colors min-h-[34px] ${
+                  className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold transition-colors whitespace-nowrap min-h-[34px] ${
                     librarySubTab === 'albums'
                       ? 'bg-[#00ff66] text-zinc-950'
                       : 'text-zinc-400 hover:text-white'
@@ -1603,7 +2160,7 @@ export default function App() {
                   aria-selected={librarySubTab === 'artists'}
                   onClick={() => setLibrarySubTab('artists')}
                   data-testid="subtab-artists"
-                  className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-bold transition-colors min-h-[34px] ${
+                  className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold transition-colors whitespace-nowrap min-h-[34px] ${
                     librarySubTab === 'artists'
                       ? 'bg-[#00ff66] text-zinc-950'
                       : 'text-zinc-400 hover:text-white'
@@ -1612,11 +2169,27 @@ export default function App() {
                   <Users className="w-3.5 h-3.5" />
                   <span>Artists ({artistGroups.length})</span>
                 </button>
+
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={librarySubTab === 'stats'}
+                  onClick={() => setLibrarySubTab('stats')}
+                  data-testid="subtab-stats"
+                  className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold transition-colors whitespace-nowrap min-h-[34px] ${
+                    librarySubTab === 'stats'
+                      ? 'bg-[#00ff66] text-zinc-950'
+                      : 'text-zinc-400 hover:text-white'
+                  }`}
+                >
+                  <BarChart3 className="w-3.5 h-3.5" />
+                  <span>Stats &amp; Cleanup</span>
+                </button>
               </div>
 
-              {/* Search & New Playlist Controls */}
-              <div className="flex items-center gap-2">
-                <div className="relative w-full sm:w-64">
+              {/* Search, Multi-Select Playlists & New Playlist Controls */}
+              <div className="flex flex-wrap items-center gap-2 flex-1 sm:flex-initial justify-end">
+                <div className="relative flex-1 sm:w-60 min-w-[180px]">
                   <Search className="w-3.5 h-3.5 text-zinc-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                   <input
                     type="search"
@@ -1635,6 +2208,27 @@ export default function App() {
                     className="w-full rounded-xl border border-zinc-800 bg-zinc-950 pl-8 pr-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:border-[#00ff66] focus:outline-none min-h-[36px]"
                   />
                 </div>
+
+                {librarySubTab === 'playlists' && visiblePlaylists.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsPlaylistSelectMode(!isPlaylistSelectMode);
+                      setSelectedPlaylistIdsForDelete(new Set());
+                    }}
+                    data-testid="toggle-select-playlists-btn"
+                    className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-mono font-semibold transition-colors whitespace-nowrap shrink-0 min-h-[36px] ${
+                      isPlaylistSelectMode
+                        ? 'border-[#00ff66] bg-emerald-500/20 text-[#00ff66]'
+                        : 'border-zinc-700 bg-zinc-900 text-zinc-200 hover:text-white'
+                    }`}
+                  >
+                    <CheckSquare className="w-3.5 h-3.5" />
+                    <span>
+                      {isPlaylistSelectMode ? 'Done Selecting' : 'Select Playlists'}
+                    </span>
+                  </button>
+                )}
 
                 <button
                   type="button"
@@ -1672,7 +2266,117 @@ export default function App() {
               </form>
             )}
 
-            {/* SUB-TAB 1: UNIFIED PLAYLISTS GRID */}
+            {/* Multi-Select Playlists Action Bar */}
+            {librarySubTab === 'playlists' && isPlaylistSelectMode && (
+              <div
+                data-testid="multi-select-playlists-bar"
+                className="winamp-bezel rounded-2xl border border-emerald-500/40 bg-zinc-900/80 p-3.5 flex flex-wrap items-center justify-between gap-3"
+              >
+                <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
+                  <span className="text-[#00ff66] font-bold">
+                    {selectedPlaylistIdsForDelete.size} of{' '}
+                    {visiblePlaylists.length} playlists selected
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSelectedPlaylistIdsForDelete(
+                        new Set(visiblePlaylists.map((p) => p.id))
+                      )
+                    }
+                    className="rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-1 text-zinc-200 hover:text-white"
+                  >
+                    Select All
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedPlaylistIdsForDelete(new Set())}
+                    className="rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-1 text-zinc-400 hover:text-white"
+                  >
+                    Clear Selection
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  disabled={selectedPlaylistIdsForDelete.size === 0}
+                  onClick={() => {
+                    const targets = visiblePlaylists.filter((p) =>
+                      selectedPlaylistIdsForDelete.has(p.id)
+                    );
+                    setPlaylistsPendingDeletion(targets);
+                  }}
+                  data-testid="delete-selected-playlists-btn"
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-rose-500 hover:bg-rose-400 disabled:opacity-40 px-4 py-2 text-xs font-mono font-bold text-white transition-colors min-h-[36px]"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>
+                    Delete Selected Playlists ({selectedPlaylistIdsForDelete.size})
+                  </span>
+                </button>
+              </div>
+            )}
+
+            {/* Safe Playlist Deletion Warning Modal / Banner (Explicitly states songs/albums are NOT deleted) */}
+            {playlistsPendingDeletion.length > 0 && (
+              <div
+                role="dialog"
+                aria-modal="true"
+                data-testid="safe-delete-playlists-warning"
+                className="rounded-2xl border-2 border-amber-500/70 bg-zinc-950/95 p-5 space-y-4 shadow-2xl"
+              >
+                <div className="flex items-start gap-3">
+                  <AlertTriangle className="w-6 h-6 text-amber-400 shrink-0 mt-0.5" />
+                  <div className="space-y-1.5">
+                    <h3 className="text-sm sm:text-base font-bold text-white font-mono">
+                      Delete {playlistsPendingDeletion.length} Playlist
+                      {playlistsPendingDeletion.length === 1 ? '' : 's'}? (Your
+                      Songs &amp; Albums Are 100% Safe!)
+                    </h3>
+                    <p className="text-xs sm:text-sm text-zinc-200 leading-relaxed">
+                      <strong className="text-[#00ff66]">
+                        Safe Deletion Guarantee:
+                      </strong>{' '}
+                      This action{' '}
+                      <strong className="text-amber-300 underline">
+                        ONLY deletes the playlist list(s)
+                      </strong>{' '}
+                      ({playlistsPendingDeletion.map((p) => `"${p.name}"`).join(', ')}).
+                      It{' '}
+                      <strong className="text-[#00ff66]">
+                        DOES NOT delete any songs, albums, or audio files
+                      </strong>{' '}
+                      from your Jellyfin server or hard drive.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center justify-end gap-2.5 pt-2 border-t border-zinc-800">
+                  <button
+                    type="button"
+                    onClick={() => setPlaylistsPendingDeletion([])}
+                    data-testid="cancel-delete-playlists-btn"
+                    className="rounded-xl border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 px-4 py-2 text-xs font-mono font-semibold text-zinc-200"
+                  >
+                    Cancel &amp; Keep Playlists
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleConfirmDeletePlaylists}
+                    data-testid="confirm-delete-playlists-btn"
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-rose-500 hover:bg-rose-400 px-4 py-2 text-xs font-mono font-bold text-white"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                    <span>
+                      Yes, Delete {playlistsPendingDeletion.length} Playlist
+                      {playlistsPendingDeletion.length === 1 ? '' : 's'} Only
+                    </span>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* SUB-TAB 1: UNIFIED PLAYLISTS GRID (Responsive 1 to 5 Columns across Phones, Laptops & 72" TVs) */}
             {librarySubTab === 'playlists' && (
               <section aria-label="Unified Playlists Grid" className="space-y-4">
                 {visiblePlaylists.length === 0 ? (
@@ -1690,13 +2394,13 @@ export default function App() {
                         }}
                         className="text-[#00ff66] underline font-semibold"
                       >
-                        Settings → Sources Hub
+                        Settings → Server &amp; Connections
                       </button>{' '}
                       to connect or sync your music server.
                     </p>
                   </div>
                 ) : (
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4">
                     {visiblePlaylists.map((pl) => {
                       const plTracks = getTracksForPlaylist(pl);
                       const allCached =
@@ -1707,28 +2411,57 @@ export default function App() {
                       const realPlaylistName = pl.originalName || pl.name;
                       const hasCustomName = realPlaylistName !== pl.name;
                       const isEditingThis = editingPlaylistId === pl.id;
+                      const isMenuOpen = openMenuPlaylistId === pl.id;
+                      const isSelectedForDelete =
+                        selectedPlaylistIdsForDelete.has(pl.id);
+                      const linkedAutopilotRule = autopilotRules.find(
+                        (r) => r.playlistId === pl.id
+                      );
 
                       return (
                         <div
                           key={pl.id}
                           data-testid={`playlist-card-${pl.id}`}
-                          className={`group winamp-bezel rounded-2xl border p-4 flex flex-col justify-between gap-4 transition-all ${
-                            isPinned
-                              ? 'border-purple-500/60 shadow-lg shadow-purple-950/20'
-                              : 'border-zinc-800/90 hover:border-zinc-700'
+                          className={`group winamp-bezel rounded-2xl border p-4 flex flex-col justify-between gap-4 transition-all relative ${
+                            isSelectedForDelete
+                              ? 'border-rose-500 ring-1 ring-rose-500/50'
+                              : isPinned
+                                ? 'border-purple-500/60 shadow-lg shadow-purple-950/20'
+                                : 'border-zinc-800/90 hover:border-zinc-700'
                           }`}
                         >
                           <div className="space-y-2.5">
                             <div className="flex items-start justify-between gap-2">
+                              {isPlaylistSelectMode && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleToggleSelectPlaylistForDelete(pl.id)
+                                  }
+                                  data-testid={`select-playlist-checkbox-${pl.id}`}
+                                  className="mt-0.5 text-zinc-300 hover:text-[#00ff66] shrink-0"
+                                >
+                                  {isSelectedForDelete ? (
+                                    <CheckSquare className="w-5 h-5 text-[#00ff66]" />
+                                  ) : (
+                                    <Square className="w-5 h-5" />
+                                  )}
+                                </button>
+                              )}
+
                               <button
                                 type="button"
                                 onClick={() => {
+                                  if (isPlaylistSelectMode) {
+                                    handleToggleSelectPlaylistForDelete(pl.id);
+                                    return;
+                                  }
                                   setSelectedPlaylistId(pl.id);
                                   setLibrarySubTab('songs');
                                 }}
                                 className="text-left min-w-0 flex-1 overflow-hidden"
                               >
-                                <div className="flex items-center gap-1.5">
+                                <div className="flex items-center gap-1.5 flex-wrap">
                                   <h3
                                     data-testid={`playlist-display-name-${pl.id}`}
                                     className="text-base font-bold text-white group-hover:text-[#00ff66] transition-colors truncate"
@@ -1738,6 +2471,11 @@ export default function App() {
                                   {hasCustomName && (
                                     <span className="rounded bg-purple-500/20 border border-purple-500/40 px-1.5 py-0.5 text-[9px] font-mono font-bold uppercase text-purple-300 shrink-0">
                                       Renamed
+                                    </span>
+                                  )}
+                                  {linkedAutopilotRule && (
+                                    <span className="rounded bg-emerald-500/20 border border-emerald-500/40 px-1.5 py-0.5 text-[9px] font-mono font-bold uppercase text-[#00ff66] shrink-0">
+                                      🤖 {linkedAutopilotRule.interval}
                                     </span>
                                   )}
                                 </div>
@@ -1761,28 +2499,8 @@ export default function App() {
                                 </p>
                               </button>
 
-                              <div className="flex items-center gap-1.5 shrink-0">
-                                {/* Rename Playlist Button */}
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    isEditingThis
-                                      ? setEditingPlaylistId(null)
-                                      : handleStartRenamePlaylist(pl)
-                                  }
-                                  data-testid={`rename-playlist-btn-${pl.id}`}
-                                  aria-label={`Rename playlist ${pl.name}`}
-                                  title="Rename Playlist (keeps Real Name visible)"
-                                  className={`min-h-[34px] min-w-[34px] rounded-xl border flex items-center justify-center transition-colors ${
-                                    isEditingThis
-                                      ? 'border-[#00ff66] bg-emerald-500/20 text-[#00ff66]'
-                                      : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-white'
-                                  }`}
-                                >
-                                  <Pencil className="w-3.5 h-3.5" />
-                                </button>
-
-                                {/* Star / Pin Favorite Playlist Button */}
+                              {/* Right Action Icons: Pin, Offline Download, and Three Dots (⋯) Menu */}
+                              <div className="flex items-center gap-1 shrink-0 relative">
                                 <button
                                   type="button"
                                   onClick={() => handleTogglePinPlaylist(pl.id)}
@@ -1795,7 +2513,7 @@ export default function App() {
                                   title={
                                     isPinned
                                       ? 'Pinned in Quick Launch'
-                                      : 'Pin as Favorite Playlist in Quick Launch'
+                                      : 'Pin as Favorite Playlist'
                                   }
                                   className={`min-h-[34px] min-w-[34px] rounded-xl border flex items-center justify-center transition-colors ${
                                     isPinned
@@ -1804,13 +2522,12 @@ export default function App() {
                                   }`}
                                 >
                                   <Star
-                                    className={`w-4 h-4 ${
+                                    className={`w-3.5 h-3.5 ${
                                       isPinned ? 'fill-amber-400' : ''
                                     }`}
                                   />
                                 </button>
 
-                                {/* Offline Vault Downloader Button */}
                                 <button
                                   type="button"
                                   onClick={() =>
@@ -1819,7 +2536,7 @@ export default function App() {
                                   disabled={isDownloading}
                                   aria-label={`Download playlist ${pl.name} to Offline Vault`}
                                   title="Save playlist to IndexedDB Offline Vault"
-                                  className={`min-h-[34px] px-2.5 rounded-xl border flex items-center justify-center gap-1 text-xs font-mono transition-colors ${
+                                  className={`min-h-[34px] px-2 rounded-xl border flex items-center justify-center gap-1 text-xs font-mono transition-colors ${
                                     allCached
                                       ? 'border-emerald-500/50 bg-emerald-500/20 text-[#00ff66]'
                                       : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-white'
@@ -1839,6 +2556,99 @@ export default function App() {
                                     <ArrowDownToLine className="w-3.5 h-3.5" />
                                   )}
                                 </button>
+
+                                {/* Three Little Dots (⋯) Menu Button */}
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setOpenMenuPlaylistId(
+                                      isMenuOpen ? null : pl.id
+                                    )
+                                  }
+                                  data-testid={`playlist-menu-btn-${pl.id}`}
+                                  aria-label={`More options for ${pl.name}`}
+                                  title="More Playlist Actions (Rename, Link Spotify Autopilot, Select, Delete)"
+                                  className={`min-h-[34px] min-w-[34px] rounded-xl border flex items-center justify-center transition-colors ${
+                                    isMenuOpen
+                                      ? 'border-[#00ff66] bg-emerald-500/20 text-[#00ff66]'
+                                      : 'border-zinc-800 bg-zinc-950 text-zinc-300 hover:text-white'
+                                  }`}
+                                >
+                                  <MoreVertical className="w-4 h-4" />
+                                </button>
+
+                                {/* Dropdown Menu for Three Dots (⋯) */}
+                                {isMenuOpen && (
+                                  <div
+                                    data-testid={`playlist-dropdown-menu-${pl.id}`}
+                                    className="absolute right-0 top-10 z-30 w-56 rounded-2xl border border-zinc-700 bg-zinc-950/95 p-1.5 shadow-2xl backdrop-blur-md space-y-1 text-xs font-mono"
+                                  >
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        handleStartRenamePlaylist(pl)
+                                      }
+                                      data-testid={`rename-playlist-btn-${pl.id}`}
+                                      className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-[#00ff66]"
+                                    >
+                                      <Pencil className="w-3.5 h-3.5 text-[#00ff66]" />
+                                      <span>Rename Playlist</span>
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setAutopilotModalPlaylist(pl);
+                                        setAutopilotSpotifyUrlInput(
+                                          linkedAutopilotRule?.spotifyUrl ||
+                                            pl.autopilotSpotifyUrl ||
+                                            ''
+                                        );
+                                        setAutopilotScheduleInput(
+                                          linkedAutopilotRule?.interval ||
+                                            pl.autopilotInterval ||
+                                            'weekly'
+                                        );
+                                        setOpenMenuPlaylistId(null);
+                                      }}
+                                      data-testid={`autopilot-link-playlist-btn-${pl.id}`}
+                                      className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-purple-300"
+                                    >
+                                      <Link2 className="w-3.5 h-3.5 text-purple-400" />
+                                      <span>Link Spotify Autopilot</span>
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setIsPlaylistSelectMode(true);
+                                        handleToggleSelectPlaylistForDelete(
+                                          pl.id
+                                        );
+                                        setOpenMenuPlaylistId(null);
+                                      }}
+                                      className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-white"
+                                    >
+                                      <CheckSquare className="w-3.5 h-3.5 text-sky-400" />
+                                      <span>Select Multiple Playlists</span>
+                                    </button>
+
+                                    <div className="border-t border-zinc-800 my-1" />
+
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setPlaylistsPendingDeletion([pl]);
+                                        setOpenMenuPlaylistId(null);
+                                      }}
+                                      data-testid={`delete-playlist-btn-${pl.id}`}
+                                      className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-rose-300 hover:bg-rose-950/50 hover:text-rose-200"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                                      <span>Delete Playlist Only</span>
+                                    </button>
+                                  </div>
+                                )}
                               </div>
                             </div>
 
@@ -1904,7 +2714,7 @@ export default function App() {
                               </form>
                             )}
 
-                            <div className="text-[11px] font-mono text-zinc-400 flex items-center gap-2">
+                            <div className="text-[11px] font-mono text-zinc-400 flex items-center gap-2 flex-wrap">
                               <span>{plTracks.length} tracks</span>
                               <span aria-hidden="true">·</span>
                               <span className="uppercase">{pl.source}</span>
@@ -1949,7 +2759,119 @@ export default function App() {
               </section>
             )}
 
-            {/* SUB-TAB 2: SONGS LIST (Clean rows without "More Like This" clutter) */}
+            {/* Modal to Link a Playlist to a Spotify Playlist for Daily/Weekly/Monthly Autopilot */}
+            {autopilotModalPlaylist && (
+              <div
+                role="dialog"
+                aria-modal="true"
+                data-testid="autopilot-link-modal"
+                className="rounded-2xl border-2 border-purple-500/60 bg-zinc-950/95 p-5 space-y-4 shadow-2xl"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="space-y-1">
+                    <h3 className="text-base font-bold text-white font-mono flex items-center gap-2">
+                      <RefreshCw className="w-4 h-4 text-[#00ff66]" />
+                      <span>
+                        Link &ldquo;{autopilotModalPlaylist.name}&rdquo; to a
+                        Spotify Playlist (Autopilot)
+                      </span>
+                    </h3>
+                    <p className="text-xs text-zinc-300">
+                      Paste a Spotify Playlist link below. Brokeify will
+                      automatically check Spotify on your schedule (Daily,
+                      Weekly, or Monthly), download any new songs, organize
+                      their folders via MusicBrainz Picard, and populate this
+                      playlist!
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setAutopilotModalPlaylist(null)}
+                    className="rounded-lg border border-zinc-800 bg-zinc-900 p-1.5 text-zinc-400 hover:text-white"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <form
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    if (!autopilotSpotifyUrlInput.trim()) return;
+                    const resp = await fetch('/api/autopilot/save', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        rule: {
+                          id: `autopilot-${autopilotModalPlaylist.id}`,
+                          playlistId: autopilotModalPlaylist.id,
+                          playlistName: autopilotModalPlaylist.name,
+                          spotifyUrl: autopilotSpotifyUrlInput.trim(),
+                          interval: autopilotScheduleInput,
+                          enabled: true,
+                          preferredDownloader:
+                            serverIntegrations.preferredDownloader || 'auto',
+                          organizeWithPicard: true,
+                        },
+                      }),
+                    });
+                    const data = await resp.json();
+                    if (resp.ok && data.ok) {
+                      setToastMessage(
+                        `🤖 Linked "${autopilotModalPlaylist.name}" to Spotify (${autopilotScheduleInput} auto-sync)!`
+                      );
+                      setAutopilotModalPlaylist(null);
+                      refreshAutopilotRules();
+                    }
+                  }}
+                  className="grid grid-cols-1 sm:grid-cols-12 gap-3"
+                >
+                  <div className="sm:col-span-7">
+                    <label className="block text-xs font-mono text-zinc-300 mb-1">
+                      Spotify Playlist URL
+                    </label>
+                    <input
+                      type="text"
+                      value={autopilotSpotifyUrlInput}
+                      onChange={(e) =>
+                        setAutopilotSpotifyUrlInput(e.target.value)
+                      }
+                      placeholder="https://open.spotify.com/playlist/..."
+                      data-testid="modal-autopilot-spotify-url"
+                      className="w-full rounded-xl border border-zinc-700 bg-zinc-900 px-3.5 py-2 text-xs font-mono text-white"
+                    />
+                  </div>
+                  <div className="sm:col-span-3">
+                    <label className="block text-xs font-mono text-zinc-300 mb-1">
+                      Check Frequency
+                    </label>
+                    <select
+                      value={autopilotScheduleInput}
+                      onChange={(e) =>
+                        setAutopilotScheduleInput(
+                          e.target.value as AutopilotScheduleInterval
+                        )
+                      }
+                      className="w-full rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs font-mono text-[#00ff66] font-bold"
+                    >
+                      <option value="daily">Daily</option>
+                      <option value="weekly">Weekly</option>
+                      <option value="monthly">Monthly</option>
+                    </select>
+                  </div>
+                  <div className="sm:col-span-2 flex items-end">
+                    <button
+                      type="submit"
+                      data-testid="modal-autopilot-save-btn"
+                      className="w-full rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-4 py-2 text-xs font-mono font-bold text-zinc-950 min-h-[38px]"
+                    >
+                      Save Link
+                    </button>
+                  </div>
+                </form>
+              </div>
+            )}
+
+            {/* SUB-TAB 2: SONGS LIST */}
             {librarySubTab === 'songs' && (
               <section
                 aria-label="Songs Catalog"
@@ -1977,32 +2899,33 @@ export default function App() {
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2">
-                    {selectedPlaylistId && (() => {
-                      const activePl = visiblePlaylists.find(
-                        (p) => p.id === selectedPlaylistId
-                      );
-                      const realPlName =
-                        activePl?.originalName || activePl?.name || '';
-                      return (
-                        <div className="flex items-center gap-2">
-                          {activePl && (
-                            <span className="rounded-lg border border-purple-500/40 bg-purple-950/30 px-2.5 py-1 text-xs font-mono text-purple-200">
-                              Playlist: <strong>{activePl.name}</strong>
-                              {realPlName && realPlName !== activePl.name
-                                ? ` (Real: ${realPlName})`
-                                : ''}
-                            </span>
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => setSelectedPlaylistId(null)}
-                            className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs font-mono font-semibold text-[#00ff66] hover:text-white min-h-[32px]"
-                          >
-                            Clear Playlist Filter (Show All {allTracks.length})
-                          </button>
-                        </div>
-                      );
-                    })()}
+                    {selectedPlaylistId &&
+                      (() => {
+                        const activePl = visiblePlaylists.find(
+                          (p) => p.id === selectedPlaylistId
+                        );
+                        const realPlName =
+                          activePl?.originalName || activePl?.name || '';
+                        return (
+                          <div className="flex items-center gap-2">
+                            {activePl && (
+                              <span className="rounded-lg border border-purple-500/40 bg-purple-950/30 px-2.5 py-1 text-xs font-mono text-purple-200">
+                                Playlist: <strong>{activePl.name}</strong>
+                                {realPlName && realPlName !== activePl.name
+                                  ? ` (Real: ${realPlName})`
+                                  : ''}
+                              </span>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => setSelectedPlaylistId(null)}
+                              className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs font-mono font-semibold text-[#00ff66] hover:text-white min-h-[32px]"
+                            >
+                              Clear Playlist Filter (Show All {allTracks.length})
+                            </button>
+                          </div>
+                        );
+                      })()}
 
                     <button
                       type="button"
@@ -2139,7 +3062,6 @@ export default function App() {
                             </div>
 
                             <div className="flex items-center gap-2 shrink-0">
-                              {/* Delete Duplicate Track from Jellyfin Server Hard Drive (2-step confirmation) */}
                               {track.source === 'jellyfin' && (
                                 <>
                                   {confirmDeleteTrackId === track.id ? (
@@ -2233,11 +3155,11 @@ export default function App() {
               </section>
             )}
 
-            {/* SUB-TAB 3: ALBUMS GRID */}
+            {/* SUB-TAB 3: ALBUMS GRID (Responsive up to 5 columns on large TVs) */}
             {librarySubTab === 'albums' && (
               <section
                 aria-label="Albums Grid"
-                className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"
+                className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4"
               >
                 {albumGroups.map((group) => (
                   <div
@@ -2304,11 +3226,11 @@ export default function App() {
               </section>
             )}
 
-            {/* SUB-TAB 4: ARTISTS GRID */}
+            {/* SUB-TAB 4: ARTISTS GRID (Responsive up to 5 columns on large TVs) */}
             {librarySubTab === 'artists' && (
               <section
                 aria-label="Artists Grid"
-                className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"
+                className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4"
               >
                 {artistGroups.map((group) => (
                   <div
@@ -2371,18 +3293,48 @@ export default function App() {
                 ))}
               </section>
             )}
+
+            {/* SUB-TAB 5: MAINTAINERR-STYLE LIBRARY STATISTICS & DISK CLEANUP */}
+            {librarySubTab === 'stats' && (
+              <MaintainerrStatsView
+                allTracks={allTracks}
+                playStats={playStats}
+                currentTrackId={audio.currentTrack?.id}
+                onPlayTrack={(track, context) =>
+                  audio.playSpecificTrack(track, context || allTracks)
+                }
+                onBulkDeleteTracksFromJellyfin={
+                  handleBulkDeleteTracksFromJellyfin
+                }
+              />
+            )}
           </div>
         )}
 
         {/* =====================================================================
-            TAB 1B: REQUEST MUSIC / DISCOVER (EXPLO REPLACEMENT: MUSICBRAINZ + LISTENBRAINZ + SLSKD)
+            TAB 1B: REQUEST MUSIC / DISCOVER (EXPLO REPLACEMENT)
            ===================================================================== */}
         {activeTab === 'discover' && (
           <RequestDiscoverView
             catalog={allTracks}
+            playlists={visiblePlaylists}
             integrations={serverIntegrations}
+            discoveryFilters={discoveryFilters}
+            onUpdateDiscoveryFilters={setDiscoveryFilters}
+            onSaveDiscoveryFiltersNow={async (nextFilters) => {
+              await saveConfigToServer(serverIntegrations, nextFilters);
+              setToastMessage('💾 Saved Exclusion Filters to config.json!');
+            }}
+            autopilotRules={autopilotRules}
+            onRefreshAutopilotRules={refreshAutopilotRules}
+            picardConfig={picardConfig}
+            onUpdatePicardConfig={setPicardConfig}
             jobs={slskdJobs}
             onPlayTrack={(track) => audio.playSpecificTrack(track, allTracks)}
+            onSaveResolvedPlaylist={(pl) => {
+              handleSaveResolvedPlaylist(pl);
+              setActiveTab('library');
+            }}
             onRefreshStatus={fetchSlskdStatus}
             onOpenSettingsSources={() => {
               setActiveTab('settings');
@@ -2400,7 +3352,7 @@ export default function App() {
             aria-label="Now Playing and Active Queue"
             className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start"
           >
-            {/* Left 7 Columns: Main Stereo Deck + Dancing Wavy Visualizer + Scrubber + Transport */}
+            {/* Left 7 Columns: Main Stereo Deck + Visualizer + Scrubber + Transport */}
             <div className="lg:col-span-7 winamp-bezel rounded-3xl border border-zinc-700/80 overflow-hidden">
               <div className="winamp-titlebar px-5 py-3 flex flex-wrap items-center justify-between gap-3 border-b border-zinc-700/80">
                 <div className="flex items-center gap-2">
@@ -2434,7 +3386,6 @@ export default function App() {
               <div className="p-5 sm:p-7 space-y-5">
                 {audio.currentTrack ? (
                   <>
-                    {/* Track Metadata LCD Banner */}
                     <div className="winamp-lcd rounded-2xl border border-zinc-800 p-4 flex flex-col sm:flex-row items-center gap-5">
                       <img
                         src={audio.currentTrack.artworkUrl}
@@ -2476,7 +3427,6 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* 90s / Early 2000s Winamp + MilkDrop Wavy Oscilloscope & Spectrum Visualizer */}
                     <WinampVisualizer
                       currentTrack={audio.currentTrack}
                       isPlaying={audio.isPlaying}
@@ -2488,7 +3438,6 @@ export default function App() {
                       carVolumeLeveler={audio.carVolumeLeveler}
                     />
 
-                    {/* Live Scrubber */}
                     <div className="space-y-1.5">
                       <input
                         type="range"
@@ -2507,7 +3456,6 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Primary Transport Controls */}
                     <div className="flex items-center justify-between gap-4">
                       <button
                         type="button"
@@ -2573,7 +3521,6 @@ export default function App() {
                       </button>
                     </div>
 
-                    {/* Volume Slider & Quick Stabilizer / EQ Strip */}
                     <div className="flex flex-wrap items-center justify-between gap-4 pt-4 border-t border-zinc-800/80">
                       <div className="flex flex-wrap items-center gap-2">
                         <button
@@ -2603,8 +3550,8 @@ export default function App() {
                             {!audio.carVolumeLeveler
                               ? 'OFF'
                               : audio.stabilizerStrength === 'aggressive'
-                              ? 'AGGRESSIVE (FLAC/MP3)'
-                              : 'STANDARD'}
+                                ? 'AGGRESSIVE (FLAC/MP3)'
+                                : 'STANDARD'}
                           </span>
                         </button>
 
@@ -2657,7 +3604,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Right 5 Columns: Up Next Queue + Crossfade Slider + Offline Queue Slider (2 to 12 Tracks) */}
+            {/* Right 5 Columns: Up Next Queue */}
             <aside className="lg:col-span-5 winamp-bezel rounded-3xl border border-zinc-700/80 overflow-hidden">
               <div className="winamp-titlebar px-5 py-3 flex flex-wrap items-center justify-between gap-2 border-b border-zinc-700/80">
                 <div>
@@ -2686,7 +3633,7 @@ export default function App() {
                       );
                     }}
                     data-testid="nowplaying-antirepeat-btn"
-                    title="Smart Anti-Repeat & Duplicate Song Guard: Never play duplicate downloads of the same song back-to-back"
+                    title="Smart Anti-Repeat & Duplicate Song Guard"
                     className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-mono font-bold transition-colors min-h-[32px] ${
                       audio.smartAntiRepeatEnabled
                         ? 'border-emerald-500/60 bg-emerald-500/15 text-[#00ff66]'
@@ -2720,9 +3667,7 @@ export default function App() {
               </div>
 
               <div className="p-5 space-y-4">
-                {/* Interactive Sliders for Seamless Crossfade (0-12s) & Offline Queue Preloader (2-12 Tracks) */}
                 <div className="winamp-lcd rounded-2xl border border-zinc-800 p-3.5 space-y-3">
-                  {/* Slider 1: Seamless Crossfade */}
                   <div className="space-y-1">
                     <div className="flex items-center justify-between text-xs font-mono">
                       <span className="text-zinc-300 inline-flex items-center gap-1.5">
@@ -2753,7 +3698,6 @@ export default function App() {
                     />
                   </div>
 
-                  {/* Slider 2: Offline Queue Lookahead Preloader (2 to 12 Tracks) */}
                   <div className="space-y-1 pt-2 border-t border-zinc-800/80">
                     <div className="flex items-center justify-between text-xs font-mono">
                       <span className="text-zinc-300 inline-flex items-center gap-1.5">
@@ -2790,7 +3734,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Queue List (Clean, zero "More Like This" clutter) */}
                 <div className="divide-y divide-zinc-800/60 max-h-[420px] overflow-y-auto pr-1">
                   {audio.queue.map((qTrack, idx) => {
                     const isCurrent = idx === audio.currentIndex;
@@ -2851,162 +3794,115 @@ export default function App() {
         )}
 
         {/* =====================================================================
-            TAB 3: SETTINGS & TOOLS
+            TAB 3: SETTINGS & TOOLS (CLEAN 4-SECTION LAYOUT WITH DEBUG & ERROR LOGS)
            ===================================================================== */}
         {activeTab === 'settings' && (
           <section aria-label="Settings and Tools" className="space-y-6">
-            {/* Settings Sub-Navigation Header */}
-            <div className="winamp-bezel rounded-2xl border border-zinc-700/80 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-              <div>
+            {/* Clean 4-Step Settings Header */}
+            <div className="winamp-bezel rounded-2xl border border-zinc-700/80 p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+              <div className="space-y-1">
                 <h1 className="text-lg font-bold text-white font-mono">
-                  Settings
+                  Settings &amp; Easy Setup Guide
                 </h1>
-                <p className="text-xs text-zinc-400">
-                  Manage your Jellyfin/Navidrome servers, FLAC/MP3 Stabilizer,
-                  Crossfade, Offline Queue Vault, and Spotify Importer.
+                <p className="text-xs sm:text-sm text-zinc-300 max-w-2xl">
+                  Everything is organized into 4 simple tabs below: connect your
+                  music server &amp; downloaders in{' '}
+                  <strong className="text-[#00ff66]">
+                    1. Server &amp; Connections
+                  </strong>
+                  , tune your car stereo sound in{' '}
+                  <strong className="text-[#00ff66]">
+                    2. Sound, Car Stereo &amp; Offline
+                  </strong>
+                  , customize colors &amp; CSS in{' '}
+                  <strong className="text-[#00ff66]">
+                    3. Themes &amp; Custom CSS
+                  </strong>
+                  , or inspect connection health &amp; errors in{' '}
+                  <strong className="text-[#00ff66]">
+                    4. Debug &amp; Error Logs
+                  </strong>
+                  .
                 </p>
               </div>
 
-              <div className="flex flex-wrap items-center gap-1.5">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
                   onClick={() => setIsOnboardingOpen(true)}
                   data-testid="settings-manage-providers-btn"
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-purple-600 hover:bg-purple-500 px-3.5 py-2 text-xs font-mono font-bold text-white shadow-sm shadow-purple-500/20 transition-colors min-h-[38px]"
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-purple-600 hover:bg-purple-500 px-3.5 py-2 text-xs font-mono font-bold text-white shadow-sm transition-colors min-h-[40px]"
                 >
                   <Server className="w-3.5 h-3.5" />
-                  <span>Manage Providers</span>
+                  <span>Quick Connect Wizard</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={() => setSettingsSubTab('sources')}
                   data-testid="settings-subtab-sources"
-                  className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-mono font-bold transition-colors min-h-[38px] ${
+                  className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-mono font-bold transition-colors min-h-[40px] ${
                     settingsSubTab === 'sources'
                       ? 'bg-[#00ff66] text-zinc-950'
                       : 'bg-zinc-950 text-zinc-300 hover:text-white border border-zinc-800'
                   }`}
                 >
                   <Server className="w-3.5 h-3.5" />
-                  <span>Sources Hub</span>
+                  <span>1. Server &amp; Connections</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={() => setSettingsSubTab('audiolab')}
                   data-testid="settings-subtab-audiolab"
-                  className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-mono font-bold transition-colors min-h-[38px] ${
+                  className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-mono font-bold transition-colors min-h-[40px] ${
                     settingsSubTab === 'audiolab'
                       ? 'bg-[#00ff66] text-zinc-950'
                       : 'bg-zinc-950 text-zinc-300 hover:text-white border border-zinc-800'
                   }`}
                 >
                   <Sliders className="w-3.5 h-3.5" />
-                  <span>Audio Lab, EQ &amp; Offline Vault</span>
+                  <span>2. Sound, Car Stereo &amp; Offline</span>
                 </button>
 
                 <button
                   type="button"
-                  onClick={() => setSettingsSubTab('spotify')}
-                  data-testid="settings-subtab-spotify"
-                  className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-mono font-bold transition-colors min-h-[38px] ${
-                    settingsSubTab === 'spotify'
+                  onClick={() => setSettingsSubTab('themes')}
+                  data-testid="settings-subtab-themes"
+                  className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-mono font-bold transition-colors min-h-[40px] ${
+                    settingsSubTab === 'themes'
                       ? 'bg-[#00ff66] text-zinc-950'
                       : 'bg-zinc-950 text-zinc-300 hover:text-white border border-zinc-800'
                   }`}
                 >
-                  <Sparkles className="w-3.5 h-3.5" />
-                  <span>Spotify Importer</span>
+                  <Palette className="w-3.5 h-3.5" />
+                  <span>3. Themes &amp; Custom CSS</span>
                 </button>
-              </div>
-            </div>
 
-            {/* Visual Theme & Classic Skin Selector (Dark & Light Skins with CSS Filter Overlays) */}
-            <div
-              data-testid="visual-theme-selector-section"
-              className="winamp-bezel rounded-2xl border border-zinc-700/80 overflow-hidden"
-            >
-              <div className="winamp-titlebar px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 border-b border-zinc-700/80">
-                <div className="flex items-center gap-2">
-                  <Palette className="w-4 h-4 text-[#00ff66] shrink-0" />
-                  <h2 className="text-xs font-mono font-bold uppercase tracking-wider text-white">
-                    VISUAL THEME // DARK &amp; LIGHT RETRO SKINS
-                  </h2>
-                </div>
-                <span className="text-[11px] font-mono text-[#00ff66]">
-                  Active Skin: {activeVisualSkin.name} ({activeVisualSkin.mode.toUpperCase()})
-                </span>
-              </div>
-
-              <div className="p-4 sm:p-5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                {VISUAL_THEMES.map((skin) => {
-                  const isSelected = audio.visualTheme === skin.id;
-                  return (
-                    <button
-                      key={skin.id}
-                      type="button"
-                      onClick={() => {
-                        audio.setVisualTheme(skin.id);
-                        setToastMessage(
-                          `🎨 Applied "${skin.name}" (${skin.mode === 'light' ? 'Light Skin' : 'Dark Skin'})`
-                        );
-                      }}
-                      data-testid={`visual-theme-option-${skin.id}`}
-                      className={`rounded-xl border p-3.5 text-left transition-all flex flex-col justify-between gap-2.5 ${
-                        isSelected
-                          ? 'border-[#00ff66] bg-emerald-500/15 ring-1 ring-[#00ff66]/50 shadow-md'
-                          : 'border-zinc-800 bg-zinc-950/80 hover:border-zinc-700'
+                <button
+                  type="button"
+                  onClick={() => setSettingsSubTab('debug')}
+                  data-testid="settings-subtab-debug"
+                  className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-mono font-bold transition-colors min-h-[40px] ${
+                    settingsSubTab === 'debug'
+                      ? 'bg-[#00ff66] text-zinc-950'
+                      : 'bg-zinc-950 text-zinc-300 hover:text-white border border-zinc-800'
+                  }`}
+                >
+                  <Bug className="w-3.5 h-3.5" />
+                  <span>4. Debug &amp; Error Logs</span>
+                  {debugErrorCount > 0 && (
+                    <span
+                      className={`rounded-full px-1.5 py-0.2 text-[10px] font-mono font-bold ${
+                        settingsSubTab === 'debug'
+                          ? 'bg-zinc-950 text-rose-400'
+                          : 'bg-rose-500/25 border border-rose-500/50 text-rose-300'
                       }`}
                     >
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-1.5">
-                            {skin.mode === 'light' ? (
-                              <Sun className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                            ) : (
-                              <Moon className="w-3.5 h-3.5 text-[#00ff66] shrink-0" />
-                            )}
-                            <span className="text-sm font-bold text-white truncate">
-                              {skin.name}
-                            </span>
-                          </div>
-                          <span className="inline-block mt-1 rounded bg-zinc-900 border border-zinc-700 px-1.5 py-0.5 text-[9px] font-mono font-bold text-zinc-300 uppercase">
-                            {skin.badge}
-                          </span>
-                        </div>
-
-                        {/* Swatch Preview Dots */}
-                        <div className="flex items-center gap-1 shrink-0">
-                          {skin.swatches.map((hex, i) => (
-                            <span
-                              key={`${skin.id}-swatch-${i}`}
-                              className="w-4 h-4 rounded-full border border-zinc-600 shadow-inner"
-                              style={{ backgroundColor: hex }}
-                            />
-                          ))}
-                        </div>
-                      </div>
-
-                      <p className="text-xs text-zinc-400 leading-relaxed">
-                        {skin.description}
-                      </p>
-
-                      <div className="pt-1.5 border-t border-zinc-800/80 flex items-center justify-between text-[10px] font-mono">
-                        <span className="text-zinc-500 truncate">
-                          Filter: {skin.cssFilter === 'none' ? 'Native Deck' : skin.cssFilter}
-                        </span>
-                        <span
-                          className={`font-bold shrink-0 ${
-                            isSelected ? 'text-[#00ff66]' : 'text-zinc-400'
-                          }`}
-                        >
-                          {isSelected ? '● ACTIVE' : 'Select'}
-                        </span>
-                      </div>
-                    </button>
-                  );
-                })}
+                      {debugErrorCount}
+                    </span>
+                  )}
+                </button>
               </div>
             </div>
 
@@ -3034,23 +3930,32 @@ export default function App() {
                     `💾 Saved configuration & keys to ${serverConfigPath}`
                   );
                 }}
+                onLockDeviceForLogin={handleLockDeviceForLogin}
               />
             )}
 
             {settingsSubTab === 'audiolab' && (
               <div className="space-y-6">
                 <div className="winamp-bezel rounded-2xl border border-zinc-700/80 p-4 flex flex-wrap items-center justify-between gap-4">
-                  <div className="flex flex-wrap items-center gap-4">
-                    <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 px-3.5 py-2 flex items-center">
-                      <SlidingToggle
-                        checked={offlineOnlyMode}
-                        onChange={setOfflineOnlyMode}
-                        label={`Offline Only Mode (${audio.cachedTrackIds.size} cached)`}
-                        ariaLabel="Toggle Offline Only Mode"
-                        size="sm"
-                        testId="settings-toggle-offline-mode"
-                      />
+                  <div className="space-y-0.5">
+                    <div className="text-xs font-mono font-bold text-[#00ff66] uppercase">
+                      Road-Trip &amp; Dead-Zone Mode
                     </div>
+                    <p className="text-xs text-zinc-300">
+                      Turn on Offline Only Mode when driving through areas with
+                      weak cell service so Brokeify only plays songs already
+                      stored on your device.
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 px-3.5 py-2 flex items-center">
+                    <SlidingToggle
+                      checked={offlineOnlyMode}
+                      onChange={setOfflineOnlyMode}
+                      label={`Offline Only Mode (${audio.cachedTrackIds.size} cached)`}
+                      ariaLabel="Toggle Offline Only Mode"
+                      size="sm"
+                      testId="settings-toggle-offline-mode"
+                    />
                   </div>
                 </div>
 
@@ -3086,49 +3991,34 @@ export default function App() {
               </div>
             )}
 
-            {settingsSubTab === 'spotify' && (
-              <SpotifyImporterView
-                catalog={allTracks}
-                onPlayTrack={(track) =>
-                  audio.playSpecificTrack(track, allTracks)
-                }
-                onSaveResolvedPlaylist={(pl) => {
-                  handleSaveResolvedPlaylist(pl);
-                  setActiveTab('library');
+            {settingsSubTab === 'themes' && (
+              <ThemesCustomCssView
+                visualTheme={audio.visualTheme}
+                onChangeVisualTheme={audio.setVisualTheme}
+                customTheme={customTheme}
+                onChangeCustomTheme={setCustomTheme}
+                onSaveThemeToServer={async (nextTheme) => {
+                  await saveConfigToServer(
+                    serverIntegrations,
+                    discoveryFilters,
+                    nextTheme
+                  );
                 }}
+                onShowToast={(msg) => setToastMessage(msg)}
               />
             )}
 
-            {/* Single Buy Me a Coffee Footer at the Bottom of the Settings Page */}
-            <footer className="winamp-bezel rounded-2xl border border-amber-500/30 p-5 sm:p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-              <div className="space-y-1">
-                <div className="text-sm font-bold text-white flex items-center gap-2">
-                  <Coffee className="w-4 h-4 text-amber-400 shrink-0" />
-                  <span>Enjoying Brokeify in your car or home lab?</span>
-                </div>
-                <p className="text-xs text-zinc-400">
-                  100% free, zero ads, zero paywalls, and zero subscriptions
-                  forever.
-                </p>
-              </div>
-
-              <button
-                type="button"
-                onClick={() => setIsBmcModalOpen(true)}
-                data-testid="footer-bmc-btn"
-                className="inline-flex items-center justify-center gap-2 rounded-full bg-[#f59e0b] hover:bg-amber-400 px-5 py-2.5 text-xs font-bold text-zinc-950 shadow-md shadow-amber-500/15 transition-colors whitespace-nowrap shrink-0 min-h-[40px]"
-              >
-                <Coffee className="w-4 h-4" />
-                <span>Buy Me a Coffee</span>
-              </button>
-            </footer>
+            {settingsSubTab === 'debug' && (
+              <DebugLogsView
+                onShowToast={(msg) => setToastMessage(msg)}
+              />
+            )}
           </section>
         )}
       </main>
 
-      {/* Persistent Winamp-Styled Bottom Player Bar + Mobile 3-Tab Bottom Navigation */}
+      {/* Persistent Bottom Player Bar + Mobile 4-Tab Navigation */}
       <div className="fixed bottom-0 inset-x-0 z-40 border-t border-zinc-700/80 winamp-titlebar backdrop-blur-lg">
-        {/* Thin Progress Line */}
         <div className="w-full h-0.5 bg-zinc-950">
           <div
             className="h-full bg-[#00ff66] transition-all duration-150"
@@ -3141,9 +4031,8 @@ export default function App() {
           />
         </div>
 
-        {/* Player Deck Row */}
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-1.5 sm:py-2.5 flex items-center justify-between gap-3">
-          {/* Current Track Info (Click to open Now Playing Drawer) */}
+        <div className="w-full max-w-[1920px] mx-auto px-3 sm:px-6 xl:px-10 py-1.5 sm:py-2.5 flex items-center justify-between gap-3">
+          {/* Current Track Info */}
           <button
             type="button"
             onClick={() => setIsDrawerOpen(true)}
@@ -3445,12 +4334,6 @@ export default function App() {
             ? audio.cachedTrackIds.has(audio.currentTrack.id)
             : false
         }
-      />
-
-      {/* Play Store Compliant "Support Indie Development ☕" Modal */}
-      <BuyMeACoffeeModal
-        isOpen={isBmcModalOpen}
-        onClose={() => setIsBmcModalOpen(false)}
       />
 
       {/* Brokeify First-Run Setup & Jellyfin Quick Connect Modal */}

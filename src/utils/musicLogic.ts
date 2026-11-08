@@ -1,5 +1,7 @@
 import type {
   BrokeifyCloudSettings,
+  CustomThemeConfig,
+  DiscoveryFilterConfig,
   EQPresetName,
   Playlist,
   ProviderConfig,
@@ -875,6 +877,35 @@ export function parseCloudSettingsResponse(
       },
       providers: Array.isArray(parsed.providers) ? parsed.providers : [],
       playlists: Array.isArray(parsed.playlists) ? parsed.playlists : [],
+      integrations:
+        parsed.integrations && typeof parsed.integrations === 'object'
+          ? parsed.integrations
+          : undefined,
+      customTheme:
+        parsed.customTheme && typeof parsed.customTheme === 'object'
+          ? parsed.customTheme
+          : undefined,
+      discoveryFilters:
+        parsed.discoveryFilters && typeof parsed.discoveryFilters === 'object'
+          ? parsed.discoveryFilters
+          : undefined,
+      picardConfig:
+        parsed.picardConfig && typeof parsed.picardConfig === 'object'
+          ? parsed.picardConfig
+          : undefined,
+      autopilotRules: Array.isArray(parsed.autopilotRules)
+        ? parsed.autopilotRules
+        : undefined,
+      customPlaylistNames:
+        parsed.customPlaylistNames &&
+        typeof parsed.customPlaylistNames === 'object'
+          ? parsed.customPlaylistNames
+          : undefined,
+      pinnedPlaylistId: parsed.pinnedPlaylistId ?? undefined,
+      playbackSession:
+        parsed.playbackSession && typeof parsed.playbackSession === 'object'
+          ? parsed.playbackSession
+          : undefined,
     };
   } catch {
     return null;
@@ -1324,4 +1355,340 @@ export function smartAntiRepeatShuffle(
   return shuffled;
 }
 
+export const DEFAULT_DISCOVERY_FILTERS: DiscoveryFilterConfig = {
+  excludeLive: true,
+  excludeRemix: false,
+  excludeAcoustic: false,
+  excludeInstrumental: true,
+  excludeSpedUpSlowed: true,
+  excludeCommentary: true,
+  customExcludedWords: [],
+  minDurationSec: 45,
+  maxDurationSec: 900,
+  customScriptEnabled: false,
+  customScriptCode: `// Return false to EXCLUDE a song, or true to KEEP it.
+// Available variables: title, artist, album, durationSec
+const lower = (title + ' ' + album).toLowerCase();
+if (lower.includes('karaoke') || lower.includes('tribute')) return false;
+if (durationSec > 0 && (durationSec < 45 || durationSec > 900)) return false;
+return true;`,
+};
 
+export interface DiscoveryFilterEvaluation {
+  excluded: boolean;
+  reason: string | null;
+}
+
+/**
+ * Evaluates a candidate track against Explo-style exclusion toggles, duration bounds,
+ * custom excluded words, and an optional user-defined custom JavaScript filter script.
+ */
+export function evaluateDiscoveryFilter(
+  track: {
+    title: string;
+    artist?: string;
+    album?: string;
+    durationSec?: number;
+  },
+  filters: DiscoveryFilterConfig = DEFAULT_DISCOVERY_FILTERS
+): DiscoveryFilterEvaluation {
+  const title = (track.title || '').trim();
+  const artist = (track.artist || '').trim();
+  const album = (track.album || '').trim();
+  const durationSec = Number(track.durationSec || 0);
+  const combined = `${title} ${album}`.toLowerCase();
+
+  if (
+    filters.excludeLive &&
+    /\b(live|live\s+at|live\s+from|in\s+concert|concert\s+version|live\s+session)\b/i.test(
+      combined
+    )
+  ) {
+    return { excluded: true, reason: 'Excluded: Live Version' };
+  }
+
+  if (
+    filters.excludeRemix &&
+    /\b(remix|re-mix|club\s+mix|extended\s+mix|vip\s+mix|bootleg|mashup|dub\s+mix|dj\s+mix)\b/i.test(
+      combined
+    )
+  ) {
+    return { excluded: true, reason: 'Excluded: Remix / Club Edit' };
+  }
+
+  if (
+    filters.excludeAcoustic &&
+    /\b(acoustic|unplugged|stripped|piano\s+version|guitar\s+version)\b/i.test(
+      combined
+    )
+  ) {
+    return { excluded: true, reason: 'Excluded: Acoustic / Stripped' };
+  }
+
+  if (
+    filters.excludeInstrumental &&
+    /\b(instrumental|karaoke|backing\s+track|tribute|8-bit|lullaby\s+version)\b/i.test(
+      combined
+    )
+  ) {
+    return { excluded: true, reason: 'Excluded: Instrumental / Karaoke' };
+  }
+
+  if (
+    filters.excludeSpedUpSlowed &&
+    /\b(sped\s+up|nightcore|slowed|reverb|chopped\s+and\s+screwed|8d\s+audio)\b/i.test(
+      combined
+    )
+  ) {
+    return { excluded: true, reason: 'Excluded: Sped Up / Slowed' };
+  }
+
+  if (
+    filters.excludeCommentary &&
+    /\b(commentary|track\s+by\s+track|interview|skit|voice\s+memo|spoken\s+word)\b/i.test(
+      combined
+    )
+  ) {
+    return { excluded: true, reason: 'Excluded: Commentary / Skit' };
+  }
+
+  if (Array.isArray(filters.customExcludedWords)) {
+    for (const rawWord of filters.customExcludedWords) {
+      const w = (rawWord || '').trim().toLowerCase();
+      if (w && (combined.includes(w) || artist.toLowerCase().includes(w))) {
+        return { excluded: true, reason: `Excluded Keyword: "${rawWord.trim()}"` };
+      }
+    }
+  }
+
+  if (durationSec > 0) {
+    if (filters.minDurationSec > 0 && durationSec < filters.minDurationSec) {
+      return {
+        excluded: true,
+        reason: `Excluded: Shorter than ${filters.minDurationSec}s (${durationSec}s)`,
+      };
+    }
+    if (filters.maxDurationSec > 0 && durationSec > filters.maxDurationSec) {
+      return {
+        excluded: true,
+        reason: `Excluded: Longer than ${filters.maxDurationSec}s (${durationSec}s)`,
+      };
+    }
+  }
+
+  if (filters.customScriptEnabled && filters.customScriptCode?.trim()) {
+    try {
+      const fn = new Function(
+        'title',
+        'artist',
+        'album',
+        'durationSec',
+        filters.customScriptCode
+      );
+      const keep = fn(title, artist, album, durationSec);
+      if (keep === false) {
+        return { excluded: true, reason: 'Excluded: Custom Filter Script' };
+      }
+    } catch {
+      // Ignore syntax error in user script during live typing
+    }
+  }
+
+  return { excluded: false, reason: null };
+}
+
+/**
+ * Detects whether a user string is a Spotify URL or URI (playlist, album, or track).
+ */
+export function extractSpotifyUrlInfo(
+  input: string
+): { type: 'playlist' | 'album' | 'track'; id: string; url: string } | null {
+  const clean = (input || '').trim();
+  if (!clean) return null;
+
+  // Match https://open.spotify.com/{playlist|album|track}/{id}
+  const webMatch = clean.match(
+    /open\.spotify\.com\/(?:intl-[a-z]+\/)?(playlist|album|track)\/([a-zA-Z0-9]+)/i
+  );
+  if (webMatch) {
+    const type = webMatch[1].toLowerCase() as 'playlist' | 'album' | 'track';
+    const id = webMatch[2];
+    return {
+      type,
+      id,
+      url: `https://open.spotify.com/${type}/${id}`,
+    };
+  }
+
+  // Match spotify:{playlist|album|track}:{id}
+  const uriMatch = clean.match(/spotify:(playlist|album|track):([a-zA-Z0-9]+)/i);
+  if (uriMatch) {
+    const type = uriMatch[1].toLowerCase() as 'playlist' | 'album' | 'track';
+    const id = uriMatch[2];
+    return {
+      type,
+      id,
+      url: `https://open.spotify.com/${type}/${id}`,
+    };
+  }
+
+  return null;
+}
+
+export const DEFAULT_CUSTOM_THEME: CustomThemeConfig = {
+  enabled: false,
+  customAppName: 'BROKEIFY',
+  customTagline: '',
+  primaryAccent: '#00ff66',
+  secondaryAccent: '#a855f7',
+  customCss: '',
+};
+
+export const CUSTOM_CSS_PRESETS: ReadonlyArray<{
+  id: string;
+  name: string;
+  description: string;
+  primaryAccent: string;
+  secondaryAccent: string;
+  css: string;
+}> = [
+  {
+    id: 'neon-synthwave',
+    name: 'Neon Synthwave Pink & Cyan',
+    description: 'Turns the stereo deck into a glowing Miami 1986 OutRun dashboard.',
+    primaryAccent: '#ff2a85',
+    secondaryAccent: '#00f0ff',
+    css: `/* Neon Synthwave Pink & Cyan Theme */
+.winamp-bezel {
+  border-color: rgba(255, 42, 133, 0.45) !important;
+  box-shadow: 0 0 24px rgba(255, 42, 133, 0.12) !important;
+}
+.winamp-titlebar {
+  background: linear-gradient(90deg, #190826 0%, #2d0b38 50%, #091d34 100%) !important;
+}`,
+  },
+  {
+    id: 'gold-obsidian',
+    name: 'Gold & Obsidian Hi-Fi Audiophile',
+    description: 'Warm brushed champagne gold accents over deep matte black.',
+    primaryAccent: '#f59e0b',
+    secondaryAccent: '#fbbf24',
+    css: `/* Gold & Obsidian Hi-Fi Theme */
+.winamp-bezel {
+  border-color: rgba(245, 158, 11, 0.4) !important;
+}
+.winamp-titlebar {
+  background: linear-gradient(90deg, #18130a 0%, #271e0c 100%) !important;
+}`,
+  },
+  {
+    id: 'oceanic-cobalt',
+    name: 'Oceanic Ice Blue Deck',
+    description: 'Crisp electric sky-blue LEDs and deep navy midnight panels.',
+    primaryAccent: '#38bdf8',
+    secondaryAccent: '#818cf8',
+    css: `/* Oceanic Ice Blue Deck */
+.winamp-bezel {
+  border-color: rgba(56, 189, 248, 0.4) !important;
+}
+.winamp-titlebar {
+  background: linear-gradient(90deg, #081426 0%, #0c2340 100%) !important;
+}`,
+  },
+  {
+    id: 'easy-reader-xl',
+    name: 'Easy-Read Boomer XL Mode',
+    description: 'Boosts font contrast, button borders, and spacing for effortless reading.',
+    primaryAccent: '#00ff66',
+    secondaryAccent: '#38bdf8',
+    css: `/* Easy-Read Boomer XL Mode */
+body {
+  letter-spacing: 0.015em;
+}
+button, input, select {
+  border-width: 1.5px !important;
+}`,
+  },
+];
+
+/**
+ * Compiles the user's Custom Color Overrides + Custom CSS into a single stylesheet string.
+ */
+export function compileUserCustomThemeCss(
+  theme?: CustomThemeConfig | null
+): string {
+  if (!theme || theme.enabled === false) return '';
+  const rules: string[] = [];
+  const primary = (theme.primaryAccent || '').trim();
+  const secondary = (theme.secondaryAccent || '').trim();
+
+  if (primary && primary.toLowerCase() !== '#00ff66') {
+    rules.push(`
+      :root { --brokeify-primary: ${primary}; }
+      .text-\\[\\#00ff66\\] { color: ${primary} !important; }
+      .bg-\\[\\#00ff66\\] { background-color: ${primary} !important; }
+      .border-\\[\\#00ff66\\] { border-color: ${primary} !important; }
+    `);
+  }
+
+  if (secondary && secondary.toLowerCase() !== '#a855f7') {
+    rules.push(`
+      :root { --brokeify-secondary: ${secondary}; }
+      .bg-\\[\\#a855f7\\], .bg-purple-600 { background-color: ${secondary} !important; }
+    `);
+  }
+
+  if (theme.customCss && theme.customCss.trim()) {
+    rules.push(theme.customCss.trim());
+  }
+
+  return rules.join('\n');
+}
+
+/**
+ * Formats a duration in seconds as M:SS (e.g. 215 -> "3:35").
+ */
+export function formatDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
+  const totalSec = Math.floor(seconds);
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
+
+export { createAlbumArtworkDataUri } from './artworkGenerator';
+
+/**
+ * Parses numeric parts of a version string like "0.0.0.1", "v0.0.0.2-beta", "0.1.0"
+ */
+export function parseVersionString(ver: string): number[] {
+  if (!ver) return [0, 0, 0, 0];
+  const cleaned = ver.trim().replace(/^v/i, '').split('-')[0];
+  return cleaned
+    .split('.')
+    .map((p) => {
+      const n = parseInt(p, 10);
+      return Number.isNaN(n) ? 0 : n;
+    });
+}
+
+/**
+ * Compares two version strings (supports 3 or 4 segments like 0.0.0.1 vs 0.0.0.2).
+ * Returns:
+ *   1 if a > b (a is newer)
+ *  -1 if a < b (b is newer)
+ *   0 if identical
+ */
+export function compareSemVerVersions(a: string, b: string): number {
+  const partsA = parseVersionString(a);
+  const partsB = parseVersionString(b);
+  const maxLen = Math.max(partsA.length, partsB.length);
+
+  for (let i = 0; i < maxLen; i++) {
+    const valA = partsA[i] ?? 0;
+    const valB = partsB[i] ?? 0;
+    if (valA > valB) return 1;
+    if (valA < valB) return -1;
+  }
+  return 0;
+}

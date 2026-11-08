@@ -1,11 +1,11 @@
 {
-  "name": "react-example",
+  "name": "brokeify",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.0.0.1-beta",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build",
+    "build": "npm run clean && vite build",
     "start": "node server.js",
     "preview": "vite preview",
     "clean": "rm -rf dist",

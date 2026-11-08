@@ -61,7 +61,14 @@ export interface Track {
   format?: string;
   isLiveStream?: boolean;
   synthRecipe?: SynthRecipe;
+  playCount?: number;
+  lastPlayedAt?: string;
+  dateAdded?: string;
+  fileSizeBytes?: number;
 }
+
+export type AutopilotSyncSchedule = 'off' | 'daily' | 'weekly' | 'monthly';
+export type AutopilotScheduleInterval = 'off' | 'daily' | 'weekly' | 'monthly';
 
 export interface Playlist {
   id: string;
@@ -72,6 +79,50 @@ export interface Playlist {
   trackIds: string[];
   createdAt: string;
   coverAccent: string;
+  linkedSpotifyUrl?: string;
+  autopilotSpotifyUrl?: string;
+  autopilotSchedule?: AutopilotSyncSchedule;
+  autopilotInterval?: AutopilotScheduleInterval;
+  autopilotAutoDownload?: boolean;
+  lastAutopilotSyncAt?: string;
+}
+
+export interface AutopilotPlaylistRule {
+  id: string;
+  playlistId: string;
+  playlistName: string;
+  sourceUrl?: string;
+  spotifyUrl: string;
+  schedule?: 'daily' | 'weekly' | 'monthly';
+  interval: AutopilotScheduleInterval;
+  autoDownloadMissing: boolean;
+  preferredDownloader?: DownloaderSourceMode;
+  organizeWithPicard?: boolean;
+  enabled: boolean;
+  lastSyncedAt: string | null;
+  lastAddedCount: number;
+  lastMissingQueuedCount: number;
+  statusMessage?: string;
+  lastRunMessage?: string;
+}
+
+export interface PicardOrganizerConfig {
+  enabled: boolean;
+  folderTemplate: string;
+  useAiMetadataCleanup: boolean;
+  useMusicBrainzPicard?: boolean;
+  targetMusicRoot?: string;
+  embedId3Tags?: boolean;
+}
+
+export interface TrackPlayStatRecord {
+  trackId: string;
+  title: string;
+  artist: string;
+  album: string;
+  playCount: number;
+  lastPlayedAt: string | null;
+  totalListenSeconds: number;
 }
 
 export type EQPresetName =
@@ -130,12 +181,36 @@ export interface BrokeifyAudioPreferences {
   smartAntiRepeatEnabled?: boolean;
 }
 
+export interface CrossDevicePlaybackSession {
+  updatedAt: string;
+  deviceId: string;
+  deviceName: string;
+  isPlaying: boolean;
+  trackId: string;
+  track: Track;
+  positionSec: number;
+  durationSec: number;
+  playlistId: string | null;
+  playlistName: string | null;
+  queueTrackIds: string[];
+  shuffleEnabled: boolean;
+  repeatMode: RepeatMode;
+}
+
 export interface BrokeifyCloudSettings {
   version: number;
   updatedAt: string;
   audioPrefs: BrokeifyAudioPreferences;
   providers: ProviderConfig[];
   playlists: Playlist[];
+  integrations?: Partial<BrokeifyServerIntegrations>;
+  customTheme?: CustomThemeConfig;
+  discoveryFilters?: DiscoveryFilterConfig;
+  picardConfig?: PicardOrganizerConfig;
+  autopilotRules?: AutopilotPlaylistRule[];
+  customPlaylistNames?: Record<string, string>;
+  pinnedPlaylistId?: string | null;
+  playbackSession?: CrossDevicePlaybackSession | null;
 }
 
 export interface CloudSyncStatus {
@@ -144,15 +219,56 @@ export interface CloudSyncStatus {
   message: string;
 }
 
+export type DownloaderSourceMode =
+  | 'auto'
+  | 'slskd'
+  | 'lidarr'
+  | 'youtube'
+  | 'archive';
+
+export interface DiscoveryFilterConfig {
+  excludeLive: boolean;
+  excludeRemix: boolean;
+  excludeAcoustic: boolean;
+  excludeInstrumental: boolean;
+  excludeSpedUpSlowed: boolean;
+  excludeCommentary: boolean;
+  customExcludedWords: string[];
+  minDurationSec: number;
+  maxDurationSec: number;
+  customScriptEnabled: boolean;
+  customScriptCode: string;
+}
+
+export interface CustomThemeConfig {
+  enabled: boolean;
+  customAppName: string;
+  customTagline: string;
+  primaryAccent: string;
+  secondaryAccent: string;
+  customCss: string;
+}
+
 export interface BrokeifyServerIntegrations {
   jellyfinUrl: string;
   jellyfinToken: string;
   jellyfinUserId: string;
   jellyfinUsername?: string;
+  requireDeviceLogin?: boolean;
   slskdUrl: string;
   slskdApiKey: string;
+  lidarrUrl?: string;
+  lidarrApiKey?: string;
+  lidarrRootFolderPath?: string;
+  lidarrQualityProfileId?: number;
+  lidarrMetadataProfileId?: number;
   listenbrainzUsername: string;
   listenbrainzToken: string;
+  preferredDownloader?: DownloaderSourceMode;
+  downloadDir?: string;
+  youtubeAudioFormat?: 'mp3' | 'flac' | 'm4a';
+  githubRepo?: string;
+  githubBranch?: string;
 }
 
 export interface BrokeifyServerConfig {
@@ -160,10 +276,16 @@ export interface BrokeifyServerConfig {
   updatedAt: string;
   integrations: BrokeifyServerIntegrations;
   audioPrefs: BrokeifyAudioPreferences;
+  discoveryFilters?: DiscoveryFilterConfig;
+  customTheme?: CustomThemeConfig;
+  picardConfig?: PicardOrganizerConfig;
+  autopilotRules?: AutopilotPlaylistRule[];
+  playStats?: Record<string, TrackPlayStatRecord>;
   providers: ProviderConfig[];
   playlists: Playlist[];
   customPlaylistNames?: Record<string, string>;
   pinnedPlaylistId?: string | null;
+  playbackSession?: CrossDevicePlaybackSession | null;
 }
 
 export interface ListenBrainzDiscoverTrack {
@@ -221,14 +343,24 @@ export interface MusicBrainzAlbumDetail {
 export interface SlskdGrabJob {
   id: string;
   type: 'album' | 'track' | 'playlist';
+  sourceEngine?: 'slskd' | 'lidarr' | 'youtube' | 'archive';
   label: string;
   artist: string;
   title: string;
   searchText: string;
-  status: 'searching' | 'queued' | 'downloading' | 'completed' | 'failed';
+  status:
+    | 'searching'
+    | 'queued'
+    | 'downloading'
+    | 'completed'
+    | 'failed'
+    | 'not_found'
+    | 'filtered';
   message: string;
   matchedPeer: string | null;
   matchedFormat: string | null;
+  organizedPath?: string | null;
+  streamUrl?: string;
   files: Array<{
     filename: string;
     size: number;
@@ -246,5 +378,65 @@ export interface SlskdReadyNotification {
   label: string;
   message: string;
   completedAt: string;
+}
+
+export type DebugLogLevel = 'error' | 'warn' | 'info' | 'success';
+
+export type DebugLogCategory =
+  | 'jellyfin'
+  | 'slskd'
+  | 'lidarr'
+  | 'listenbrainz'
+  | 'spotify'
+  | 'youtube'
+  | 'audio'
+  | 'playback-sync'
+  | 'autopilot'
+  | 'system'
+  | 'client';
+
+export interface BrokeifyDebugLogEntry {
+  id: string;
+  timestamp: string;
+  level: DebugLogLevel;
+  category: DebugLogCategory;
+  source: 'server' | 'client';
+  message: string;
+  details?: string;
+  endpoint?: string;
+  statusCode?: number;
+  hint?: string;
+}
+
+export interface HomelabDiagnosticCheck {
+  id: string;
+  name: string;
+  category: DebugLogCategory;
+  status: 'ok' | 'warn' | 'error';
+  latencyMs?: number;
+  summary: string;
+  details?: string;
+  hint?: string;
+}
+
+export interface BrokeifyVersionStatus {
+  localVersion: string;
+  localDisplayVersion: string;
+  localChannel: string;
+  localCommitSha: string | null;
+  localBuildTime: string | null;
+  remoteVersion: string | null;
+  remoteDisplayVersion: string | null;
+  remoteCommitSha: string | null;
+  remoteCommitMessage: string | null;
+  remoteCommitDate: string | null;
+  remoteCommitUrl: string | null;
+  repository: string;
+  branch: string;
+  updateAvailable: boolean;
+  statusSummary: string;
+  checkedAt: string;
+  changelog: string[];
+  error?: string;
 }
 

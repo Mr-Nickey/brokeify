@@ -1164,6 +1164,17 @@ export class MusicProviderManager {
           ? item.Genres.map((g: any) => String(g))
           : [];
 
+        const playCount = Number(item.UserData?.PlayCount || 0);
+        const lastPlayedAt = item.UserData?.LastPlayedDate
+          ? String(item.UserData.LastPlayedDate)
+          : undefined;
+        const dateAdded = item.DateCreated
+          ? String(item.DateCreated)
+          : undefined;
+        const fileSizeBytes = item.MediaSources?.[0]?.Size
+          ? Number(item.MediaSources[0].Size)
+          : undefined;
+
         return {
           id: `${config.type}-${id}`,
           title,
@@ -1193,6 +1204,10 @@ export class MusicProviderManager {
           normalizationGain: normGain,
           bitrateKbps: bitrate,
           format: container,
+          playCount,
+          lastPlayedAt,
+          dateAdded,
+          fileSizeBytes,
         };
       };
 

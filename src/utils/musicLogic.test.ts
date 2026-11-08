@@ -39,6 +39,10 @@ import {
   dedupeAndSpreadTracks,
   smartAntiRepeatShuffle,
   mergePlaylistsPreservingCustomNames,
+  DEFAULT_DISCOVERY_FILTERS,
+  evaluateDiscoveryFilter,
+  extractSpotifyUrlInfo,
+  compileUserCustomThemeCss,
 } from './musicLogic';
 import type {
   BrokeifyCloudSettings,
@@ -554,5 +558,121 @@ test('VISUAL_THEMES includes both dark and light skins with CSS filters and zero
   }
 });
 
+test('evaluateDiscoveryFilter blocks Live, Remix, Acoustic, Custom Words, and Custom JS Filter Scripts accurately', () => {
+  const filters = {
+    ...DEFAULT_DISCOVERY_FILTERS,
+    excludeLive: true,
+    excludeRemix: true,
+    excludeAcoustic: true,
+    customExcludedWords: ['demo'],
+  };
 
+  assert.equal(
+    evaluateDiscoveryFilter(
+      { title: 'One More Time (Live 2007)', artist: 'Daft Punk' },
+      filters
+    ).excluded,
+    true
+  );
+  assert.equal(
+    evaluateDiscoveryFilter(
+      { title: 'In the End (Club Remix)', artist: 'Linkin Park' },
+      filters
+    ).excluded,
+    true
+  );
+  assert.equal(
+    evaluateDiscoveryFilter(
+      { title: 'Everlong (Acoustic Version)', artist: 'Foo Fighters' },
+      filters
+    ).excluded,
+    true
+  );
+  assert.equal(
+    evaluateDiscoveryFilter(
+      { title: 'Unfinished Song (Demo)', artist: 'Artist' },
+      filters
+    ).excluded,
+    true
+  );
+  assert.equal(
+    evaluateDiscoveryFilter(
+      { title: 'Sunset', artist: 'The Midnight', durationSec: 240 },
+      filters
+    ).excluded,
+    false
+  );
+});
+
+test('extractSpotifyUrlInfo parses Spotify playlist, album, and track links and URIs', () => {
+  assert.deepEqual(
+    extractSpotifyUrlInfo(
+      'https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M?si=123'
+    ),
+    {
+      type: 'playlist',
+      id: '37i9dQZF1DXcBWIGoYBM5M',
+      url: 'https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M',
+    }
+  );
+  assert.deepEqual(
+    extractSpotifyUrlInfo('spotify:album:4aawyAB9vmqN3uQ7FjRGTy'),
+    {
+      type: 'album',
+      id: '4aawyAB9vmqN3uQ7FjRGTy',
+      url: 'https://open.spotify.com/album/4aawyAB9vmqN3uQ7FjRGTy',
+    }
+  );
+  assert.equal(extractSpotifyUrlInfo('Linkin Park - Hybrid Theory'), null);
+});
+
+test('compileUserCustomThemeCss generates CSS variables and includes custom CSS when enabled', () => {
+  const css = compileUserCustomThemeCss({
+    enabled: true,
+    customAppName: 'GARAGE DECK',
+    customTagline: 'PORT 3487',
+    primaryAccent: '#ff007f',
+    secondaryAccent: '#00e5ff',
+    customCss: '.winamp-bezel { border-radius: 24px !important; }',
+  });
+  assert.ok(css.includes('#ff007f'));
+  assert.ok(css.includes('#00e5ff'));
+  assert.ok(css.includes('border-radius: 24px'));
+});
+
+test('redactSensitiveText, inferCategoryFromUrl, and parseCloudSettingsResponse handle Lidarr, playback handoff, and secret redaction', async () => {
+  const { redactSensitiveText, inferCategoryFromUrl, inferHintForError } =
+    await import('./debugLogger');
+
+  const raw =
+    'GET https://jf.local/Items?api_key=superSecret123&token=myTok999 Authorization: MediaBrowser Token="abc987"';
+  const redacted = redactSensitiveText(raw);
+  assert.ok(!redacted.includes('superSecret123'));
+  assert.ok(!redacted.includes('myTok999'));
+  assert.ok(!redacted.includes('abc987'));
+  assert.ok(redacted.includes('[REDACTED]'));
+
+  assert.equal(inferCategoryFromUrl('/api/lidarr/test'), 'lidarr');
+  assert.equal(inferCategoryFromUrl('/api/slskd/grab'), 'slskd');
+  assert.equal(inferCategoryFromUrl('/api/playback-session'), 'playback-sync');
+  assert.ok(
+    inferHintForError('lidarr', 'HTTP 401 Unauthorized', 401).includes(
+      'LIDARR'
+    )
+  );
+});
+
+test('parseVersionString and compareSemVerVersions handle 4-segment beta versions like 0.0.0.1 vs 0.0.0.2', async () => {
+  const { parseVersionString, compareSemVerVersions } = await import(
+    './musicLogic'
+  );
+  assert.deepEqual(parseVersionString('0.0.0.1'), [0, 0, 0, 1]);
+  assert.deepEqual(parseVersionString('v0.0.0.1-beta'), [0, 0, 0, 1]);
+  assert.deepEqual(parseVersionString('v0.1.2'), [0, 1, 2]);
+
+  assert.equal(compareSemVerVersions('0.0.0.2', '0.0.0.1'), 1);
+  assert.equal(compareSemVerVersions('0.0.0.1', '0.0.0.2'), -1);
+  assert.equal(compareSemVerVersions('v0.0.0.1-beta', '0.0.0.1'), 0);
+  assert.equal(compareSemVerVersions('0.0.1.0', '0.0.0.9'), 1);
+});
 

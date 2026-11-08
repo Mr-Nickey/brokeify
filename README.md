@@ -5,11 +5,13 @@
 # Brokeify (Docker Full-Stack Edition)
 
 **Because $11.99 a month is highway robbery.**  
-*Self-hosted Jellyfin car stereo, ListenBrainz discovery engine & automated `slskd` downloader — powered by spite, hard drives, and a '99 retro deck.*
+*Self-hosted Jellyfin car stereo, Spotify & ListenBrainz autopilot discovery engine, `slskd` + YouTube Music downloader, Picard folder organizer & Maintainerr disk cleaner — powered by spite, hard drives, and a '99 retro deck.*
 
 [![Docker Ready](https://img.shields.io/badge/Docker%20%26%20Dockge-Port%203487-00ff66?style=for-the-badge&logo=docker&logoColor=black)](https://github.com/Mr-Nickey/brokeify)
-[![Self-Hosted Music](https://img.shields.io/badge/Self--Hosted-Jellyfin%20%2B%20slskd%20%2B%20ListenBrainz-38bdf8?style=for-the-badge&logo=jellyfin&logoColor=black)](https://github.com/Mr-Nickey/brokeify)
+[![Current Version](https://img.shields.io/badge/Version-v0.0.0.1--beta-purple?style=for-the-badge&logo=github)](https://github.com/Mr-Nickey/brokeify/releases)
+[![Self-Hosted Music](https://img.shields.io/badge/Self--Hosted-Jellyfin%20%2B%20Lidarr%20%2B%20slskd-38bdf8?style=for-the-badge&logo=jellyfin&logoColor=black)](https://github.com/Mr-Nickey/brokeify)
 [![Built with Google AI Studio](https://img.shields.io/badge/Built%20With-Google%20AI%20Studio-a855f7?style=for-the-badge&logo=google&logoColor=white)](https://aistudio.google.com/)
+[![Buy Me a Coffee Coming Soon](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Coming%20Soon%20%E2%98%95-f59e0b?style=for-the-badge)](https://github.com/Mr-Nickey/brokeify)
 
 <br />
 
@@ -21,19 +23,25 @@
 
 ## 🎧 What is Brokeify?
 
-**Brokeify** is a self-hosted, Docker-ready full-stack music player and automated discovery/downloader hub (React/Vite frontend + Express/Node.js backend in `server.js`) designed to run under a single domain (like `https://music.yourdomain.com`) and **completely replace Explo**.
+**Brokeify** is a self-hosted, Docker-ready full-stack music player, automated playlist autopilot, and library cleanup hub (React/Vite frontend + Express/Node.js backend in `server.js`) designed to run on **Port `3487`** under a single domain (like `https://music.yourdomain.com`) and **completely replace Explo & Maintainerr**.
 
 ### Why Brokeify Exists:
-- **Zero-Login Persistent Server Config (`/app/data/config.json`):** Configure your Jellyfin, `slskd`, and `ListenBrainz` credentials once. Every phone, tablet, or desktop that opens your Brokeify URL loads `/api/config` from `/app/data/config.json` automatically—plus a 1-click **`Download config.json Backup`** button in Settings.
-- **Replaces Explo (`Request / Discover` Tab):**
-  - Search any **Artist, Album, or Song** via MusicBrainz (`GET /api/musicbrainz/search` + exact album tracklists).
-  - Browse your **ListenBrainz** `"Created For You"` mixes (**Weekly Exploration**, **Weekly Jams**, **Daily Jams**) and see which songs are already in Jellyfin vs. missing.
-  - Click **"Grab Full Album"** or **"Download Missing Playlist Tracks"** — the Node.js backend searches your local `slskd` instance (`POST /api/v0/searches`), picks the best peer with `hasFreeUploadSlot: true` (preferring **FLAC** or **320kbps MP3**), queues the downloads, watches `GET /api/v0/transfers/downloads` in the background, and automatically triggers `POST /Library/Refresh` on Jellyfin the instant it finishes (`"Linkin Park - Hybrid Theory is ready to play!"`).
-- **Delete Duplicate Files Directly from Jellyfin's Hard Drive:**
-  - Noticed duplicate tracks downloaded over time? Click the **`🗑️` Delete** button on any song row to call `DELETE /api/jellyfin/items/:id` and permanently remove the duplicate from your server's disk, while **Smart Anti-Repeat** guarantees the same song never plays back-to-back.
-- **Built for Driving & Variable Mobile Data:**
-  - **Aggressive FLAC / MP3 Volume Stabilizer** (5-band EQ + heavy-duty compressor + LUFS preamp) so loud FLACs and quiet 240kbps MP3s play at the same volume.
-  - **Seamless Crossfade (0s–12s)** + **6s Proactive Stream Buffer** + **IndexedDB Offline Vault (2–12 Tracks)** + **Android Auto / Car Mode**.
+- **Zero-Login Persistent Server Config (`/app/data/config.json`):** Configure your Jellyfin, `slskd`, and `ListenBrainz` credentials once. Every phone, car stereo, laptop, Chromecast, or 72-inch TV that opens your Brokeify URL loads `/api/config` from `/app/data/config.json` automatically—plus a 1-click **`Download config.json Backup`** button in Settings.
+- **Better Than Explo (`Request / Discover` Tab):**
+  - **Unified Search & Spotify Link Dropper:** Search any **Artist, Album, or Song** via MusicBrainz, OR drop any **Spotify Playlist / Album Link** (`https://open.spotify.com/playlist/...`) right into the search bar.
+  - **Better-Than-Explo Playlist Status Matrix:** Inspect any Spotify or ListenBrainz playlist with live filter pills showing **🟢 On Jellyfin**, **🟡 Missing**, **🔵 Downloading**, **🔴 Can't Find**, and **⚪ Excluded by Filter**.
+  - **Multi-Source Downloader (`slskd` + `YouTube Music` + `Open Audio Archive`):** Automatically searches `slskd` for lossless FLAC / 320kbps MP3 first and falls back to **YouTube Music (`yt-dlp`)** when a song isn't found on Soulseek (or grab directly from YouTube Music with 1 click!).
+  - **Explo-Style Exclusion Filters & Custom JS Filter Scripts:** 1-click toggles to block `Live`, `Remix`, `Acoustic`, `Instrumental/Karaoke`, `Sped Up / Slowed`, and `Commentary` tracks, plus custom excluded keywords, min/max duration limits, and a live JavaScript filter script editor.
+  - **Autopilot Linked Playlists (Daily, Weekly, or Monthly Spotify Sync):** Link any playlist to a Spotify Playlist URL so Brokeify automatically checks Spotify on a **Daily, Weekly, or Monthly** schedule, downloads new songs, and populates your playlist on autopilot.
+  - **MusicBrainz Picard + AI Auto-Tagger & Folder Organizer:** Automatically cleans messy track titles, resolves canonical Album / Year / Track Number metadata via MusicBrainz, and organizes files into `{Artist}/{Album} ({Year})/{TrackNumber} - {Title}.{ext}` folders.
+- **Maintainerr-Style Library Statistics & Disk Space Janitor (`Library → Stats & Cleanup`):**
+  - See songs **On Repeat (Most Played)**, **Recently Played**, **Never Played (0 Plays)**, **Unplayed All Year (365+ Days)**, and **Duplicate Files Wasting Space**—and bulk-delete unwanted files from Jellyfin's hard drive (`POST /api/jellyfin/items/bulk-delete`).
+- **Playlist `⋯` Menu & Safe Multi-Select Playlist Deletion:**
+  - Click the **`⋯` (Three Dots)** menu on any playlist card to **Rename** (while always preserving `Real Name: <server name>`), **Link to Spotify Autopilot**, **Select Multiple Playlists**, or **Delete Playlists**—with a clear safety guarantee that deleting a playlist **only deletes the playlist container, never your songs or albums**.
+- **Dedicated Themes & Custom CSS Studio (`Settings → 3. Themes & Custom CSS`):**
+  - Choose from 6 built-in Dark & Daylight skins, pick your own custom app title & favorite button colors, or write your own **Custom CSS** saved directly to `config.json`.
+- **Universal Responsive Layout (Phone, Car Stereo, Laptop, 32" Garage TV & 72" 4K Home Theater):**
+  - Scales fluidly from Android Auto / CarPlay and mobile screens up to half-screen desktop windows and 72-inch 4K Smart TVs / Chromecasts without overlapping buttons or clipped toolbars.
 
 ---
 
@@ -49,11 +57,18 @@ This project was vibe-coded and iterated inside **Google AI Studio** to build a 
 
 ---
 
-## 🐳 How to Install with Dockge or Docker Compose (Conflict-Free Port `3487`)
+## ☕ Support / Buy Me a Coffee (Coming Soon!)
 
-Every homelab already has a dozen services fighting over ports `3000` (Grafana / Uptime Kuma / Gitea), `5001` (Dockge), `5030` (slskd), `8080` (qBittorrent / SABnzbd), `8096` (Jellyfin), and `4533` (Navidrome).
+Enjoying **Brokeify** in your car, garage, or homelab?  
+A **Buy Me a Coffee / GitHub Sponsors** link is **coming soon** right here on GitHub! In the meantime, starring ⭐ the repository or sharing feedback in Issues is hugely appreciated.
 
-To make sure Brokeify **never collides with anything in your homelab**, Brokeify maps host port **`3487`** → container port `3000` (`3487:3000`).
+---
+
+## 🐳 How to Install with Dockge or Docker Compose (100% Port `3487` — Zero Port `3000` Conflict!)
+
+Port `3000` is already used by **Open WebUI**, **Grafana**, **Uptime Kuma**, and **Gitea** on almost every homelab server.
+
+To make sure Brokeify **never touches Port `3000`**, Brokeify runs natively on **Port `3487`** both inside and outside the container (`3487:3487` with `PORT=3487`).
 
 ### Option A: 1-Minute Setup in Dockge (Connected Directly to GitHub)
 
@@ -68,12 +83,13 @@ services:
     container_name: brokeify
     restart: unless-stopped
     ports:
-      - "3487:3000"
+      - "3487:3487"
     environment:
       - NODE_ENV=production
-      - PORT=3000
+      - PORT=3487
     volumes:
       - ./data:/app/data
+      - ./downloads:/app/downloads
 ```
 
 4. Click **Deploy** (and whenever you push updates to GitHub, just click **Update / Rebuild** in Dockge!).
@@ -88,61 +104,14 @@ services:
 git clone https://github.com/Mr-Nickey/brokeify.git
 cd brokeify
 
-# 2. Build and start the container in the background
+# 2. Build and start the container in the background on port 3487
 docker compose up -d --build
 
 # 3. View logs
 docker compose logs -f brokeify
 ```
 
-Your persistent configuration and playlists will be stored safely in `./data/config.json` (mounted to `/app/data/config.json` inside the container).
-
----
-
-## ⚙️ First-Run Setup & How to Use Everything
-
-### 1. Connect Jellyfin (Quick Connect or Username/Password)
-1. Open Brokeify at `https://music.yourdomain.com` (or `http://<server-ip>:3487`).
-2. On the welcome modal (or **Settings ⚙️ → Manage Providers**), enter your Jellyfin URL (e.g. `https://jellyfin.yourdomain.com` or internal `http://jellyfin:8096`).
-3. Authenticate with **⚡ Quick Connect** or **Username & Password**.
-4. Brokeify immediately saves your token to `/app/data/config.json`. Any other device you open Brokeify on will automatically load your library and playlists without asking you to log in again!
-
-### 2. Configure `slskd` & `ListenBrainz` (Replaces Explo)
-1. Go to **Settings ⚙️ → Sources Hub**.
-2. At the top card (**`Persistent Server Storage (/app/data/config.json) & Explo Replacement Keys`**):
-   - **slskd Internal Docker / LAN URL:** e.g., `http://slskd:5030` or `http://192.168.1.50:5030`
-   - **slskd API Key (`X-API-Key`):** Paste your `slskd` API key from your `slskd.yml` config.
-   - **ListenBrainz Username:** Enter your ListenBrainz username (e.g., `your-listenbrainz-username`).
-   - **ListenBrainz User Token:** Paste your token from `https://listenbrainz.org/settings/` to enable automatic `playing_now` and `single` listen scrobbling.
-3. Click **`Save to config.json`** (and click **`Download config.json Backup`** anytime you want a local backup file).
-
-### 3. Grab Full Albums, Missing Weekly Exploration Tracks & Auto-Import to Jellyfin
-1. Click the **`Request / Discover`** tab in the top navigation bar.
-2. **Search MusicBrainz:** Search for any Album or Song, click **View Tracklist** to inspect the exact tracks, and click **`Grab Full Album`** or **`Grab Track`**.
-3. **ListenBrainz Weekly Exploration:** Switch to **`ListenBrainz Weekly Exploration`**, view your personalized mixes, and click **`Download Missing Playlist Tracks`**.
-4. **Automatic Jellyfin Import:** Brokeify's backend watches `GET /api/v0/transfers/downloads` in `slskd`. The moment the files finish downloading, Brokeify sends `POST /Library/Refresh` to Jellyfin and pops up a green banner:
-   > **`🎉 Linkin Park - Hybrid Theory is ready to play! [Sync & Play Now ▶]`**
-
-### 4. Rename Playlists (While Keeping the Real Server Name) & Delete Duplicates
-- **Rename Playlists:** On **Library → Playlists**, click the **Pencil (`✏️`)** icon on any playlist card to give it a custom display name. The card will always display both your custom name and `Real Name: <original server name>`.
-- **Delete Duplicate Songs from Disk:** On **Library → Songs**, click the **Trash (`🗑️`)** button on any duplicate track and confirm **`Delete File`** to call `DELETE /api/jellyfin/items/:id` and remove it from your Jellyfin server.
-
----
-
-## 🔌 Backend API Reference (`server.js`)
-
-| Endpoint | Method | Description |
-| :--- | :---: | :--- |
-| `/api/config` | `GET` / `POST` | Reads and writes persistent server configuration (`/app/data/config.json`). |
-| `/api/config/backup` | `GET` | Downloads a timestamped `config.json` backup file. |
-| `/api/jellyfin/items/:id` | `DELETE` | Calls Jellyfin `DELETE /Items/:id` to permanently delete duplicate tracks from disk. |
-| `/api/jellyfin/refresh` | `POST` | Triggers `POST /Library/Refresh` on your Jellyfin server. |
-| `/api/listenbrainz/discover` | `GET` | Fetches ListenBrainz `createdfor` playlists (`Weekly Exploration`, `Weekly Jams`) and cross-checks tracks against Jellyfin. |
-| `/api/listenbrainz/scrobble` | `POST` | Submits `playing_now` and `single` listens to ListenBrainz. |
-| `/api/musicbrainz/search` | `GET` | Searches MusicBrainz for albums (`release-group`) or songs (`recording`). |
-| `/api/musicbrainz/album/:id` | `GET` | Resolves the official release tracklist for a MusicBrainz album. |
-| `/api/slskd/grab` | `POST` | Searches `slskd`, selects the best peer with `hasFreeUploadSlot: true` (FLAC / 320kbps MP3), and queues downloads. |
-| `/api/slskd/status` | `GET` | Returns active `slskd` download progress and completed Jellyfin import notifications. |
+Your persistent configuration, custom CSS, exclusion filters, play statistics, and autopilot schedules are stored safely in `./data/config.json` (mounted to `/app/data/config.json` inside the container).
 
 ---
 
@@ -157,5 +126,5 @@ Your persistent configuration and playlists will be stored safely in `./data/con
 ---
 
 <div align="center">
-  <sub>Built with spite, hard drives, and Google AI Studio · Self-Hosted on Docker · Zero Subscriptions Forever</sub>
+  <sub>Built with spite, hard drives, and Google AI Studio · Self-Hosted on Docker Port 3487 · Zero Subscriptions Forever</sub>
 </div>
