@@ -676,3 +676,31 @@ test('parseVersionString and compareSemVerVersions handle 4-segment beta version
   assert.equal(compareSemVerVersions('0.0.1.0', '0.0.0.9'), 1);
 });
 
+test('brokeify-artwork-cache IndexedDB store constants and cache methods exist and function', async () => {
+  const {
+    ARTWORK_CACHE_DB_NAME,
+    ARTWORK_CACHE_STORE_NAME,
+    getCachedArtworkUrl,
+    preloadArtworkBatch,
+    clearArtworkCache,
+    getArtworkCacheStats,
+  } = await import('./artworkCache');
+
+  assert.equal(ARTWORK_CACHE_DB_NAME, 'brokeify-artwork-cache');
+  assert.equal(ARTWORK_CACHE_STORE_NAME, 'artwork');
+
+  // getCachedArtworkUrl returns null on empty
+  const emptyRes = await getCachedArtworkUrl('');
+  assert.equal(emptyRes, null);
+
+  // preloadArtworkBatch handles null/empty gracefully
+  await preloadArtworkBatch([undefined, '', 'data:image/svg+xml,...']);
+
+  // stats and clear work gracefully even if IndexedDB is not polyfilled in Node
+  const stats = await getArtworkCacheStats();
+  assert.ok(typeof stats.count === 'number');
+
+  const cleared = await clearArtworkCache();
+  assert.ok(typeof cleared === 'boolean');
+});
+

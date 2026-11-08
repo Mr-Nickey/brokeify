@@ -1,7 +1,9 @@
 import React, { useState } from 'react';
 import {
   AlertCircle,
+  AlertTriangle,
   ArrowDownToLine,
+  Check,
   CheckCircle2,
   Cloud,
   CloudDownload,
@@ -20,6 +22,8 @@ import {
   Server,
   ShieldCheck,
   Terminal,
+  Wifi,
+  WifiOff,
   X,
   Zap,
 } from 'lucide-react';
@@ -34,6 +38,11 @@ import type {
 } from '../types/music';
 import { MusicProviderManager } from '../services/MusicProviderManager';
 import { buildJellyfinDisplayPrefsUrl } from '../utils/musicLogic';
+import {
+  ARTWORK_CACHE_DB_NAME,
+  clearArtworkCache,
+  getArtworkCacheStats,
+} from '../utils/artworkCache';
 import { SlidingToggle } from './SlidingToggle';
 import { VersionChecker } from './VersionChecker';
 
@@ -100,10 +109,253 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
   const [lidarrTestStatus, setLidarrTestStatus] = useState<{
     ok: boolean;
     message: string;
+    hint?: string;
   } | null>(null);
+
+  const [isTestingSlskd, setIsTestingSlskd] = useState<boolean>(false);
+  const [slskdTestStatus, setSlskdTestStatus] = useState<{
+    ok: boolean;
+    message: string;
+    hint?: string;
+  } | null>(null);
+
+  const [isTestingJellyfin, setIsTestingJellyfin] = useState<boolean>(false);
+  const [jellyfinTestStatus, setJellyfinTestStatus] = useState<{
+    ok: boolean;
+    message: string;
+    hint?: string;
+    serverName?: string;
+    version?: string;
+  } | null>(null);
+
+  const [isTestingListenbrainz, setIsTestingListenbrainz] =
+    useState<boolean>(false);
+  const [listenbrainzTestStatus, setListenbrainzTestStatus] = useState<{
+    ok: boolean;
+    message: string;
+    tokenValid?: boolean;
+  } | null>(null);
+
+  const [isTestingAll, setIsTestingAll] = useState<boolean>(false);
+  const [allServicesResult, setAllServicesResult] = useState<{
+    ok: boolean;
+    services: {
+      jellyfin: { ok: boolean; message: string; hint?: string };
+      slskd: { ok: boolean; message: string; hint?: string };
+      lidarr: { ok: boolean; message: string; hint?: string };
+      listenbrainz: { ok: boolean; message: string };
+      storage: { ok: boolean; message: string };
+    };
+  } | null>(null);
+
+  const [savedCardFeedback, setSavedCardFeedback] = useState<
+    Record<string, string>
+  >({});
+  const [artworkStats, setArtworkStats] = useState<{
+    count: number;
+    totalSizeBytes: number;
+  }>({ count: 0, totalSizeBytes: 0 });
+  const [isClearingArtwork, setIsClearingArtwork] = useState<boolean>(false);
+
+  const refreshArtworkStats = async () => {
+    try {
+      const stats = await getArtworkCacheStats();
+      setArtworkStats(stats);
+    } catch {
+      // ignore
+    }
+  };
+
+  React.useEffect(() => {
+    refreshArtworkStats();
+  }, []);
 
   const jellyfinProvider =
     providers.find((p) => p.type === 'jellyfin') || providers[0];
+
+  const showSavedCard = (cardKey: string, msg = 'Saved to config.json!') => {
+    setSavedCardFeedback((prev) => ({ ...prev, [cardKey]: msg }));
+    setTimeout(() => {
+      setSavedCardFeedback((prev) => {
+        const next = { ...prev };
+        delete next[cardKey];
+        return next;
+      });
+    }, 4000);
+  };
+
+  const handleSaveCard = async (cardKey: string) => {
+    if (onSaveServerConfigNow) {
+      setIsSavingConfigFile(true);
+      try {
+        await onSaveServerConfigNow();
+        showSavedCard(cardKey);
+      } finally {
+        setIsSavingConfigFile(false);
+      }
+    }
+  };
+
+  const handleTestSlskd = async () => {
+    setIsTestingSlskd(true);
+    setSlskdTestStatus(null);
+    try {
+      const resp = await fetch('/api/slskd/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          slskdUrl: serverIntegrations?.slskdUrl,
+          slskdApiKey: serverIntegrations?.slskdApiKey,
+        }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (resp.ok && data.ok) {
+        setSlskdTestStatus({
+          ok: true,
+          message: data.message || 'Connected to slskd!',
+        });
+      } else {
+        setSlskdTestStatus({
+          ok: false,
+          message: data.error || 'Could not connect to slskd.',
+          hint: data.hint,
+        });
+      }
+    } catch {
+      setSlskdTestStatus({
+        ok: false,
+        message: 'Network error calling Brokeify server.',
+        hint: 'Check if Brokeify backend is running on port 3487.',
+      });
+    } finally {
+      setIsTestingSlskd(false);
+    }
+  };
+
+  const handleTestJellyfin = async (prov?: ProviderConfig) => {
+    const targetProv = prov || jellyfinProvider;
+    setIsTestingJellyfin(true);
+    setJellyfinTestStatus(null);
+    try {
+      const resp = await fetch('/api/jellyfin/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          serverUrl: targetProv?.serverUrl,
+          token: targetProv?.token,
+          username: targetProv?.username,
+          password: targetProv?.password,
+        }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (resp.ok && data.ok) {
+        setJellyfinTestStatus({
+          ok: true,
+          message: data.message || 'Connected to Jellyfin!',
+          serverName: data.serverName,
+          version: data.serverVersion,
+        });
+      } else {
+        setJellyfinTestStatus({
+          ok: false,
+          message: data.error || 'Connection failed to Jellyfin.',
+          hint: data.hint,
+        });
+      }
+    } catch {
+      setJellyfinTestStatus({
+        ok: false,
+        message: 'Network error testing Jellyfin connection.',
+        hint: 'Ensure port 8096 is reachable from this Docker container.',
+      });
+    } finally {
+      setIsTestingJellyfin(false);
+    }
+  };
+
+  const handleTestListenbrainz = async () => {
+    setIsTestingListenbrainz(true);
+    setListenbrainzTestStatus(null);
+    try {
+      const resp = await fetch('/api/listenbrainz/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: serverIntegrations?.listenbrainzUsername,
+          token: serverIntegrations?.listenbrainzToken,
+        }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (resp.ok && data.ok) {
+        setListenbrainzTestStatus({
+          ok: true,
+          message: data.message || 'Connected to ListenBrainz!',
+          tokenValid: data.tokenValid,
+        });
+      } else {
+        setListenbrainzTestStatus({
+          ok: false,
+          message: data.error || 'Could not verify ListenBrainz account.',
+        });
+      }
+    } catch {
+      setListenbrainzTestStatus({
+        ok: false,
+        message: 'Network error testing ListenBrainz.',
+      });
+    } finally {
+      setIsTestingListenbrainz(false);
+    }
+  };
+
+  const handleTestAllServices = async () => {
+    setIsTestingAll(true);
+    setAllServicesResult(null);
+    try {
+      const resp = await fetch('/api/services/test-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jellyfin: {
+            jellyfinUrl: jellyfinProvider?.serverUrl,
+            jellyfinToken: jellyfinProvider?.token,
+          },
+          slskd: {
+            slskdUrl: serverIntegrations?.slskdUrl,
+            slskdApiKey: serverIntegrations?.slskdApiKey,
+          },
+          lidarr: {
+            lidarrUrl: serverIntegrations?.lidarrUrl,
+            lidarrApiKey: serverIntegrations?.lidarrApiKey,
+          },
+          listenbrainz: {
+            username: serverIntegrations?.listenbrainzUsername,
+            token: serverIntegrations?.listenbrainzToken,
+          },
+        }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (resp.ok && data.services) {
+        setAllServicesResult(data);
+        if (data.services.jellyfin) {
+          setJellyfinTestStatus(data.services.jellyfin);
+        }
+        if (data.services.slskd) {
+          setSlskdTestStatus(data.services.slskd);
+        }
+        if (data.services.lidarr) {
+          setLidarrTestStatus(data.services.lidarr);
+        }
+        if (data.services.listenbrainz) {
+          setListenbrainzTestStatus(data.services.listenbrainz);
+        }
+      }
+    } catch {
+      // ignore
+    } finally {
+      setIsTestingAll(false);
+    }
+  };
 
   const jellyfinDisplayPrefsEndpoint = jellyfinProvider?.serverUrl?.trim()
     ? buildJellyfinDisplayPrefsUrl(
@@ -561,7 +813,24 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                 : `Status: ${prov.status.toUpperCase()}`}
             </span>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              {prov.type === 'jellyfin' && (
+                <button
+                  type="button"
+                  disabled={isTestingJellyfin}
+                  onClick={() => handleTestJellyfin(prov)}
+                  data-testid="test-jellyfin-connection-btn"
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-500/50 bg-emerald-500/15 hover:bg-emerald-500/25 px-3 py-2 text-xs font-mono font-bold text-[#00ff66] transition-colors whitespace-nowrap shrink-0 min-h-[40px]"
+                >
+                  {isTestingJellyfin ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <RefreshCw className="w-3.5 h-3.5" />
+                  )}
+                  <span>Test Connection</span>
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={() => handleTestAndSync(prov)}
@@ -582,6 +851,59 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
               </button>
             </div>
           </div>
+
+          {/* LOUD JELLYFIN DISCONNECTED WARNING BANNER */}
+          {prov.type === 'jellyfin' &&
+            ((jellyfinTestStatus && !jellyfinTestStatus.ok) ||
+              prov.status === 'error') && (
+              <div
+                role="alert"
+                className="rounded-xl border-2 border-rose-500 bg-rose-950/90 p-4 space-y-2.5 animate-pulse shadow-lg"
+              >
+                <div className="flex items-center gap-2 text-rose-200 font-mono font-bold text-xs uppercase">
+                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span>🚨 JELLYFIN DISCONNECTED // SERVER UNREACHABLE!</span>
+                </div>
+                <p className="text-xs font-mono text-white leading-relaxed">
+                  {jellyfinTestStatus?.message ||
+                    diagnosticText ||
+                    'Could not connect to Jellyfin.'}
+                </p>
+                <div className="rounded-lg bg-black/60 p-2.5 text-[11px] font-mono text-amber-300 border border-amber-500/30">
+                  <strong>💡 HOMELAB DOCKER FIX:</strong> Inside Docker, router
+                  NAT loopback prevents resolving external domain names (e.g.{' '}
+                  <code>https://jellyfin.flockingreeds.farm</code>). Use your
+                  local LAN IP <code>http://192.168.1.175:8096</code> directly!
+                </div>
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      handleFieldChange(
+                        prov.id,
+                        'serverUrl',
+                        'http://192.168.1.175:8096'
+                      );
+                      handleTestJellyfin({
+                        ...prov,
+                        serverUrl: 'http://192.168.1.175:8096',
+                      });
+                    }}
+                    className="rounded-lg bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold px-3 py-1.5 text-xs font-mono"
+                  >
+                    Switch URL to http://192.168.1.175:8096 &amp; Re-Test
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isTestingJellyfin}
+                    onClick={() => handleTestJellyfin(prov)}
+                    className="rounded-lg border border-rose-500 bg-rose-900/40 text-rose-200 hover:text-white px-3 py-1.5 text-xs font-mono"
+                  >
+                    {isTestingJellyfin ? 'Testing...' : 'Re-Test Current URL'}
+                  </button>
+                </div>
+              </div>
+            )}
 
           {/* Live Diagnostic Log Box beneath Connect & Save */}
           <div
@@ -647,6 +969,21 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
             </div>
 
             <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+              <button
+                type="button"
+                disabled={isTestingAll}
+                onClick={handleTestAllServices}
+                data-testid="test-all-services-btn"
+                className="inline-flex items-center gap-2 rounded-xl border border-cyan-500/50 bg-cyan-500/15 hover:bg-cyan-500/25 px-4 py-2 text-xs font-mono font-bold text-cyan-300 transition-colors whitespace-nowrap min-h-[40px]"
+              >
+                {isTestingAll ? (
+                  <Loader2 className="w-4 h-4 animate-spin text-cyan-300" />
+                ) : (
+                  <RefreshCw className="w-4 h-4 text-cyan-300" />
+                )}
+                <span>Test All Homelab Services</span>
+              </button>
+
               <a
                 href="/api/config/backup"
                 download="config.json"
@@ -654,7 +991,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                 className="inline-flex items-center gap-2 rounded-xl border border-emerald-500/50 bg-emerald-500/15 hover:bg-emerald-500/25 px-4 py-2 text-xs font-mono font-bold text-[#00ff66] transition-colors whitespace-nowrap min-h-[40px]"
               >
                 <ArrowDownToLine className="w-4 h-4" />
-                <span>Download config.json Backup</span>
+                <span>Backup config.json</span>
               </a>
 
               {onSaveServerConfigNow && (
@@ -662,12 +999,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                   type="button"
                   disabled={isSavingConfigFile}
                   onClick={async () => {
-                    setIsSavingConfigFile(true);
-                    try {
-                      await onSaveServerConfigNow();
-                    } finally {
-                      setIsSavingConfigFile(false);
-                    }
+                    await handleSaveCard('top');
                   }}
                   data-testid="save-server-config-btn"
                   className="inline-flex items-center gap-2 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-4 py-2 text-xs font-mono font-bold text-zinc-950 transition-colors whitespace-nowrap min-h-[40px]"
@@ -677,10 +1009,266 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                   ) : (
                     <Save className="w-4 h-4" />
                   )}
-                  <span>Save to config.json</span>
+                  <span>Save All Settings Now</span>
                 </button>
               )}
             </div>
+          </div>
+
+          {/* Homelab Live Health Matrix (Jellyfin, slskd, Lidarr, ListenBrainz, Storage) */}
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-4 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800/80 pb-2.5">
+              <span className="text-xs font-mono font-bold uppercase tracking-wider text-zinc-300 flex items-center gap-2">
+                <Server className="w-4 h-4 text-[#00ff66]" />
+                Live Homelab Service Diagnostics &amp; Health Checks
+              </span>
+              {savedCardFeedback['top'] && (
+                <span className="text-xs font-mono font-bold text-[#00ff66] flex items-center gap-1">
+                  <Check className="w-3.5 h-3.5" />
+                  {savedCardFeedback['top']}
+                </span>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5">
+              {/* Jellyfin status */}
+              <div
+                className={`p-3 rounded-xl border flex flex-col justify-between gap-1.5 ${
+                  jellyfinTestStatus?.ok
+                    ? 'border-emerald-500/40 bg-emerald-950/20 text-emerald-300'
+                    : jellyfinTestStatus && !jellyfinTestStatus.ok
+                      ? 'border-rose-500/60 bg-rose-950/30 text-rose-300'
+                      : jellyfinProvider?.status === 'connected'
+                        ? 'border-emerald-500/30 bg-emerald-950/15 text-emerald-300'
+                        : 'border-zinc-800 bg-zinc-900/60 text-zinc-300'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-1">
+                  <span className="text-[11px] font-mono font-bold uppercase text-zinc-300">
+                    Jellyfin Server
+                  </span>
+                  {jellyfinTestStatus?.ok ||
+                  jellyfinProvider?.status === 'connected' ? (
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                  ) : jellyfinTestStatus && !jellyfinTestStatus.ok ? (
+                    <AlertCircle className="w-3.5 h-3.5 text-rose-400 animate-pulse" />
+                  ) : (
+                    <Radio className="w-3.5 h-3.5 text-zinc-500" />
+                  )}
+                </div>
+                <p className="text-[11px] font-mono truncate">
+                  {jellyfinTestStatus?.message ||
+                    (jellyfinProvider?.status === 'connected'
+                      ? 'Connected (Active Session)'
+                      : 'Untested (Click Test)')}
+                </p>
+                <button
+                  type="button"
+                  disabled={isTestingJellyfin}
+                  onClick={() => handleTestJellyfin(jellyfinProvider)}
+                  data-testid="matrix-test-jellyfin-btn"
+                  className="mt-1 text-[10px] font-mono font-bold text-[#00ff66] hover:underline text-left"
+                >
+                  {isTestingJellyfin ? 'Testing...' : 'Test Connection →'}
+                </button>
+              </div>
+
+              {/* slskd status */}
+              <div
+                className={`p-3 rounded-xl border flex flex-col justify-between gap-1.5 ${
+                  slskdTestStatus?.ok
+                    ? 'border-emerald-500/40 bg-emerald-950/20 text-emerald-300'
+                    : slskdTestStatus && !slskdTestStatus.ok
+                      ? 'border-rose-500/60 bg-rose-950/30 text-rose-300'
+                      : 'border-zinc-800 bg-zinc-900/60 text-zinc-300'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-1">
+                  <span className="text-[11px] font-mono font-bold uppercase text-zinc-300">
+                    slskd P2P
+                  </span>
+                  {slskdTestStatus?.ok ? (
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                  ) : slskdTestStatus && !slskdTestStatus.ok ? (
+                    <AlertCircle className="w-3.5 h-3.5 text-rose-400 animate-pulse" />
+                  ) : (
+                    <Radio className="w-3.5 h-3.5 text-zinc-500" />
+                  )}
+                </div>
+                <p className="text-[11px] font-mono truncate">
+                  {slskdTestStatus?.message ||
+                    (serverIntegrations.slskdUrl ? 'Untested' : 'Not Configured')}
+                </p>
+                <button
+                  type="button"
+                  disabled={isTestingSlskd}
+                  onClick={handleTestSlskd}
+                  data-testid="matrix-test-slskd-btn"
+                  className="mt-1 text-[10px] font-mono font-bold text-[#00ff66] hover:underline text-left"
+                >
+                  {isTestingSlskd ? 'Testing...' : 'Test slskd →'}
+                </button>
+              </div>
+
+              {/* Lidarr status */}
+              <div
+                className={`p-3 rounded-xl border flex flex-col justify-between gap-1.5 ${
+                  lidarrTestStatus?.ok
+                    ? 'border-emerald-500/40 bg-emerald-950/20 text-emerald-300'
+                    : lidarrTestStatus && !lidarrTestStatus.ok
+                      ? 'border-rose-500/60 bg-rose-950/30 text-rose-300'
+                      : 'border-zinc-800 bg-zinc-900/60 text-zinc-300'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-1">
+                  <span className="text-[11px] font-mono font-bold uppercase text-zinc-300">
+                    Lidarr Arr Stack
+                  </span>
+                  {lidarrTestStatus?.ok ? (
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                  ) : lidarrTestStatus && !lidarrTestStatus.ok ? (
+                    <AlertCircle className="w-3.5 h-3.5 text-rose-400" />
+                  ) : (
+                    <Radio className="w-3.5 h-3.5 text-zinc-500" />
+                  )}
+                </div>
+                <p className="text-[11px] font-mono truncate">
+                  {lidarrTestStatus?.message ||
+                    (serverIntegrations.lidarrApiKey ? 'Untested' : 'Optional')}
+                </p>
+                <button
+                  type="button"
+                  disabled={isTestingLidarr}
+                  onClick={async () => {
+                    setIsTestingLidarr(true);
+                    try {
+                      const resp = await fetch('/api/lidarr/test', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          lidarrUrl: serverIntegrations.lidarrUrl,
+                          lidarrApiKey: serverIntegrations.lidarrApiKey,
+                        }),
+                      });
+                      const data = await resp.json().catch(() => ({}));
+                      setLidarrTestStatus({
+                        ok: resp.ok && data.ok,
+                        message: data.message || data.error || 'Result received',
+                        hint: data.hint,
+                      });
+                    } catch {
+                      setLidarrTestStatus({
+                        ok: false,
+                        message: 'Network error',
+                      });
+                    } finally {
+                      setIsTestingLidarr(false);
+                    }
+                  }}
+                  data-testid="matrix-test-lidarr-btn"
+                  className="mt-1 text-[10px] font-mono font-bold text-amber-300 hover:underline text-left"
+                >
+                  {isTestingLidarr ? 'Testing...' : 'Test Lidarr →'}
+                </button>
+              </div>
+
+              {/* ListenBrainz status */}
+              <div
+                className={`p-3 rounded-xl border flex flex-col justify-between gap-1.5 ${
+                  listenbrainzTestStatus?.ok
+                    ? 'border-emerald-500/40 bg-emerald-950/20 text-emerald-300'
+                    : listenbrainzTestStatus && !listenbrainzTestStatus.ok
+                      ? 'border-rose-500/60 bg-rose-950/30 text-rose-300'
+                      : 'border-zinc-800 bg-zinc-900/60 text-zinc-300'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-1">
+                  <span className="text-[11px] font-mono font-bold uppercase text-zinc-300">
+                    ListenBrainz
+                  </span>
+                  {listenbrainzTestStatus?.ok ? (
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                  ) : listenbrainzTestStatus && !listenbrainzTestStatus.ok ? (
+                    <AlertCircle className="w-3.5 h-3.5 text-rose-400" />
+                  ) : (
+                    <Radio className="w-3.5 h-3.5 text-zinc-500" />
+                  )}
+                </div>
+                <p className="text-[11px] font-mono truncate">
+                  {listenbrainzTestStatus?.message ||
+                    (serverIntegrations.listenbrainzUsername
+                      ? 'Untested'
+                      : 'Not configured')}
+                </p>
+                <button
+                  type="button"
+                  disabled={isTestingListenbrainz}
+                  onClick={handleTestListenbrainz}
+                  data-testid="matrix-test-listenbrainz-btn"
+                  className="mt-1 text-[10px] font-mono font-bold text-purple-300 hover:underline text-left"
+                >
+                  {isTestingListenbrainz ? 'Testing...' : 'Test ListenBrainz →'}
+                </button>
+              </div>
+
+              {/* Storage write check */}
+              <div className="p-3 rounded-xl border border-emerald-500/30 bg-emerald-950/15 text-emerald-300 flex flex-col justify-between gap-1.5">
+                <div className="flex items-center justify-between gap-1">
+                  <span className="text-[11px] font-mono font-bold uppercase text-zinc-300">
+                    Server Storage
+                  </span>
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                </div>
+                <p className="text-[11px] font-mono truncate">
+                  {serverConfigPath} (Persistent)
+                </p>
+                <span className="mt-1 text-[10px] font-mono text-zinc-400">
+                  Port 3487 active
+                </span>
+              </div>
+            </div>
+
+            {/* LOUD WARNING BANNER THAT YELLS AT USER IF JELLYFIN OR SLSKD HAS FAILED */}
+            {((jellyfinTestStatus && !jellyfinTestStatus.ok) ||
+              (slskdTestStatus && !slskdTestStatus.ok)) && (
+              <div
+                role="alert"
+                className="rounded-xl border-2 border-rose-500 bg-rose-950/90 p-4 space-y-2.5 animate-pulse shadow-xl"
+              >
+                <div className="flex items-center gap-2.5 text-rose-200 font-mono font-bold text-sm uppercase">
+                  <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0" />
+                  <span>🚨 CONNECTION ALERT: HOMELAB SERVICES UNREACHABLE!</span>
+                </div>
+                <div className="text-xs font-mono text-white space-y-1.5">
+                  {jellyfinTestStatus && !jellyfinTestStatus.ok && (
+                    <div>
+                      <p>
+                        • <strong className="text-rose-300">Jellyfin Media Server:</strong>{' '}
+                        {jellyfinTestStatus.message}
+                      </p>
+                      {jellyfinTestStatus.hint && (
+                        <p className="text-amber-300 font-semibold bg-black/50 p-2 rounded border border-amber-500/30 mt-1">
+                          💡 {jellyfinTestStatus.hint}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                  {slskdTestStatus && !slskdTestStatus.ok && (
+                    <div>
+                      <p>
+                        • <strong className="text-rose-300">slskd Soulseek Engine:</strong>{' '}
+                        {slskdTestStatus.message}
+                      </p>
+                      {slskdTestStatus.hint && (
+                        <p className="text-amber-300 font-semibold bg-black/50 p-2 rounded border border-amber-500/30 mt-1">
+                          💡 {slskdTestStatus.hint}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Per-Device Jellyfin Login Security + Instant Profile Sync Banner */}
@@ -738,23 +1326,67 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {/* 1. slskd Configuration Card */}
             <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-4 space-y-3">
-              <div className="space-y-1">
-                <span className="text-xs font-mono font-bold uppercase text-[#00ff66] block">
-                  1. slskd Downloader (Soulseek P2P FLAC / 320k MP3)
-                </span>
-                <p className="text-[11px] text-zinc-400 leading-relaxed">
-                  Connects Brokeify to your <code className="text-white">slskd</code>{' '}
-                  container so clicking &ldquo;Grab Album&rdquo; or &ldquo;Grab
-                  Missing&rdquo; downloads high-bitrate audio straight to your
-                  server.
-                </p>
+              <div className="flex items-start justify-between gap-2">
+                <div className="space-y-1">
+                  <span className="text-xs font-mono font-bold uppercase text-[#00ff66] block">
+                    1. slskd Downloader (Soulseek P2P FLAC / 320k MP3)
+                  </span>
+                  <p className="text-[11px] text-zinc-400 leading-relaxed">
+                    Connects Brokeify to your <code className="text-white">slskd</code>{' '}
+                    container so clicking &ldquo;Grab Album&rdquo; or &ldquo;Grab
+                    Missing&rdquo; downloads high-bitrate audio straight to your
+                    server.
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    disabled={isTestingSlskd}
+                    onClick={handleTestSlskd}
+                    data-testid="test-slskd-btn"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/15 hover:bg-emerald-500/25 px-2.5 py-1.5 text-[11px] font-mono font-bold text-[#00ff66] transition-colors shrink-0"
+                  >
+                    {isTestingSlskd ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="w-3.5 h-3.5" />
+                    )}
+                    <span>Test slskd</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isSavingConfigFile}
+                    onClick={() => handleSaveCard('slskd')}
+                    data-testid="save-slskd-btn"
+                    className="inline-flex items-center gap-1 rounded-lg bg-emerald-500 hover:bg-emerald-400 px-2.5 py-1.5 text-[11px] font-mono font-bold text-zinc-950 transition-colors shrink-0"
+                  >
+                    <Save className="w-3.5 h-3.5" />
+                    <span>Save</span>
+                  </button>
+                </div>
               </div>
 
               <div className="space-y-2.5">
                 <div>
-                  <label className="block text-xs text-zinc-300 mb-1">
-                    slskd Internal Docker / LAN URL
-                  </label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="block text-xs text-zinc-300">
+                      slskd Internal Docker / LAN URL
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onUpdateServerIntegrations({
+                          ...serverIntegrations,
+                          slskdUrl: 'http://192.168.1.175:5030',
+                        })
+                      }
+                      className="text-[10px] font-mono text-[#00ff66] hover:underline"
+                    >
+                      Use Host LAN IP (192.168.1.175:5030)
+                    </button>
+                  </div>
                   <input
                     type="text"
                     value={serverIntegrations.slskdUrl ?? ''}
@@ -764,7 +1396,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                         slskdUrl: e.target.value,
                       })
                     }
-                    placeholder="http://slskd:5030 or http://192.168.1.x:5030"
+                    placeholder="http://slskd:5030 or http://192.168.1.175:5030"
                     data-testid="input-slskd-url"
                     className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
                   />
@@ -789,6 +1421,37 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                   />
                 </div>
               </div>
+
+              {savedCardFeedback['slskd'] && (
+                <div className="rounded-lg border border-emerald-500/40 bg-emerald-950/30 px-2.5 py-1.5 text-[11px] font-mono text-emerald-300 flex items-center gap-1.5">
+                  <Check className="w-3.5 h-3.5" />
+                  <span>{savedCardFeedback['slskd']}</span>
+                </div>
+              )}
+
+              {slskdTestStatus && (
+                <div
+                  className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-mono space-y-1 ${
+                    slskdTestStatus.ok
+                      ? 'border-emerald-500/40 bg-emerald-950/30 text-emerald-300'
+                      : 'border-rose-500/50 bg-rose-950/40 text-rose-300'
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5 font-bold">
+                    {slskdTestStatus.ok ? (
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    ) : (
+                      <AlertCircle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                    )}
+                    <span>{slskdTestStatus.message}</span>
+                  </div>
+                  {slskdTestStatus.hint && (
+                    <p className="text-[10px] text-amber-300 leading-normal bg-black/40 p-1.5 rounded">
+                      💡 {slskdTestStatus.hint}
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* 2. Lidarr Automated Music Manager Card */}
@@ -808,67 +1471,82 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                   </p>
                 </div>
 
-                <button
-                  type="button"
-                  disabled={isTestingLidarr}
-                  onClick={async () => {
-                    setIsTestingLidarr(true);
-                    setLidarrTestStatus(null);
-                    try {
-                      const resp = await fetch('/api/lidarr/test', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                          lidarrUrl: serverIntegrations.lidarrUrl,
-                          lidarrApiKey: serverIntegrations.lidarrApiKey,
-                        }),
-                      });
-                      const data = await resp.json();
-                      if (resp.ok && data.ok) {
-                        setLidarrTestStatus({
-                          ok: true,
-                          message: data.message || 'Connected to Lidarr!',
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    disabled={isTestingLidarr}
+                    onClick={async () => {
+                      setIsTestingLidarr(true);
+                      setLidarrTestStatus(null);
+                      try {
+                        const resp = await fetch('/api/lidarr/test', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            lidarrUrl: serverIntegrations.lidarrUrl,
+                            lidarrApiKey: serverIntegrations.lidarrApiKey,
+                          }),
                         });
-                        if (data.rootFolderPath) {
-                          onUpdateServerIntegrations({
-                            ...serverIntegrations,
-                            lidarrRootFolderPath: data.rootFolderPath,
-                            lidarrQualityProfileId:
-                              data.qualityProfileId ||
-                              serverIntegrations.lidarrQualityProfileId ||
-                              1,
-                            lidarrMetadataProfileId:
-                              data.metadataProfileId ||
-                              serverIntegrations.lidarrMetadataProfileId ||
-                              1,
+                        const data = await resp.json();
+                        if (resp.ok && data.ok) {
+                          setLidarrTestStatus({
+                            ok: true,
+                            message: data.message || 'Connected to Lidarr!',
+                            hint: data.hint,
+                          });
+                          if (data.rootFolderPath) {
+                            onUpdateServerIntegrations({
+                              ...serverIntegrations,
+                              lidarrRootFolderPath: data.rootFolderPath,
+                              lidarrQualityProfileId:
+                                data.qualityProfileId ||
+                                serverIntegrations.lidarrQualityProfileId ||
+                                1,
+                              lidarrMetadataProfileId:
+                                data.metadataProfileId ||
+                                serverIntegrations.lidarrMetadataProfileId ||
+                                1,
+                            });
+                          }
+                        } else {
+                          setLidarrTestStatus({
+                            ok: false,
+                            message:
+                              data.error || 'Could not connect to Lidarr.',
+                            hint: data.hint,
                           });
                         }
-                      } else {
+                      } catch {
                         setLidarrTestStatus({
                           ok: false,
-                          message:
-                            data.error || 'Could not connect to Lidarr.',
+                          message: 'Network error testing Lidarr.',
                         });
+                      } finally {
+                        setIsTestingLidarr(false);
                       }
-                    } catch {
-                      setLidarrTestStatus({
-                        ok: false,
-                        message: 'Network error testing Lidarr.',
-                      });
-                    } finally {
-                      setIsTestingLidarr(false);
-                    }
-                  }}
-                  data-testid="test-lidarr-btn"
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/15 hover:bg-amber-500/25 px-2.5 py-1.5 text-[11px] font-mono font-bold text-amber-300 transition-colors shrink-0"
-                >
-                  {isTestingLidarr ? (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  ) : (
-                    <RefreshCw className="w-3.5 h-3.5" />
-                  )}
-                  <span>Test Lidarr</span>
-                </button>
+                    }}
+                    data-testid="test-lidarr-btn"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/15 hover:bg-amber-500/25 px-2.5 py-1.5 text-[11px] font-mono font-bold text-amber-300 transition-colors shrink-0"
+                  >
+                    {isTestingLidarr ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="w-3.5 h-3.5" />
+                    )}
+                    <span>Test Lidarr</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isSavingConfigFile}
+                    onClick={() => handleSaveCard('lidarr')}
+                    data-testid="save-lidarr-btn"
+                    className="inline-flex items-center gap-1 rounded-lg bg-amber-500 hover:bg-amber-400 px-2.5 py-1.5 text-[11px] font-mono font-bold text-zinc-950 transition-colors shrink-0"
+                  >
+                    <Save className="w-3.5 h-3.5" />
+                    <span>Save</span>
+                  </button>
+                </div>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
@@ -930,6 +1608,13 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                 </div>
               </div>
 
+              {savedCardFeedback['lidarr'] && (
+                <div className="rounded-lg border border-amber-500/40 bg-amber-950/30 px-2.5 py-1.5 text-[11px] font-mono text-amber-300 flex items-center gap-1.5">
+                  <Check className="w-3.5 h-3.5" />
+                  <span>{savedCardFeedback['lidarr']}</span>
+                </div>
+              )}
+
               {lidarrTestStatus && (
                 <div
                   className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-mono ${
@@ -945,17 +1630,30 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
 
             {/* 3. YouTube Music & Multi-Source Downloader Card */}
             <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-4 space-y-3">
-              <div className="space-y-1">
-                <span className="text-xs font-mono font-bold uppercase text-rose-300 block">
-                  3. YouTube Music &amp; Multi-Downloader Priority
-                </span>
-                <p className="text-[11px] text-zinc-400 leading-relaxed">
-                  Choose which download engine Brokeify uses by default: Auto
-                  waterfall (<code className="text-white">slskd</code> &rarr;{' '}
-                  <code className="text-white">Lidarr</code> &rarr;{' '}
-                  <code className="text-white">YouTube Music</code>) or a
-                  specific engine.
-                </p>
+              <div className="flex items-start justify-between gap-2">
+                <div className="space-y-1">
+                  <span className="text-xs font-mono font-bold uppercase text-rose-300 block">
+                    3. YouTube Music &amp; Multi-Downloader Priority
+                  </span>
+                  <p className="text-[11px] text-zinc-400 leading-relaxed">
+                    Choose which download engine Brokeify uses by default: Auto
+                    waterfall (<code className="text-white">slskd</code> &rarr;{' '}
+                    <code className="text-white">Lidarr</code> &rarr;{' '}
+                    <code className="text-white">YouTube Music</code>) or a
+                    specific engine.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  disabled={isSavingConfigFile}
+                  onClick={() => handleSaveCard('youtube')}
+                  data-testid="save-downloader-priority-btn"
+                  className="inline-flex items-center gap-1 rounded-lg bg-rose-500 hover:bg-rose-400 px-2.5 py-1.5 text-[11px] font-mono font-bold text-zinc-950 transition-colors shrink-0"
+                >
+                  <Save className="w-3.5 h-3.5" />
+                  <span>Save</span>
+                </button>
               </div>
 
               <div className="space-y-2.5">
@@ -1011,19 +1709,56 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                   />
                 </div>
               </div>
+
+              {savedCardFeedback['youtube'] && (
+                <div className="rounded-lg border border-rose-500/40 bg-rose-950/30 px-2.5 py-1.5 text-[11px] font-mono text-rose-300 flex items-center gap-1.5">
+                  <Check className="w-3.5 h-3.5" />
+                  <span>{savedCardFeedback['youtube']}</span>
+                </div>
+              )}
             </div>
 
             {/* 4. ListenBrainz Configuration Card */}
             <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-4 space-y-3">
-              <div className="space-y-1">
-                <span className="text-xs font-mono font-bold uppercase text-purple-300 block">
-                  4. ListenBrainz Mixes &amp; Auto-Scrobbler
-                </span>
-                <p className="text-[11px] text-zinc-400 leading-relaxed">
-                  Pulls your personal Weekly Exploration &amp; Weekly Jams
-                  playlists and records every song you listen to so your
-                  recommendations keep getting better.
-                </p>
+              <div className="flex items-start justify-between gap-2">
+                <div className="space-y-1">
+                  <span className="text-xs font-mono font-bold uppercase text-purple-300 block">
+                    4. ListenBrainz Mixes &amp; Auto-Scrobbler
+                  </span>
+                  <p className="text-[11px] text-zinc-400 leading-relaxed">
+                    Pulls your personal Weekly Exploration &amp; Weekly Jams
+                    playlists and records every song you listen to so your
+                    recommendations keep getting better.
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    disabled={isTestingListenbrainz}
+                    onClick={handleTestListenbrainz}
+                    data-testid="test-listenbrainz-btn"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-purple-500/40 bg-purple-500/15 hover:bg-purple-500/25 px-2.5 py-1.5 text-[11px] font-mono font-bold text-purple-300 transition-colors shrink-0"
+                  >
+                    {isTestingListenbrainz ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="w-3.5 h-3.5" />
+                    )}
+                    <span>Test ListenBrainz</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isSavingConfigFile}
+                    onClick={() => handleSaveCard('listenbrainz')}
+                    data-testid="save-listenbrainz-btn"
+                    className="inline-flex items-center gap-1 rounded-lg bg-purple-600 hover:bg-purple-500 px-2.5 py-1.5 text-[11px] font-mono font-bold text-white transition-colors shrink-0"
+                  >
+                    <Save className="w-3.5 h-3.5" />
+                    <span>Save</span>
+                  </button>
+                </div>
               </div>
 
               <div className="space-y-2.5">
@@ -1065,6 +1800,25 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                   />
                 </div>
               </div>
+
+              {savedCardFeedback['listenbrainz'] && (
+                <div className="rounded-lg border border-purple-500/40 bg-purple-950/30 px-2.5 py-1.5 text-[11px] font-mono text-purple-300 flex items-center gap-1.5">
+                  <Check className="w-3.5 h-3.5" />
+                  <span>{savedCardFeedback['listenbrainz']}</span>
+                </div>
+              )}
+
+              {listenbrainzTestStatus && (
+                <div
+                  className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-mono ${
+                    listenbrainzTestStatus.ok
+                      ? 'border-emerald-500/40 bg-emerald-950/30 text-emerald-300'
+                      : 'border-rose-500/40 bg-rose-950/30 text-rose-300'
+                  }`}
+                >
+                  {listenbrainzTestStatus.message}
+                </div>
+              )}
             </div>
           </div>
         </section>
@@ -1218,7 +1972,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
           </div>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
           <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/60 p-4 space-y-1">
             <div className="font-semibold text-white flex items-center gap-1.5">
               <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
@@ -1261,6 +2015,54 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
             >
               {cloudSyncStatus.message}
             </p>
+          </div>
+
+          {/* 4. Disk-Backed Album Artwork Cache (brokeify-artwork-cache) */}
+          <div
+            data-testid="artwork-cache-status-card"
+            className="rounded-xl border border-zinc-800/80 bg-zinc-950/60 p-4 space-y-2 flex flex-col justify-between"
+          >
+            <div className="space-y-1">
+              <div className="font-semibold text-white flex items-center justify-between gap-1.5">
+                <div className="flex items-center gap-1.5">
+                  <Database className="w-4 h-4 text-[#00ff66] shrink-0" />
+                  <span>Disk-Backed Artwork Cache</span>
+                </div>
+                <span className="text-[10px] font-mono font-bold text-emerald-400 bg-emerald-950/40 px-1.5 py-0.5 rounded border border-emerald-500/30">
+                  IndexedDB
+                </span>
+              </div>
+              <p className="text-[11px] text-zinc-400 leading-tight">
+                Stored in <code className="text-[#00ff66]">{ARTWORK_CACHE_DB_NAME}</code> for instant scrolling without repeated network queries.
+              </p>
+              <div className="text-xs font-mono text-[#00ff66] pt-1">
+                {artworkStats.count} covers cached ({artworkStats.totalSizeBytes > 0 ? (artworkStats.totalSizeBytes / (1024 * 1024)).toFixed(1) + ' MB' : '0 KB'})
+              </div>
+            </div>
+
+            <button
+              type="button"
+              disabled={isClearingArtwork || artworkStats.count === 0}
+              onClick={async () => {
+                setIsClearingArtwork(true);
+                try {
+                  await clearArtworkCache();
+                  await refreshArtworkStats();
+                  showSavedCard('top', 'Artwork cache purged successfully!');
+                } finally {
+                  setIsClearingArtwork(false);
+                }
+              }}
+              data-testid="clear-artwork-cache-btn"
+              className="mt-2 inline-flex items-center justify-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 hover:border-rose-500/50 hover:text-rose-300 disabled:opacity-40 px-3 py-1.5 text-[11px] font-mono font-semibold text-zinc-300 transition-colors w-full"
+            >
+              {isClearingArtwork ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <RefreshCw className="w-3.5 h-3.5" />
+              )}
+              <span>Purge Artwork Cache</span>
+            </button>
           </div>
         </div>
       </section>

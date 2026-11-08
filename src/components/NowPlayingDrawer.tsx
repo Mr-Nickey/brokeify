@@ -26,6 +26,7 @@ import type {
   Track,
 } from '../types/music';
 import { createAlbumArtworkDataUri } from '../utils/artworkGenerator';
+import { CachedArtworkImage } from '../utils/artworkCache';
 import { WinampVisualizer } from './WinampVisualizer';
 
 interface NowPlayingDrawerProps {
@@ -173,19 +174,12 @@ export const NowPlayingDrawer: React.FC<NowPlayingDrawerProps> = ({
           {/* Left: Artwork, 90s/2000s Winamp Visualizer, Transport */}
           <div className="lg:col-span-7 flex flex-col justify-between space-y-5">
             <div className="winamp-lcd rounded-2xl border border-zinc-800 p-4 flex flex-col sm:flex-row items-center gap-5">
-              <img
+              <CachedArtworkImage
                 src={currentTrack.artworkUrl}
                 alt={currentTrack.title}
-                referrerPolicy="no-referrer"
-                onError={(e) => {
-                  e.currentTarget.onerror = null;
-                  e.currentTarget.src = createAlbumArtworkDataUri(
-                    currentTrack.title,
-                    currentTrack.artist,
-                    currentTrack.accentColor || '#10b981',
-                    '#09090b'
-                  );
-                }}
+                fallbackTitle={currentTrack.title}
+                fallbackArtist={currentTrack.artist}
+                fallbackAccent={currentTrack.accentColor || '#10b981'}
                 className="w-28 h-28 sm:w-32 sm:h-32 rounded-xl border border-zinc-700 object-cover shadow-xl shrink-0"
               />
               <div className="space-y-1.5 text-center sm:text-left min-w-0 flex-1">

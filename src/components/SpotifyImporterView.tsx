@@ -3,6 +3,7 @@ import {
   ArrowRight,
   CheckCircle2,
   ListPlus,
+  Loader2,
   Play,
   Sparkles,
   Upload,
@@ -60,8 +61,65 @@ export const SpotifyImporterView: React.FC<SpotifyImporterViewProps> = ({
     )
   );
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
+  const [isFetchingUrl, setIsFetchingUrl] = useState<boolean>(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
 
-  const handleCrossResolve = () => {
+  const fetchTracksFromSpotifyUrl = async (url: string) => {
+    setIsFetchingUrl(true);
+    setFetchError(null);
+    try {
+      const resp = await fetch('/api/spotify/import-url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      });
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) {
+        setFetchError(data.error || 'Failed to fetch tracks from Spotify URL.');
+        return false;
+      }
+      if (data.playlistTitle) {
+        setPlaylistTitle(data.playlistTitle);
+      }
+      if (Array.isArray(data.tracks) && data.tracks.length > 0) {
+        const textLines = data.tracks.map(
+          (t: { artist: string; title: string }) => `${t.artist} - ${t.title}`
+        );
+        const newText = textLines.join('\n');
+        setRawTracklist(newText);
+        const parsed = parseSpotifyExport(newText);
+        setResolvedItems(parsed.map((item) => crossResolveTrack(item, catalog)));
+        setSavedNotice(`Loaded ${data.tracks.length} tracks from "${data.playlistTitle}"!`);
+        return true;
+      } else {
+        setFetchError(`Found "${data.playlistTitle}", but Spotify hid tracklist details.`);
+        return false;
+      }
+    } catch (err) {
+      setFetchError(
+        err instanceof Error ? err.message : 'Could not contact Spotify importer'
+      );
+      return false;
+    } finally {
+      setIsFetchingUrl(false);
+    }
+  };
+
+  const handleCrossResolve = async () => {
+    const raw = rawTracklist.trim();
+    const tokenUrl = spotifyTokenOrUrl.trim();
+
+    // Check if user entered a Spotify URL into either input
+    const possibleUrl = [tokenUrl, raw].find((val) =>
+      /open\.spotify\.com\/(?:intl-[a-z]+\/)?(playlist|album|track)\//i.test(val) ||
+      /^spotify:(playlist|album|track):/i.test(val)
+    );
+
+    if (possibleUrl) {
+      await fetchTracksFromSpotifyUrl(possibleUrl);
+      return;
+    }
+
     const parsed = parseSpotifyExport(rawTracklist);
     const resolved = parsed.map((item) => crossResolveTrack(item, catalog));
     setResolvedItems(resolved);
@@ -148,20 +206,43 @@ export const SpotifyImporterView: React.FC<SpotifyImporterViewProps> = ({
           </div>
 
           <div>
-            <label
-              htmlFor="spotify-token-input"
-              className="block text-xs font-medium text-zinc-400 mb-1.5"
-            >
-              Optional: Spotify Playlist URL or Bearer Token
-            </label>
-            <input
-              id="spotify-token-input"
-              type="text"
-              value={spotifyTokenOrUrl}
-              onChange={(e) => setSpotifyTokenOrUrl(e.target.value)}
-              placeholder="https://open.spotify.com/playlist/... or BQD..."
-              className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3.5 py-2 text-xs text-zinc-200 placeholder-zinc-600 focus:border-emerald-500 focus:outline-none font-mono"
-            />
+            <div className="flex items-center justify-between mb-1.5">
+              <label
+                htmlFor="spotify-token-input"
+                className="block text-xs font-medium text-zinc-400"
+              >
+                Spotify Playlist URL or Web Link
+              </label>
+              {spotifyTokenOrUrl.trim() && (
+                <button
+                  type="button"
+                  disabled={isFetchingUrl}
+                  onClick={() => fetchTracksFromSpotifyUrl(spotifyTokenOrUrl.trim())}
+                  className="text-[11px] font-mono text-[#00ff66] hover:underline inline-flex items-center gap-1 font-bold"
+                >
+                  {isFetchingUrl ? (
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                  ) : (
+                    <span>Fetch Tracks →</span>
+                  )}
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                id="spotify-token-input"
+                type="text"
+                value={spotifyTokenOrUrl}
+                onChange={(e) => setSpotifyTokenOrUrl(e.target.value)}
+                placeholder="https://open.spotify.com/playlist/..."
+                className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3.5 py-2 text-xs text-zinc-200 placeholder-zinc-600 focus:border-emerald-500 focus:outline-none font-mono"
+              />
+            </div>
+            {fetchError && (
+              <p className="text-[11px] font-mono text-rose-400 mt-1.5 bg-rose-950/40 border border-rose-500/40 p-2 rounded-lg">
+                ⚠️ {fetchError}
+              </p>
+            )}
           </div>
 
           <div>

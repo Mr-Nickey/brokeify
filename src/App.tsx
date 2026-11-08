@@ -103,6 +103,7 @@ import {
 } from './utils/debugLogger';
 import { preloadTrackToVault } from './utils/offlineVault';
 import { createAlbumArtworkDataUri } from './utils/artworkGenerator';
+import { CachedArtworkImage, preloadArtworkBatch } from './utils/artworkCache';
 
 type CoreTab = 'library' | 'discover' | 'nowplaying' | 'settings';
 type LibrarySubTab = 'playlists' | 'songs' | 'albums' | 'artists' | 'stats';
@@ -226,6 +227,8 @@ export default function App() {
 
   // Toast Notification
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [dismissedJellyfinAlert, setDismissedJellyfinAlert] =
+    useState<boolean>(false);
 
   // Zero-Logout Persistent Storage & Jellyfin Cloud Sync State
   const [storagePersistStatus, setStoragePersistStatus] = useState<{
@@ -664,6 +667,19 @@ export default function App() {
     });
   }, [enabledProviderTypes, remoteTracks]);
 
+  // Preload first 40 album covers into 'brokeify-artwork-cache' IndexedDB in the background
+  useEffect(() => {
+    if (allTracks.length > 0) {
+      const urls = allTracks
+        .slice(0, 40)
+        .map((t) => t.artworkUrl)
+        .filter((u): u is string => Boolean(u && !u.startsWith('data:')));
+      if (urls.length > 0) {
+        preloadArtworkBatch(urls, 4).catch(() => {});
+      }
+    }
+  }, [allTracks]);
+
   // Filter playlists so only playlists from enabled sources appear
   const visiblePlaylists = useMemo(() => {
     return playlists.filter((pl) => {
@@ -684,6 +700,18 @@ export default function App() {
       return true;
     });
   }, [enabledProviderTypes, playlists]);
+
+  const jellyfinProv = providers.find((p) => p.type === 'jellyfin');
+  const isJellyfinDisconnected = Boolean(
+    jellyfinProv &&
+      jellyfinProv.enabled &&
+      (jellyfinProv.status === 'error' ||
+        Boolean(
+          jellyfinProv.diagnosticLog?.toLowerCase().includes('timeout') ||
+            jellyfinProv.diagnosticLog?.toLowerCase().includes('failed') ||
+            jellyfinProv.diagnosticLog?.toLowerCase().includes('aborted')
+        ))
+  );
 
   const audio = useAudioEngine(allTracks);
 
@@ -751,8 +779,7 @@ export default function App() {
   // Helper to resolve tracks for a playlist
   const getTracksForPlaylist = (pl: Playlist): Track[] => {
     const idSet = new Set(pl.trackIds);
-    const matched = allTracks.filter((t) => idSet.has(t.id));
-    return matched.length > 0 ? matched : allTracks.slice(0, 6);
+    return allTracks.filter((t) => idSet.has(t.id));
   };
 
   // Start renaming a playlist
@@ -1743,6 +1770,54 @@ export default function App() {
         </div>
       )}
 
+      {/* Loud Jellyfin Disconnected Alert Bar — Yells at user so they know before leaving Settings */}
+      {isJellyfinDisconnected && !dismissedJellyfinAlert && (
+        <div
+          role="alert"
+          data-testid="jellyfin-disconnected-alert-bar"
+          className="bg-rose-950/95 border-b-2 border-rose-500 px-4 py-2.5 text-xs font-mono text-rose-200 flex flex-wrap items-center justify-between gap-3 z-50 sticky top-0 shadow-2xl backdrop-blur-md"
+        >
+          <div className="flex items-center gap-2.5 min-w-0 flex-1">
+            <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0 animate-pulse" />
+            <span className="leading-snug">
+              <strong className="text-white uppercase tracking-wider">
+                🚨 JELLYFIN DISCONNECTED // SERVER UNREACHABLE:
+              </strong>{' '}
+              Cannot connect to{' '}
+              <code className="text-rose-100 underline font-bold">
+                {jellyfinProv?.serverUrl || 'media server'}
+              </code>
+              .{' '}
+              <span className="text-amber-300 font-semibold">
+                In Docker, switch to your local LAN IP (e.g.
+                http://192.168.1.175:8096) to avoid NAT loopback timeouts!
+              </span>
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab('settings');
+                setSettingsSubTab('sources');
+              }}
+              className="rounded-lg bg-rose-500 hover:bg-rose-400 text-zinc-950 font-bold px-3 py-1 text-xs transition-colors whitespace-nowrap min-h-[30px]"
+            >
+              Fix in Settings ⚙️
+            </button>
+            <button
+              type="button"
+              onClick={() => setDismissedJellyfinAlert(true)}
+              className="p-1 text-rose-400 hover:text-white rounded"
+              title="Dismiss banner"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Universal Responsive Top Header Bar (Never Overlaps on Half-Windows, Phones, Car Screens, or 72-inch TVs) */}
       <header className="sticky top-0 z-30 winamp-titlebar border-b border-zinc-700/80">
         <div className="w-full max-w-[1920px] mx-auto px-3 sm:px-6 xl:px-10 py-2 flex flex-wrap items-center justify-between gap-2.5">
@@ -2065,19 +2140,12 @@ export default function App() {
                             : 'border-zinc-800 bg-zinc-900/70 hover:border-zinc-700'
                         }`}
                       >
-                        <img
+                        <CachedArtworkImage
                           src={track.artworkUrl}
                           alt={track.title}
-                          referrerPolicy="no-referrer"
-                          onError={(e) => {
-                            e.currentTarget.onerror = null;
-                            e.currentTarget.src = createAlbumArtworkDataUri(
-                              track.title,
-                              track.artist,
-                              track.accentColor || '#10b981',
-                              '#09090b'
-                            );
-                          }}
+                          fallbackTitle={track.title}
+                          fallbackArtist={track.artist}
+                          fallbackAccent={track.accentColor || '#10b981'}
                           className="w-10 h-10 rounded-lg border border-zinc-700 object-cover shrink-0"
                         />
                         <div className="min-w-0 flex-1 overflow-hidden">
@@ -2951,20 +3019,58 @@ export default function App() {
 
                 <div className="p-4 sm:p-5">
                   {displayedTracks.length === 0 ? (
-                    <div className="py-10 text-center space-y-2">
-                      <p className="text-sm font-semibold text-zinc-300">
-                        No songs match your current filter.
-                      </p>
-                      {offlineOnlyMode && (
-                        <button
-                          type="button"
-                          onClick={() => setOfflineOnlyMode(false)}
-                          className="rounded-xl bg-zinc-800 px-4 py-2 text-xs font-semibold text-white hover:bg-zinc-700"
-                        >
-                          Disable Offline Only Mode
-                        </button>
-                      )}
-                    </div>
+                    selectedPlaylistId ? (
+                      <div className="py-12 px-4 text-center max-w-md mx-auto space-y-3">
+                        <div className="w-12 h-12 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center mx-auto text-amber-400">
+                          <Radio className="w-6 h-6 animate-pulse" />
+                        </div>
+                        <h3 className="text-base font-bold text-white">
+                          Playlist Songs Not Downloaded Yet
+                        </h3>
+                        <p className="text-xs text-zinc-400 font-mono leading-relaxed">
+                          &ldquo;
+                          {visiblePlaylists.find(
+                            (p) => p.id === selectedPlaylistId
+                          )?.name || 'This playlist'}
+                          &rdquo; has no matching songs in your local Jellyfin
+                          server yet. Open Request / Discover to grab and
+                          download the missing songs straight to your server
+                          disk!
+                        </p>
+                        <div className="flex flex-wrap items-center justify-center gap-2 pt-2">
+                          <button
+                            type="button"
+                            onClick={() => setActiveTab('discover')}
+                            className="inline-flex items-center gap-1.5 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-4 py-2 text-xs font-mono font-bold text-zinc-950 transition-colors"
+                          >
+                            <ArrowDownToLine className="w-4 h-4" />
+                            <span>Open Request &amp; Discover</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setSelectedPlaylistId(null)}
+                            className="rounded-xl border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 px-3 py-2 text-xs font-mono text-zinc-300"
+                          >
+                            Show All Songs ({allTracks.length})
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="py-10 text-center space-y-2">
+                        <p className="text-sm font-semibold text-zinc-300">
+                          No songs match your current filter.
+                        </p>
+                        {offlineOnlyMode && (
+                          <button
+                            type="button"
+                            onClick={() => setOfflineOnlyMode(false)}
+                            className="rounded-xl bg-zinc-800 px-4 py-2 text-xs font-semibold text-white hover:bg-zinc-700"
+                          >
+                            Disable Offline Only Mode
+                          </button>
+                        )}
+                      </div>
+                    )
                   ) : (
                     <div className="divide-y divide-zinc-800/70">
                       {displayedTracks.map((track, idx) => {
@@ -2988,20 +3094,12 @@ export default function App() {
                                 {String(idx + 1).padStart(2, '0')}
                               </span>
 
-                              <img
+                              <CachedArtworkImage
                                 src={track.artworkUrl}
                                 alt={track.title}
-                                referrerPolicy="no-referrer"
-                                onError={(e) => {
-                                  e.currentTarget.onerror = null;
-                                  e.currentTarget.src =
-                                    createAlbumArtworkDataUri(
-                                      track.title,
-                                      track.artist,
-                                      track.accentColor || '#10b981',
-                                      '#09090b'
-                                    );
-                                }}
+                                fallbackTitle={track.title}
+                                fallbackArtist={track.artist}
+                                fallbackAccent={track.accentColor || '#10b981'}
                                 className="w-10 h-10 rounded-lg border border-zinc-800 object-cover shrink-0"
                               />
 
@@ -3167,19 +3265,12 @@ export default function App() {
                     className="winamp-bezel rounded-2xl border border-zinc-800/90 p-4 flex flex-col justify-between gap-4"
                   >
                     <div className="flex items-center gap-3.5">
-                      <img
+                      <CachedArtworkImage
                         src={group.artworkUrl}
                         alt={group.album}
-                        referrerPolicy="no-referrer"
-                        onError={(e) => {
-                          e.currentTarget.onerror = null;
-                          e.currentTarget.src = createAlbumArtworkDataUri(
-                            group.album,
-                            group.artist,
-                            '#10b981',
-                            '#09090b'
-                          );
-                        }}
+                        fallbackTitle={group.album}
+                        fallbackArtist={group.artist}
+                        fallbackAccent="#10b981"
                         className="w-16 h-16 rounded-xl border border-zinc-800 object-cover shrink-0"
                       />
                       <div className="min-w-0 flex-1">
@@ -3238,19 +3329,12 @@ export default function App() {
                     className="winamp-bezel rounded-2xl border border-zinc-800/90 p-4 flex flex-col justify-between gap-4"
                   >
                     <div className="flex items-center gap-3.5">
-                      <img
+                      <CachedArtworkImage
                         src={group.artworkUrl}
                         alt={group.artist}
-                        referrerPolicy="no-referrer"
-                        onError={(e) => {
-                          e.currentTarget.onerror = null;
-                          e.currentTarget.src = createAlbumArtworkDataUri(
-                            group.artist,
-                            'Artist',
-                            '#a855f7',
-                            '#09090b'
-                          );
-                        }}
+                        fallbackTitle={group.artist}
+                        fallbackArtist="Artist"
+                        fallbackAccent="#a855f7"
                         className="w-14 h-14 rounded-full border border-zinc-800 object-cover shrink-0"
                       />
                       <div className="min-w-0 flex-1">
@@ -4039,19 +4123,12 @@ export default function App() {
             className="flex items-center gap-3 min-w-0 flex-1 sm:flex-initial sm:w-80 text-left group"
           >
             {audio.currentTrack && (
-              <img
+              <CachedArtworkImage
                 src={audio.currentTrack.artworkUrl}
                 alt={audio.currentTrack.title}
-                referrerPolicy="no-referrer"
-                onError={(e) => {
-                  e.currentTarget.onerror = null;
-                  e.currentTarget.src = createAlbumArtworkDataUri(
-                    audio.currentTrack?.title || 'Brokeify',
-                    audio.currentTrack?.artist || 'Jellyfin',
-                    '#10b981',
-                    '#09090b'
-                  );
-                }}
+                fallbackTitle={audio.currentTrack?.title || 'Brokeify'}
+                fallbackArtist={audio.currentTrack?.artist || 'Jellyfin'}
+                fallbackAccent={audio.currentTrack?.accentColor || '#10b981'}
                 className="w-9 h-9 sm:w-11 sm:h-11 rounded-xl border border-zinc-700 object-cover shrink-0"
               />
             )}

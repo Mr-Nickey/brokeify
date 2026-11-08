@@ -15,6 +15,7 @@ import {
   X,
 } from 'lucide-react';
 import type { EQPresetName, RepeatMode, Track } from '../types/music';
+import { CachedArtworkImage } from '../utils/artworkCache';
 
 interface CarModeOverlayProps {
   isOpen: boolean;
@@ -124,10 +125,12 @@ export const CarModeOverlay: React.FC<CarModeOverlayProps> = ({
       <div className="my-auto py-5 space-y-6 max-w-4xl mx-auto w-full">
         <div className="winamp-lcd rounded-3xl border border-zinc-800 p-5 flex flex-col sm:flex-row items-center gap-6">
           {currentTrack && (
-            <img
+            <CachedArtworkImage
               src={currentTrack.artworkUrl}
               alt={currentTrack.title}
-              referrerPolicy="no-referrer"
+              fallbackTitle={currentTrack.title}
+              fallbackArtist={currentTrack.artist}
+              fallbackAccent={currentTrack.accentColor || '#10b981'}
               className="w-24 h-24 sm:w-32 sm:h-32 rounded-2xl border border-zinc-700 object-cover shrink-0 shadow-2xl"
             />
           )}

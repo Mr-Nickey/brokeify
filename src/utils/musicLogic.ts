@@ -753,24 +753,20 @@ export function crossResolveTrack(
     }
   }
 
-  // If no strong keyword match was found, deterministically map to a playable free stream so the user never gets dead silence
-  if (bestScore < 15 && catalog.length > 0) {
-    const hash = (normTitle + normArtist)
-      .split('')
-      .reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
-    const fallback = catalog[hash % catalog.length];
+  // If no good match was found, return null so Brokeify correctly flags track as Missing for slskd/Lidarr download
+  if (bestScore < 30 || !bestTrack) {
     return {
       original: item,
-      matchedTrack: fallback,
-      confidence: 62,
-      matchReason: `Cloud acoustic proxy via ${fallback.sourceName}`,
+      matchedTrack: null,
+      confidence: 0,
+      matchReason: 'Not found in local library (Missing - Available for Download)',
     };
   }
 
   return {
     original: item,
     matchedTrack: bestTrack,
-    confidence: Math.min(100, Math.max(68, bestScore)),
+    confidence: Math.min(100, Math.max(50, bestScore)),
     matchReason: bestReason,
   };
 }

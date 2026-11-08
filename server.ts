@@ -1847,6 +1847,437 @@ app.post('/api/lidarr/test', async (req, res) => {
   }
 });
 
+// POST /api/slskd/test — Test slskd connection and API key with homelab diagnostics
+app.post('/api/slskd/test', async (req, res) => {
+  try {
+    const { slskdUrl, slskdApiKey } = getSlskdConfig(req.body || {});
+    if (!slskdUrl) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Enter your slskd URL first (e.g. http://192.168.1.175:5030 or http://slskd:5030).',
+        hint: 'If running in Docker, enter your server LAN IP or docker service name.',
+      });
+    }
+
+    const headers = buildSlskdHeaders(slskdApiKey);
+    let appInfo: any = null;
+    let endpointTried = `${slskdUrl}/api/v0/application`;
+
+    try {
+      const resp = await fetch(endpointTried, {
+        headers,
+        signal: AbortSignal.timeout(6000),
+      });
+
+      if (resp.status === 401 || resp.status === 403) {
+        return res.status(resp.status).json({
+          ok: false,
+          error: `slskd rejected authentication (HTTP ${resp.status}). Check your slskd API Key (X-API-Key).`,
+        });
+      }
+
+      if (resp.ok) {
+        appInfo = await resp.json().catch(() => ({}));
+      } else {
+        // Fallback to /api/v0/transfers/downloads
+        endpointTried = `${slskdUrl}/api/v0/transfers/downloads`;
+        const fallbackResp = await fetch(endpointTried, {
+          headers,
+          signal: AbortSignal.timeout(6000),
+        });
+        if (!fallbackResp.ok) {
+          return res.status(fallbackResp.status).json({
+            ok: false,
+            error: `slskd returned HTTP ${fallbackResp.status} at ${endpointTried}. Verify slskd URL and key.`,
+          });
+        }
+        appInfo = { version: '0.6.x' };
+      }
+    } catch (fetchErr) {
+      const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+      let hint = 'Make sure your slskd Docker container is running.';
+      if (
+        errMsg.includes('fetch failed') ||
+        errMsg.includes('ECONNREFUSED') ||
+        errMsg.includes('ENOTFOUND') ||
+        errMsg.includes('timeout')
+      ) {
+        hint = `Cannot reach ${slskdUrl} from inside this Docker container. If slskd is on another compose stack, "http://slskd:5030" cannot be resolved. Change URL to your server's LAN IP like http://192.168.1.175:5030 or join both containers to the same Docker bridge network.`;
+      }
+      return res.status(502).json({
+        ok: false,
+        error: `Unreachable at ${slskdUrl}: ${errMsg}`,
+        hint,
+      });
+    }
+
+    const version = appInfo?.version || appInfo?.appVersion || '0.6.x';
+    return res.json({
+      ok: true,
+      version,
+      url: slskdUrl,
+      message: `Connected to slskd v${version}! Soulseek P2P engine is ready for 1-click downloads.`,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Error testing slskd connection.',
+    });
+  }
+});
+
+// POST /api/jellyfin/test — Test Jellyfin connection, version, user auth, and library reachability
+app.post('/api/jellyfin/test', async (req, res) => {
+  try {
+    const { serverUrl, token, userId } = getActiveJellyfinCredentials(req.body || {});
+    const inputUsername = String(req.body?.username || '').trim();
+    const inputPassword = String(req.body?.password || '').trim();
+
+    if (!serverUrl) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Jellyfin Server URL is empty. Enter your server URL (e.g. http://192.168.1.175:8096).',
+      });
+    }
+
+    let publicInfo: any = null;
+    try {
+      const publicResp = await fetch(`${serverUrl}/System/Info/Public`, {
+        headers: buildJellyfinHeaders(token),
+        signal: AbortSignal.timeout(6000),
+      });
+
+      if (!publicResp.ok) {
+        return res.status(publicResp.status).json({
+          ok: false,
+          error: `Jellyfin server at ${serverUrl} responded with HTTP ${publicResp.status}.`,
+          hint: 'Verify the port and protocol (http vs https).',
+        });
+      }
+      publicInfo = await publicResp.json().catch(() => ({}));
+    } catch (fetchErr) {
+      const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+      let hint = 'Make sure Jellyfin is running and port 8096 is exposed.';
+      if (
+        errMsg.includes('timeout') ||
+        errMsg.includes('aborted') ||
+        errMsg.includes('fetch failed') ||
+        errMsg.includes('ECONNREFUSED')
+      ) {
+        hint = `Failed to connect to ${serverUrl}: ${errMsg}. If you are running Brokeify inside Docker, external domains (e.g. https://jellyfin.flockingreeds.farm) often fail due to router NAT loopback / hairpinning. Use your local host LAN IP instead: http://192.168.1.175:8096!`;
+      }
+      return res.status(502).json({
+        ok: false,
+        error: `Connection failed to ${serverUrl}: ${errMsg}`,
+        hint,
+      });
+    }
+
+    const serverName = publicInfo?.ServerName || 'Jellyfin Media Server';
+    const serverVersion = publicInfo?.Version || '10.x';
+    let authValid = false;
+    let authedUser = '';
+
+    // Check user auth if token or credentials provided
+    if (token) {
+      try {
+        const meResp = await fetch(`${serverUrl}/Users/Me`, {
+          headers: buildJellyfinHeaders(token),
+          signal: AbortSignal.timeout(5000),
+        });
+        if (meResp.ok) {
+          const meData = (await meResp.json().catch(() => ({}))) as any;
+          authValid = true;
+          authedUser = meData?.Name || '';
+        }
+      } catch {
+        // non-blocking
+      }
+    } else if (inputUsername && inputPassword) {
+      try {
+        const authResp = await fetch(`${serverUrl}/Users/AuthenticateByName`, {
+          method: 'POST',
+          headers: buildJellyfinHeaders(''),
+          body: JSON.stringify({ Username: inputUsername, Pw: inputPassword }),
+          signal: AbortSignal.timeout(6000),
+        });
+        if (authResp.ok) {
+          const authData = (await authResp.json().catch(() => ({}))) as any;
+          authValid = true;
+          authedUser = authData?.User?.Name || inputUsername;
+        }
+      } catch {
+        // non-blocking
+      }
+    }
+
+    return res.json({
+      ok: true,
+      serverName,
+      serverVersion,
+      serverUrl,
+      authValid,
+      username: authedUser || inputUsername || userId,
+      message: `Connected to ${serverName} (Jellyfin v${serverVersion})! ${
+        authValid ? `Signed in as ${authedUser || inputUsername}.` : 'Public endpoint reachable.'
+      }`,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Error testing Jellyfin.',
+    });
+  }
+});
+
+// POST /api/listenbrainz/test — Test ListenBrainz user & scrobbler token
+app.post('/api/listenbrainz/test', async (req, res) => {
+  try {
+    const cfg = readServerConfig();
+    const username = String(
+      req.body?.username || cfg.integrations?.listenbrainzUsername || ''
+    ).trim();
+    const token = String(
+      req.body?.token || cfg.integrations?.listenbrainzToken || ''
+    ).trim();
+
+    if (!username) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Enter your ListenBrainz username first (e.g. crazynick17).',
+      });
+    }
+
+    // Verify user exists on ListenBrainz
+    try {
+      const userResp = await fetch(
+        `https://api.listenbrainz.org/1/user/${encodeURIComponent(username)}/playlists`,
+        { signal: AbortSignal.timeout(6000) }
+      );
+      if (!userResp.ok && userResp.status === 404) {
+        return res.status(404).json({
+          ok: false,
+          error: `ListenBrainz user "${username}" was not found. Check your username spelling on listenbrainz.org.`,
+        });
+      }
+    } catch (e) {
+      return res.status(502).json({
+        ok: false,
+        error: `Could not reach ListenBrainz API: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    }
+
+    let tokenValid = false;
+    let tokenMessage = 'No User Token entered (token needed for scrobbling).';
+
+    if (token) {
+      try {
+        const tokenResp = await fetch('https://api.listenbrainz.org/1/validate-token', {
+          headers: { Authorization: `Token ${token}` },
+          signal: AbortSignal.timeout(6000),
+        });
+        if (tokenResp.ok) {
+          const tokenJson = (await tokenResp.json().catch(() => ({}))) as any;
+          tokenValid = Boolean(tokenJson.valid);
+          tokenMessage = tokenValid
+            ? 'Scrobbler Token valid & authorized.'
+            : 'Scrobbler Token is invalid or expired. Check your token on listenbrainz.org/profile.';
+        }
+      } catch {
+        tokenMessage = 'Could not validate scrobbler token right now.';
+      }
+    }
+
+    return res.json({
+      ok: true,
+      username,
+      tokenValid,
+      message: `ListenBrainz profile "${username}" connected! ${tokenMessage}`,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'ListenBrainz test error.',
+    });
+  }
+});
+
+// POST /api/services/test-all — Runs all connection tests in parallel and checks storage permissions
+app.post('/api/services/test-all', async (req, res) => {
+  const cfg = readServerConfig();
+  const jfCreds = getActiveJellyfinCredentials(req.body?.jellyfin || {});
+  const slskdCreds = getSlskdConfig(req.body?.slskd || {});
+  const lidarrCreds = getLidarrConfig(req.body?.lidarr || {});
+  const lbUser = String(req.body?.listenbrainz?.username || cfg.integrations?.listenbrainzUsername || '').trim();
+  const lbToken = String(req.body?.listenbrainz?.token || cfg.integrations?.listenbrainzToken || '').trim();
+
+  // Test Storage Permissions
+  let storageStatus = { ok: true, path: CONFIG_FILE_PATH, message: 'Writable & Persistent (/app/data)' };
+  try {
+    fs.mkdirSync(path.dirname(CONFIG_FILE_PATH), { recursive: true });
+    fs.accessSync(path.dirname(CONFIG_FILE_PATH), fs.constants.W_OK);
+  } catch (e) {
+    storageStatus = {
+      ok: false,
+      path: CONFIG_FILE_PATH,
+      message: `Permission error writing to ${CONFIG_FILE_PATH}: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+
+  // Test Jellyfin
+  let jellyfinStatus: { ok: boolean; serverName?: string; version?: string; message: string; hint?: string } = {
+    ok: false,
+    message: 'Not configured',
+  };
+  if (jfCreds.serverUrl) {
+    try {
+      const jfResp = await fetch(`${jfCreds.serverUrl}/System/Info/Public`, {
+        headers: buildJellyfinHeaders(jfCreds.token),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (jfResp.ok) {
+        const info = (await jfResp.json().catch(() => ({}))) as any;
+        jellyfinStatus = {
+          ok: true,
+          serverName: info.ServerName || 'Jellyfin',
+          version: info.Version || '10.x',
+          message: `Connected to ${info.ServerName || 'Jellyfin'} (v${info.Version || '10.x'})`,
+        };
+      } else {
+        jellyfinStatus = {
+          ok: false,
+          message: `HTTP ${jfResp.status} from ${jfCreds.serverUrl}`,
+          hint: 'Check server URL and port.',
+        };
+      }
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      let hint = 'Make sure Jellyfin is running.';
+      if (errMsg.includes('timeout') || errMsg.includes('fetch failed')) {
+        hint = 'In Docker, avoid external domain names. Use http://192.168.1.175:8096 directly!';
+      }
+      jellyfinStatus = {
+        ok: false,
+        message: `Failed to connect to ${jfCreds.serverUrl}: ${errMsg}`,
+        hint,
+      };
+    }
+  }
+
+  // Test slskd
+  let slskdStatus: { ok: boolean; version?: string; message: string; hint?: string } = {
+    ok: false,
+    message: 'Not configured',
+  };
+  if (slskdCreds.slskdUrl) {
+    try {
+      const sResp = await fetch(`${slskdCreds.slskdUrl}/api/v0/application`, {
+        headers: buildSlskdHeaders(slskdCreds.slskdApiKey),
+        signal: AbortSignal.timeout(5000),
+      }).catch(async () => {
+        return await fetch(`${slskdCreds.slskdUrl}/api/v0/transfers/downloads`, {
+          headers: buildSlskdHeaders(slskdCreds.slskdApiKey),
+          signal: AbortSignal.timeout(5000),
+        });
+      });
+      if (sResp.ok) {
+        const sInfo = (await sResp.json().catch(() => ({}))) as any;
+        slskdStatus = {
+          ok: true,
+          version: sInfo.version || '0.6.x',
+          message: `Connected to slskd v${sInfo.version || '0.6.x'}`,
+        };
+      } else {
+        slskdStatus = {
+          ok: false,
+          message: `HTTP ${sResp.status} from slskd. Check API key.`,
+        };
+      }
+    } catch (e) {
+      slskdStatus = {
+        ok: false,
+        message: `Unreachable at ${slskdCreds.slskdUrl}`,
+        hint: 'If running in Docker, use host LAN IP (http://192.168.1.175:5030) or connect to the same Docker network.',
+      };
+    }
+  }
+
+  // Test Lidarr
+  let lidarrStatus: { ok: boolean; version?: string; message: string; hint?: string } = {
+    ok: false,
+    message: 'Not configured',
+  };
+  if (lidarrCreds.lidarrUrl && lidarrCreds.lidarrApiKey) {
+    try {
+      const lResp = await fetch(`${lidarrCreds.lidarrUrl}/api/v1/system/status`, {
+        headers: buildLidarrHeaders(lidarrCreds.lidarrApiKey),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (lResp.ok) {
+        const lInfo = (await lResp.json().catch(() => ({}))) as any;
+        lidarrStatus = {
+          ok: true,
+          version: lInfo.version || '1.x',
+          message: `Connected to Lidarr v${lInfo.version || '1.x'}`,
+        };
+      } else {
+        lidarrStatus = {
+          ok: false,
+          message: `HTTP ${lResp.status} from Lidarr. Verify API key.`,
+        };
+      }
+    } catch (e) {
+      lidarrStatus = {
+        ok: false,
+        message: `Unreachable at ${lidarrCreds.lidarrUrl}`,
+        hint: 'Check your Lidarr URL or use http://192.168.1.175:8686.',
+      };
+    }
+  }
+
+  // Test ListenBrainz
+  let listenbrainzStatus: { ok: boolean; username?: string; message: string } = {
+    ok: false,
+    message: 'Not configured',
+  };
+  if (lbUser) {
+    try {
+      const lbResp = await fetch(
+        `https://api.listenbrainz.org/1/user/${encodeURIComponent(lbUser)}/playlists`,
+        { signal: AbortSignal.timeout(5000) }
+      );
+      if (lbResp.ok || lbResp.status === 200) {
+        listenbrainzStatus = {
+          ok: true,
+          username: lbUser,
+          message: `ListenBrainz profile "${lbUser}" verified!`,
+        };
+      } else if (lbResp.status === 404) {
+        listenbrainzStatus = {
+          ok: false,
+          message: `User "${lbUser}" does not exist on ListenBrainz.`,
+        };
+      }
+    } catch (e) {
+      listenbrainzStatus = {
+        ok: false,
+        message: 'Could not contact ListenBrainz API.',
+      };
+    }
+  }
+
+  return res.json({
+    ok: true,
+    services: {
+      jellyfin: jellyfinStatus,
+      slskd: slskdStatus,
+      lidarr: lidarrStatus,
+      listenbrainz: listenbrainzStatus,
+      storage: storageStatus,
+    },
+  });
+});
+
 // Execute an automated Lidarr artist/album lookup, add/monitor, and indexer search command
 async function executeLidarrGrabJob(job, override = {}) {
   const {
@@ -3097,7 +3528,7 @@ app.get('/api/debug/logs', async (_req, res) => {
       ytDlpAvailable: ytDlpInfo.installed,
       ytDlpVersion: ytDlpInfo.version,
       ffmpegAvailable: ffmpegInfo.installed,
-      activeGrabJobs: grabJobs.filter(
+      activeGrabJobs: Array.from(slskdJobs.values()).filter(
         (j) => j.status === 'searching' || j.status === 'downloading'
       ).length,
       memoryRssMb: Math.round((mem.rss || 0) / (1024 * 1024)),
