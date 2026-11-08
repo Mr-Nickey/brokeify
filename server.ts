@@ -1224,7 +1224,17 @@ app.post('/api/spotify/import-url', async (req, res) => {
 // ============================================================================
 
 const slskdJobs = new Map();
-const readyNotifications = [];
+const grabJobs = slskdJobs;
+(globalThis as any).grabJobs = slskdJobs;
+(globalThis as any).slskdJobs = slskdJobs;
+const readyNotifications: any[] = [];
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Brokeify] Unhandled Rejection at:', promise, 'reason:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[Brokeify] Uncaught Exception:', err);
+});
 
 function evaluateServerDiscoveryFilter(track, filtersConfig) {
   const filters = filtersConfig || readServerConfig().discoveryFilters || {};
@@ -4086,23 +4096,32 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(
-      `[Brokeify] Full-Stack Server listening on http://0.0.0.0:${PORT} (config: ${CONFIG_FILE_PATH})`
-    );
-    pushServerLog(
-      'success',
-      'system',
-      `Brokeify Server started on port ${PORT} (storage: ${CONFIG_FILE_PATH})`
-    );
-  });
-
-  // In AI Studio dev preview only, also bind 3000 if PORT is 3487 so the preview iframe stays connected
-  if (!isProd && PORT !== 3000) {
-    try {
-      app.listen(3000, '0.0.0.0', () => {});
-    } catch {
-      // ignore if 3000 is already in use
+  const portsToBind = Array.from(new Set([PORT, 3487, 3000]));
+  for (const p of portsToBind) {
+    if (p === PORT) {
+      app.listen(p, '0.0.0.0', () => {
+        console.log(
+          `[Brokeify] Full-Stack Server listening on http://0.0.0.0:${p} (config: ${CONFIG_FILE_PATH})`
+        );
+        pushServerLog(
+          'success',
+          'system',
+          `Brokeify Server started on port ${p} (storage: ${CONFIG_FILE_PATH})`
+        );
+      });
+    } else {
+      try {
+        const extraServer = app.listen(p, '0.0.0.0', () => {
+          console.log(
+            `[Brokeify] Dual-port listener active on http://0.0.0.0:${p}`
+          );
+        });
+        extraServer.on('error', () => {
+          // Port already in use, safe to ignore
+        });
+      } catch {
+        // ignore
+      }
     }
   }
 }
