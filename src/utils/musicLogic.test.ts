@@ -250,44 +250,44 @@ test('Jellyfin Quick Connect, Authenticated Headers, User-Scoped Endpoints, Subs
   );
 
   assert.equal(
-    buildJellyfinPublicSystemInfoUrl('https://jellyfin.flockingreeds.farm/'),
-    'https://jellyfin.flockingreeds.farm/System/Info/Public'
+    buildJellyfinPublicSystemInfoUrl('https://jellyfin.yourdomain.com/'),
+    'https://jellyfin.yourdomain.com/System/Info/Public'
   );
   assert.equal(
-    buildJellyfinQuickConnectInitiateUrl('https://jellyfin.flockingreeds.farm/'),
-    'https://jellyfin.flockingreeds.farm/QuickConnect/Initiate'
+    buildJellyfinQuickConnectInitiateUrl('https://jellyfin.yourdomain.com/'),
+    'https://jellyfin.yourdomain.com/QuickConnect/Initiate'
   );
   assert.equal(
-    buildJellyfinQuickConnectPollUrl('https://jellyfin.flockingreeds.farm/', 'sec-99'),
-    'https://jellyfin.flockingreeds.farm/QuickConnect/Connect?Secret=sec-99'
+    buildJellyfinQuickConnectPollUrl('https://jellyfin.yourdomain.com/', 'sec-99'),
+    'https://jellyfin.yourdomain.com/QuickConnect/Connect?Secret=sec-99'
   );
   assert.equal(
-    buildJellyfinQuickConnectAuthUrl('https://jellyfin.flockingreeds.farm/'),
-    'https://jellyfin.flockingreeds.farm/Users/AuthenticateWithQuickConnect'
+    buildJellyfinQuickConnectAuthUrl('https://jellyfin.yourdomain.com/'),
+    'https://jellyfin.yourdomain.com/Users/AuthenticateWithQuickConnect'
   );
   assert.equal(
-    buildJellyfinUsersMeUrl('https://jellyfin.flockingreeds.farm/', 'tok123'),
-    'https://jellyfin.flockingreeds.farm/Users/Me?api_key=tok123'
+    buildJellyfinUsersMeUrl('https://jellyfin.yourdomain.com/', 'tok123'),
+    'https://jellyfin.yourdomain.com/Users/Me?api_key=tok123'
   );
   assert.equal(
-    buildJellyfinUserAudioItemsUrl('https://jellyfin.flockingreeds.farm/', 'uid-42', 'tok123'),
-    'https://jellyfin.flockingreeds.farm/Users/uid-42/Items?IncludeItemTypes=Audio&Recursive=true&Fields=MediaSources,NormalizationGain,Album,Artists&Limit=3000&api_key=tok123'
+    buildJellyfinUserAudioItemsUrl('https://jellyfin.yourdomain.com/', 'uid-42', 'tok123'),
+    'https://jellyfin.yourdomain.com/Users/uid-42/Items?IncludeItemTypes=Audio&Recursive=true&Fields=MediaSources,NormalizationGain,Album,Artists&Limit=3000&api_key=tok123'
   );
   assert.equal(
-    buildJellyfinUserPlaylistsUrl('https://jellyfin.flockingreeds.farm/', 'uid-42', 'tok123'),
-    'https://jellyfin.flockingreeds.farm/Users/uid-42/Items?IncludeItemTypes=Playlist&Recursive=true&api_key=tok123'
+    buildJellyfinUserPlaylistsUrl('https://jellyfin.yourdomain.com/', 'uid-42', 'tok123'),
+    'https://jellyfin.yourdomain.com/Users/uid-42/Items?IncludeItemTypes=Playlist&Recursive=true&api_key=tok123'
   );
   assert.equal(
-    buildJellyfinPlaylistItemsUrl('https://jellyfin.flockingreeds.farm/', 'pl-88', 'uid-42', 'tok123'),
-    'https://jellyfin.flockingreeds.farm/Playlists/pl-88/Items?UserId=uid-42&Fields=MediaSources,NormalizationGain&api_key=tok123'
+    buildJellyfinPlaylistItemsUrl('https://jellyfin.yourdomain.com/', 'pl-88', 'uid-42', 'tok123'),
+    'https://jellyfin.yourdomain.com/Playlists/pl-88/Items?UserId=uid-42&Fields=MediaSources,NormalizationGain&api_key=tok123'
   );
   assert.equal(
-    buildJellyfinGlobalAudioItemsUrl('https://jellyfin.flockingreeds.farm/', 'myKey32'),
-    'https://jellyfin.flockingreeds.farm/Items?IncludeItemTypes=Audio&Recursive=true&Fields=MediaSources,NormalizationGain,Album,Artists&Limit=3000&api_key=myKey32'
+    buildJellyfinGlobalAudioItemsUrl('https://jellyfin.yourdomain.com/', 'myKey32'),
+    'https://jellyfin.yourdomain.com/Items?IncludeItemTypes=Audio&Recursive=true&Fields=MediaSources,NormalizationGain,Album,Artists&Limit=3000&api_key=myKey32'
   );
   assert.equal(
-    buildJellyfinGlobalPlaylistsUrl('https://jellyfin.flockingreeds.farm/', 'myKey32'),
-    'https://jellyfin.flockingreeds.farm/Items?IncludeItemTypes=Playlist&Recursive=true&api_key=myKey32'
+    buildJellyfinGlobalPlaylistsUrl('https://jellyfin.yourdomain.com/', 'myKey32'),
+    'https://jellyfin.yourdomain.com/Items?IncludeItemTypes=Playlist&Recursive=true&api_key=myKey32'
   );
 
   const jfUniversal = buildJellyfinStreamUrl('https://jellyfin.yourdomain.com/', 'item99', 'secretKey', 'user1', false);
@@ -320,15 +320,15 @@ test('isLikelyJellyfinApiKey and matchJellyfinUserFromList support Method A API 
 
   const sampleUsers = [
     { Id: 'u-guest', Name: 'Guest', Policy: { IsAdministrator: false } },
-    { Id: 'u-nicky', Name: 'Nicky', Policy: { IsAdministrator: true } },
+    { Id: 'u-admin', Name: 'AdminUser', Policy: { IsAdministrator: true } },
   ];
-  assert.deepEqual(matchJellyfinUserFromList(sampleUsers, 'nicky'), {
-    id: 'u-nicky',
-    name: 'Nicky',
+  assert.deepEqual(matchJellyfinUserFromList(sampleUsers, 'adminuser'), {
+    id: 'u-admin',
+    name: 'AdminUser',
   });
   assert.deepEqual(matchJellyfinUserFromList(sampleUsers, ''), {
-    id: 'u-nicky',
-    name: 'Nicky',
+    id: 'u-admin',
+    name: 'AdminUser',
   });
 });
 
@@ -411,7 +411,7 @@ test('mergeProvidersPreservingAuth never clears saved auth tokens on offline or 
       name: 'Jellyfin Media Server',
       enabled: true,
       serverUrl: 'https://jf.myhome.net',
-      username: 'nreed',
+      username: 'musicfan',
       token: 'persisted-jf-token-999',
       userId: 'jf-uid-1',
       status: 'connected',
@@ -425,7 +425,7 @@ test('mergeProvidersPreservingAuth never clears saved auth tokens on offline or 
       name: 'Jellyfin Media Server',
       enabled: true,
       serverUrl: 'https://jf.myhome.net',
-      username: 'nreed',
+      username: 'musicfan',
       token: '', // Empty token from failed/partial response must NOT overwrite saved token
       userId: '',
       status: 'connected',

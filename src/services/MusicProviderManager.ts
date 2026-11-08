@@ -959,7 +959,7 @@ export class MusicProviderManager {
 
     if (!cleanUrl) {
       const msg =
-        '❌ Missing Server URL. Enter your Jellyfin URL (e.g., https://jellyfin.flockingreeds.farm).';
+        '❌ Missing Server URL. Enter your Jellyfin URL (e.g., https://jellyfin.yourdomain.com).';
       return {
         updatedConfig: {
           ...config,

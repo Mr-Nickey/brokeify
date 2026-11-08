@@ -1,10 +1,12 @@
 import React, { useState } from 'react';
 import {
   AlertCircle,
+  ArrowDownToLine,
   CheckCircle2,
   Cloud,
   CloudDownload,
   CloudUpload,
+  Database,
   Eye,
   EyeOff,
   HardDrive,
@@ -14,6 +16,7 @@ import {
   Plus,
   Radio,
   RefreshCw,
+  Save,
   Server,
   ShieldCheck,
   Terminal,
@@ -22,6 +25,7 @@ import {
 } from 'lucide-react';
 import type {
   BrokeifyCloudSettings,
+  BrokeifyServerIntegrations,
   CloudSyncStatus,
   Playlist,
   ProviderConfig,
@@ -44,6 +48,10 @@ interface SourcesHubViewProps {
   onApplyRestoredCloudSettings: (settings: BrokeifyCloudSettings) => void;
   onOpenOnboardingModal?: () => void;
   onLogoutProvider?: (type: ProviderType) => Promise<void>;
+  serverIntegrations?: BrokeifyServerIntegrations;
+  serverConfigPath?: string;
+  onUpdateServerIntegrations?: (next: BrokeifyServerIntegrations) => void;
+  onSaveServerConfigNow?: () => Promise<void>;
 }
 
 const RADIO_TAGS = [
@@ -67,6 +75,10 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
   onApplyRestoredCloudSettings,
   onOpenOnboardingModal,
   onLogoutProvider,
+  serverIntegrations,
+  serverConfigPath = '/app/data/config.json',
+  onUpdateServerIntegrations,
+  onSaveServerConfigNow,
 }) => {
   const [testingId, setTestingId] = useState<string | null>(null);
   const [selectedRadioTag, setSelectedRadioTag] = useState<string>('rock');
@@ -80,6 +92,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
   );
   const [confirmingLogoutType, setConfirmingLogoutType] =
     useState<ProviderType | null>(null);
+  const [isSavingConfigFile, setIsSavingConfigFile] = useState<boolean>(false);
 
   const jellyfinProvider =
     providers.find((p) => p.type === 'jellyfin') || providers[0];
@@ -589,6 +602,177 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
 
   return (
     <div className="space-y-8">
+      {/* Section 0: Persistent Docker Server Storage (/app/data/config.json) + slskd & ListenBrainz Keys + 1-Click Backup */}
+      {serverIntegrations && onUpdateServerIntegrations && (
+        <section
+          aria-labelledby="docker-config-heading"
+          data-testid="docker-persistent-config-section"
+          className="rounded-2xl border border-emerald-500/40 bg-zinc-900/60 p-5 sm:p-6 space-y-5"
+        >
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-zinc-800/80 pb-4">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2.5">
+                <Database className="w-5 h-5 text-[#00ff66] shrink-0" />
+                <h2
+                  id="docker-config-heading"
+                  className="text-lg font-bold text-white tracking-tight font-mono"
+                >
+                  Persistent Server Storage ({serverConfigPath}) &amp; Explo Replacement Keys
+                </h2>
+              </div>
+              <p className="text-xs text-zinc-300">
+                All settings, Jellyfin tokens, <code className="text-[#00ff66]">slskd</code> credentials,{' '}
+                <code className="text-purple-300">ListenBrainz</code> tokens, and custom playlists are saved directly on your server in{' '}
+                <code className="text-[#00ff66]">{serverConfigPath}</code> so every device opening{' '}
+                <code className="text-[#00ff66]">your Brokeify domain</code> is logged in automatically.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+              <a
+                href="/api/config/backup"
+                download="config.json"
+                data-testid="download-config-backup-btn"
+                className="inline-flex items-center gap-2 rounded-xl border border-emerald-500/50 bg-emerald-500/15 hover:bg-emerald-500/25 px-4 py-2 text-xs font-mono font-bold text-[#00ff66] transition-colors whitespace-nowrap min-h-[40px]"
+              >
+                <ArrowDownToLine className="w-4 h-4" />
+                <span>Download config.json Backup</span>
+              </a>
+
+              {onSaveServerConfigNow && (
+                <button
+                  type="button"
+                  disabled={isSavingConfigFile}
+                  onClick={async () => {
+                    setIsSavingConfigFile(true);
+                    try {
+                      await onSaveServerConfigNow();
+                    } finally {
+                      setIsSavingConfigFile(false);
+                    }
+                  }}
+                  data-testid="save-server-config-btn"
+                  className="inline-flex items-center gap-2 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-4 py-2 text-xs font-mono font-bold text-zinc-950 transition-colors whitespace-nowrap min-h-[40px]"
+                >
+                  {isSavingConfigFile ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Save className="w-4 h-4" />
+                  )}
+                  <span>Save to config.json</span>
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {/* slskd Configuration Card */}
+            <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-mono font-bold uppercase text-[#00ff66]">
+                  1. slskd Downloader Engine (Replaces Explo)
+                </span>
+                <span className="text-[10px] font-mono text-zinc-400">
+                  POST /api/v0/searches + /transfers/downloads
+                </span>
+              </div>
+
+              <div className="space-y-2.5">
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1">
+                    slskd Internal Docker / LAN URL
+                  </label>
+                  <input
+                    type="text"
+                    value={serverIntegrations.slskdUrl ?? ''}
+                    onChange={(e) =>
+                      onUpdateServerIntegrations({
+                        ...serverIntegrations,
+                        slskdUrl: e.target.value,
+                      })
+                    }
+                    placeholder="http://slskd:5030 or http://192.168.1.x:5030"
+                    data-testid="input-slskd-url"
+                    className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1">
+                    slskd API Key (X-API-Key)
+                  </label>
+                  <input
+                    type="password"
+                    value={serverIntegrations.slskdApiKey ?? ''}
+                    onChange={(e) =>
+                      onUpdateServerIntegrations({
+                        ...serverIntegrations,
+                        slskdApiKey: e.target.value,
+                      })
+                    }
+                    placeholder="Enter slskd API key..."
+                    data-testid="input-slskd-apikey"
+                    className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* ListenBrainz Configuration Card */}
+            <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-mono font-bold uppercase text-purple-300">
+                  2. ListenBrainz Weekly Exploration &amp; Scrobbler
+                </span>
+                <span className="text-[10px] font-mono text-zinc-400">
+                  playing_now + single scrobbles
+                </span>
+              </div>
+
+              <div className="space-y-2.5">
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1">
+                    ListenBrainz Username
+                  </label>
+                  <input
+                    type="text"
+                    value={serverIntegrations.listenbrainzUsername ?? ''}
+                    onChange={(e) =>
+                      onUpdateServerIntegrations({
+                        ...serverIntegrations,
+                        listenbrainzUsername: e.target.value,
+                      })
+                    }
+                    placeholder="your-listenbrainz-username"
+                    data-testid="input-listenbrainz-username"
+                    className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1">
+                    ListenBrainz User Token (for Automatic Scrobbling)
+                  </label>
+                  <input
+                    type="password"
+                    value={serverIntegrations.listenbrainzToken ?? ''}
+                    onChange={(e) =>
+                      onUpdateServerIntegrations({
+                        ...serverIntegrations,
+                        listenbrainzToken: e.target.value,
+                      })
+                    }
+                    placeholder="Enter ListenBrainz User Token..."
+                    data-testid="input-listenbrainz-token"
+                    className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
       {/* Section 1: Active Music Sources (Only active connectors are shown; others stay hidden until activated) */}
       <section
         aria-labelledby="active-connectors-heading"

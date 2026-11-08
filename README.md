@@ -2,14 +2,14 @@
 
 <img src="./public/pwa-192x192.png" alt="Brokeify Logo" width="110" height="110" />
 
-# Brokeify
+# Brokeify (Docker Full-Stack Edition)
 
 **Because $11.99 a month is highway robbery.**  
-*Powered by spite, hard drives, and a '99 retro stereo deck.*
+*Self-hosted Jellyfin car stereo, ListenBrainz discovery engine & automated `slskd` downloader — powered by spite, hard drives, and a '99 retro deck.*
 
-[![Self-Hosted Music](https://img.shields.io/badge/Self--Hosted-Jellyfin%20%7C%20Navidrome%20%7C%20Emby%20%7C%20Plex-00ff66?style=for-the-badge&logo=jellyfin&logoColor=black)](https://github.com/Mr-Nickey/brokeify)
+[![Docker Ready](https://img.shields.io/badge/Docker%20%26%20Dockge-Port%203487-00ff66?style=for-the-badge&logo=docker&logoColor=black)](https://github.com/Mr-Nickey/brokeify)
+[![Self-Hosted Music](https://img.shields.io/badge/Self--Hosted-Jellyfin%20%2B%20slskd%20%2B%20ListenBrainz-38bdf8?style=for-the-badge&logo=jellyfin&logoColor=black)](https://github.com/Mr-Nickey/brokeify)
 [![Built with Google AI Studio](https://img.shields.io/badge/Built%20With-Google%20AI%20Studio-a855f7?style=for-the-badge&logo=google&logoColor=white)](https://aistudio.google.com/)
-[![Cloudflare Pages Ready](https://img.shields.io/badge/Deploy-Cloudflare%20Pages-f59e0b?style=for-the-badge&logo=cloudflare&logoColor=black)](https://pages.cloudflare.com/)
 
 <br />
 
@@ -21,90 +21,128 @@
 
 ## 🎧 What is Brokeify?
 
-**Brokeify** is a fast, zero-subscription, self-hosted web music player and car-ready stereo deck designed first and foremost for **Jellyfin** (with optional connectors for **Navidrome / Subsonic**, **Emby**, and **Plex**).
+**Brokeify** is a self-hosted, Docker-ready full-stack music player and automated discovery/downloader hub (React/Vite frontend + Express/Node.js backend in `server.js`) designed to run under a single domain (like `https://music.yourdomain.com`) and **completely replace Explo**.
 
-It was built to solve real-world annoyances when streaming your own music library on the road:
-- **Loud FLACs next to quiet 240kbps MP3s?** Brokeify has an **Aggressive FLAC/MP3 Volume Stabilizer** (5-band EQ + heavy-duty compressor + LUFS preamp) so you stop reaching for your car volume knob every 3 minutes.
-- **Downloader grabbed 4 copies of the same song with weird tags?** Brokeify's **Smart Anti-Repeat & Duplicate Song Guard** fingerprints song titles/artists, strips out `(Radio Version)` / `(feat. ...)` / `- Artist` suffixes, picks the cleanest copy, and guarantees the same song **never plays back-to-back**.
-- **Spotty cell reception on rural highways?** Brokeify includes a **6s–15s Proactive Stream Buffer** plus an **IndexedDB Offline Vault** that automatically pre-downloads the next **2 to 12 tracks** ahead in your queue.
-- **Ugly auto-imported server playlist names?** Rename any playlist inside Brokeify while still displaying the **Real Server Playlist Name** right underneath it.
+### Why Brokeify Exists:
+- **Zero-Login Persistent Server Config (`/app/data/config.json`):** Configure your Jellyfin, `slskd`, and `ListenBrainz` credentials once. Every phone, tablet, or desktop that opens your Brokeify URL loads `/api/config` from `/app/data/config.json` automatically—plus a 1-click **`Download config.json Backup`** button in Settings.
+- **Replaces Explo (`Request / Discover` Tab):**
+  - Search any **Artist, Album, or Song** via MusicBrainz (`GET /api/musicbrainz/search` + exact album tracklists).
+  - Browse your **ListenBrainz** `"Created For You"` mixes (**Weekly Exploration**, **Weekly Jams**, **Daily Jams**) and see which songs are already in Jellyfin vs. missing.
+  - Click **"Grab Full Album"** or **"Download Missing Playlist Tracks"** — the Node.js backend searches your local `slskd` instance (`POST /api/v0/searches`), picks the best peer with `hasFreeUploadSlot: true` (preferring **FLAC** or **320kbps MP3**), queues the downloads, watches `GET /api/v0/transfers/downloads` in the background, and automatically triggers `POST /Library/Refresh` on Jellyfin the instant it finishes (`"Linkin Park - Hybrid Theory is ready to play!"`).
+- **Delete Duplicate Files Directly from Jellyfin's Hard Drive:**
+  - Noticed duplicate tracks downloaded over time? Click the **`🗑️` Delete** button on any song row to call `DELETE /api/jellyfin/items/:id` and permanently remove the duplicate from your server's disk, while **Smart Anti-Repeat** guarantees the same song never plays back-to-back.
+- **Built for Driving & Variable Mobile Data:**
+  - **Aggressive FLAC / MP3 Volume Stabilizer** (5-band EQ + heavy-duty compressor + LUFS preamp) so loud FLACs and quiet 240kbps MP3s play at the same volume.
+  - **Seamless Crossfade (0s–12s)** + **6s Proactive Stream Buffer** + **IndexedDB Offline Vault (2–12 Tracks)** + **Android Auto / Car Mode**.
 
 ---
 
 ## 🤖 Full Transparency: Coded with Google AI Studio
 
-If you peek around the repo or commit history, you'll notice **Google AI Studio** fingerprints all over it—and there's zero hiding that!
+If you peek around the repo or commit history, you'll see **Google AI Studio** all over it—and there's zero hiding that!
 
-This project was vibe-coded and iterated inside **Google AI Studio** by someone who wanted a custom, nostalgic late-'90s stereo deck that actually works smoothly in the car, over Cloudflare Pages, connected to a home Jellyfin server.
+This project was vibe-coded and iterated inside **Google AI Studio** to build a custom, nostalgic late-'90s stereo deck and homelab music stack that works the exact way the author wanted in the car and at home.
 
 > **Friendly Disclaimer:**  
-> If you enjoy tinkering with AI-built tools, awesome—clone it, fork it, break it, and have fun!  
-> If you're someone who strongly prefers 100% hand-artisanal, organic, free-range human code and can't stand AI-generated repos, **no hard feelings at all—you definitely don't have to use it!** ❤️ Keep scrolling, enjoy your music however you play it, and have a great drive.
+> If you enjoy tinkering with AI-built homelab tools, awesome—pull the container, fork it, break it, and have fun!  
+> If you prefer 100% hand-crafted, organic, artisanal human code and don't like AI-coded apps, **no hard feelings at all—you definitely don't have to use it!** ❤️ Grab a coffee, enjoy your own setup, and have a great drive.
 
 ---
 
-## ✨ Key Features
+## 🐳 How to Install with Dockge or Docker Compose (Conflict-Free Port `3487`)
 
-| Feature | What It Does |
-| :--- | :--- |
-| ⚡ **Jellyfin Quick Connect** | Log in with a 6-digit Quick Connect code or standard username & password—no hunting for API keys required. |
-| 🛡️ **Smart Anti-Repeat & Duplicate Guard** | Detects duplicate downloads of the same song (even when one copy has artist `"a"` and title `"Song (Radio Version) - Artist"`), collapses duplicates, and **never plays the same song back-to-back**. |
-| 🏷️ **Playlist Renaming + Real Name Display** | Give any playlist a clean custom display name while always showing its **Real Name** from your Jellyfin server right on the card. |
-| 🔊 **Aggressive FLAC / MP3 Volume Stabilizer** | Balances booming lossless FLAC files and quiet legacy MP3 files using a Web Audio API compressor + format-aware preamp + 5-band Equalizer (`Car Stereo`, `Bass Boost`, `Rock`, `Vocal`, `Late Night`). |
-| 🌊 **Seamless Crossfade (0s–12s)** | Dual-deck equal-power crossfader so songs blend smoothly without dead air while driving. |
-| 📡 **Proactive Stream Buffer (2s–15s)** | Waits for a solid 6-second audio cushion (default) before unpausing on variable mobile data so songs never sound like a skipping FM radio. |
-| 💾 **Dead-Zone Offline Queue Vault (2–12 Tracks)** | Uses `navigator.storage.persist()` + IndexedDB (`brokeify-offline-vault`) to cache upcoming tracks or entire playlists for offline playback—no `.apk` compilation needed. |
-| 🚗 **Car Mode & Android Auto MediaSession** | Giant touch targets for driving plus native Android Auto / Bluetooth lock-screen **Skip Song** (`nexttrack`) and **Previous Song** (`previoustrack`) controls showing clean Track & Artist metadata. |
-| 🎨 **6 Retro Dark & Light Skins** | Switch between **Cyber Deck '99**, **Classic Slate**, **Midnight Amber**, **Cobalt Studio**, **Platinum Daylight**, and **Warm Paper** in Settings. |
-| ☁️ **Zero-Logout Jellyfin Cloud Sync** | Automatically backs up and restores your EQ, Stabilizer, Crossfade, Visual Skin, and custom playlist names to your Jellyfin server (`/DisplayPreferences/brokeify`). |
+Every homelab already has a dozen services fighting over ports `3000` (Grafana / Uptime Kuma / Gitea), `5001` (Dockge), `5030` (slskd), `8080` (qBittorrent / SABnzbd), `8096` (Jellyfin), and `4533` (Navidrome).
 
----
+To make sure Brokeify **never collides with anything in your homelab**, Brokeify maps host port **`3487`** → container port `3000` (`3487:3000`).
 
-## 🚀 How to Use Brokeify
+### Option A: 1-Minute Setup in Dockge (Connected Directly to GitHub)
 
-### 1. Connect Your Jellyfin Server
-1. Open Brokeify (or click **Settings ⚙️ → Manage Providers**).
-2. Enter your Jellyfin Server URL (for example, `https://jellyfin.yourdomain.com`).
-3. Choose **⚡ Quick Connect** (enter the 6-digit code in your Jellyfin app under *Settings → Quick Connect*) **or** sign in with your **Username & Password**.
-4. Brokeify will immediately load your audio library and playlists and disable any demo placeholders.
+1. Open **Dockge** in your homelab and click **+ Compose**.
+2. Set the Stack Name to `brokeify`.
+3. Paste the following into the `compose.yaml` editor on the right:
 
-### 2. Rename Playlists (While Keeping the Real Server Name)
-1. On the **Library → Playlists** tab, every playlist card displays both your **Custom Display Name** and a `Real Name:` badge showing the original server name.
-2. Click the **Pencil (`✏️`)** button on any playlist card to rename it.
-3. Click **Save** (`✓`), or click the **Reset (`↺`)** button anytime to revert back to the original server name.
-
-### 3. Keep Duplicate Songs from Playing Back-to-Back
-- **Smart Anti-Repeat** is **ON by default**.
-- You can toggle it anytime in **Now Playing → `No Back-to-Back: ON`** or in **Settings → Audio Lab, EQ & Offline Vault → Smart Anti-Repeat & Duplicate Song Guard**.
-
-### 4. Download Playlists for Offline Driving (No APK Needed!)
-- Click the **Download (`⬇️`)** button on any playlist card to save every track into your browser's persistent IndexedDB Offline Vault (`brokeify-offline-vault`).
-- On Android / Pixel phones: open your deployed Brokeify URL in Chrome, tap **⋮ → Add to Home screen → Install app**, and Android will install Brokeify with its custom emerald icon and up to 60% of free device storage for offline playlists.
-
----
-
-## 🛠️ Local Development & Cloudflare Pages Deployment
-
-### Run Locally
-```bash
-# 1. Install dependencies
-npm install
-
-# 2. Start the development server on port 3000
-npm run dev
-
-# 3. Run unit tests
-npx tsx --test src/utils/musicLogic.test.ts
+```yaml
+services:
+  brokeify:
+    build: https://github.com/Mr-Nickey/brokeify.git#main
+    container_name: brokeify
+    restart: unless-stopped
+    ports:
+      - "3487:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+    volumes:
+      - ./data:/app/data
 ```
 
-### Deploy to Cloudflare Pages (via GitHub)
-1. Push this repository to GitHub (`https://github.com/Mr-Nickey/brokeify`).
-2. In the **Cloudflare Dashboard**, go to **Workers & Pages → Create → Pages → Connect to Git**.
-3. Select your `brokeify` repository and use these build settings:
-   - **Framework preset:** `Vite`
-   - **Build command:** `npm run build`
-   - **Build output directory:** `dist`
-4. Attach your custom domain (e.g., `music.yourdomain.com`) under **Custom Domains**.
+4. Click **Deploy** (and whenever you push updates to GitHub, just click **Update / Rebuild** in Dockge!).
+5. Open `http://<your-server-ip>:3487` (or point your Cloudflare Tunnel / Nginx Proxy Manager / Caddy domain `https://music.yourdomain.com` to `http://<your-server-ip>:3487`).
+
+---
+
+### Option B: Standard `docker compose` via Terminal
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/Mr-Nickey/brokeify.git
+cd brokeify
+
+# 2. Build and start the container in the background
+docker compose up -d --build
+
+# 3. View logs
+docker compose logs -f brokeify
+```
+
+Your persistent configuration and playlists will be stored safely in `./data/config.json` (mounted to `/app/data/config.json` inside the container).
+
+---
+
+## ⚙️ First-Run Setup & How to Use Everything
+
+### 1. Connect Jellyfin (Quick Connect or Username/Password)
+1. Open Brokeify at `https://music.yourdomain.com` (or `http://<server-ip>:3487`).
+2. On the welcome modal (or **Settings ⚙️ → Manage Providers**), enter your Jellyfin URL (e.g. `https://jellyfin.yourdomain.com` or internal `http://jellyfin:8096`).
+3. Authenticate with **⚡ Quick Connect** or **Username & Password**.
+4. Brokeify immediately saves your token to `/app/data/config.json`. Any other device you open Brokeify on will automatically load your library and playlists without asking you to log in again!
+
+### 2. Configure `slskd` & `ListenBrainz` (Replaces Explo)
+1. Go to **Settings ⚙️ → Sources Hub**.
+2. At the top card (**`Persistent Server Storage (/app/data/config.json) & Explo Replacement Keys`**):
+   - **slskd Internal Docker / LAN URL:** e.g., `http://slskd:5030` or `http://192.168.1.50:5030`
+   - **slskd API Key (`X-API-Key`):** Paste your `slskd` API key from your `slskd.yml` config.
+   - **ListenBrainz Username:** Enter your ListenBrainz username (e.g., `your-listenbrainz-username`).
+   - **ListenBrainz User Token:** Paste your token from `https://listenbrainz.org/settings/` to enable automatic `playing_now` and `single` listen scrobbling.
+3. Click **`Save to config.json`** (and click **`Download config.json Backup`** anytime you want a local backup file).
+
+### 3. Grab Full Albums, Missing Weekly Exploration Tracks & Auto-Import to Jellyfin
+1. Click the **`Request / Discover`** tab in the top navigation bar.
+2. **Search MusicBrainz:** Search for any Album or Song, click **View Tracklist** to inspect the exact tracks, and click **`Grab Full Album`** or **`Grab Track`**.
+3. **ListenBrainz Weekly Exploration:** Switch to **`ListenBrainz Weekly Exploration`**, view your personalized mixes, and click **`Download Missing Playlist Tracks`**.
+4. **Automatic Jellyfin Import:** Brokeify's backend watches `GET /api/v0/transfers/downloads` in `slskd`. The moment the files finish downloading, Brokeify sends `POST /Library/Refresh` to Jellyfin and pops up a green banner:
+   > **`🎉 Linkin Park - Hybrid Theory is ready to play! [Sync & Play Now ▶]`**
+
+### 4. Rename Playlists (While Keeping the Real Server Name) & Delete Duplicates
+- **Rename Playlists:** On **Library → Playlists**, click the **Pencil (`✏️`)** icon on any playlist card to give it a custom display name. The card will always display both your custom name and `Real Name: <original server name>`.
+- **Delete Duplicate Songs from Disk:** On **Library → Songs**, click the **Trash (`🗑️`)** button on any duplicate track and confirm **`Delete File`** to call `DELETE /api/jellyfin/items/:id` and remove it from your Jellyfin server.
+
+---
+
+## 🔌 Backend API Reference (`server.js`)
+
+| Endpoint | Method | Description |
+| :--- | :---: | :--- |
+| `/api/config` | `GET` / `POST` | Reads and writes persistent server configuration (`/app/data/config.json`). |
+| `/api/config/backup` | `GET` | Downloads a timestamped `config.json` backup file. |
+| `/api/jellyfin/items/:id` | `DELETE` | Calls Jellyfin `DELETE /Items/:id` to permanently delete duplicate tracks from disk. |
+| `/api/jellyfin/refresh` | `POST` | Triggers `POST /Library/Refresh` on your Jellyfin server. |
+| `/api/listenbrainz/discover` | `GET` | Fetches ListenBrainz `createdfor` playlists (`Weekly Exploration`, `Weekly Jams`) and cross-checks tracks against Jellyfin. |
+| `/api/listenbrainz/scrobble` | `POST` | Submits `playing_now` and `single` listens to ListenBrainz. |
+| `/api/musicbrainz/search` | `GET` | Searches MusicBrainz for albums (`release-group`) or songs (`recording`). |
+| `/api/musicbrainz/album/:id` | `GET` | Resolves the official release tracklist for a MusicBrainz album. |
+| `/api/slskd/grab` | `POST` | Searches `slskd`, selects the best peer with `hasFreeUploadSlot: true` (FLAC / 320kbps MP3), and queues downloads. |
+| `/api/slskd/status` | `GET` | Returns active `slskd` download progress and completed Jellyfin import notifications. |
 
 ---
 
@@ -119,5 +157,5 @@ npx tsx --test src/utils/musicLogic.test.ts
 ---
 
 <div align="center">
-  <sub>Built with spite, hard drives, and Google AI Studio · 100% Free · Zero Subscriptions Forever</sub>
+  <sub>Built with spite, hard drives, and Google AI Studio · Self-Hosted on Docker · Zero Subscriptions Forever</sub>
 </div>

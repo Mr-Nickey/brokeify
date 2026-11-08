@@ -143,3 +143,108 @@ export interface CloudSyncStatus {
   lastSyncedAt: string | null;
   message: string;
 }
+
+export interface BrokeifyServerIntegrations {
+  jellyfinUrl: string;
+  jellyfinToken: string;
+  jellyfinUserId: string;
+  jellyfinUsername?: string;
+  slskdUrl: string;
+  slskdApiKey: string;
+  listenbrainzUsername: string;
+  listenbrainzToken: string;
+}
+
+export interface BrokeifyServerConfig {
+  version: number;
+  updatedAt: string;
+  integrations: BrokeifyServerIntegrations;
+  audioPrefs: BrokeifyAudioPreferences;
+  providers: ProviderConfig[];
+  playlists: Playlist[];
+  customPlaylistNames?: Record<string, string>;
+  pinnedPlaylistId?: string | null;
+}
+
+export interface ListenBrainzDiscoverTrack {
+  id: string;
+  title: string;
+  artist: string;
+  album: string;
+  durationMs: number;
+  inLibrary: boolean;
+  jellyfinTrackId: string | null;
+}
+
+export interface ListenBrainzDiscoverPlaylist {
+  id: string;
+  title: string;
+  annotation: string;
+  date: string;
+  trackCount: number;
+  inLibraryCount: number;
+  missingCount: number;
+  tracks: ListenBrainzDiscoverTrack[];
+}
+
+export interface MusicBrainzSearchResult {
+  id: string;
+  type: 'album' | 'track';
+  title: string;
+  artist: string;
+  album: string;
+  year: string;
+  coverUrl: string;
+  durationSec?: number;
+  primaryType?: string;
+}
+
+export interface MusicBrainzAlbumTrack {
+  id: string;
+  number: string;
+  title: string;
+  artist: string;
+  album: string;
+  durationSec: number;
+}
+
+export interface MusicBrainzAlbumDetail {
+  id: string;
+  releaseId?: string;
+  title: string;
+  artist: string;
+  year?: string;
+  coverUrl?: string;
+  tracks: MusicBrainzAlbumTrack[];
+}
+
+export interface SlskdGrabJob {
+  id: string;
+  type: 'album' | 'track' | 'playlist';
+  label: string;
+  artist: string;
+  title: string;
+  searchText: string;
+  status: 'searching' | 'queued' | 'downloading' | 'completed' | 'failed';
+  message: string;
+  matchedPeer: string | null;
+  matchedFormat: string | null;
+  files: Array<{
+    filename: string;
+    size: number;
+    username: string;
+    completed: boolean;
+  }>;
+  createdAt: string;
+  completedAt: string | null;
+  error?: string;
+}
+
+export interface SlskdReadyNotification {
+  id: string;
+  jobId: string;
+  label: string;
+  message: string;
+  completedAt: string;
+}
+

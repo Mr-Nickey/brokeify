@@ -296,7 +296,7 @@ export const BrokeifyOnboardingModal: React.FC<BrokeifyOnboardingModalProps> = (
     const url = (activeProviderConfig?.serverUrl ?? '').trim();
     if (!url) {
       setQcError(
-        'Please enter your Jellyfin Server URL first (e.g., https://jellyfin.flockingreeds.farm).'
+        'Please enter your Jellyfin Server URL first (e.g., https://jellyfin.yourdomain.com).'
       );
       return;
     }
@@ -718,7 +718,7 @@ export const BrokeifyOnboardingModal: React.FC<BrokeifyOnboardingModalProps> = (
                     updateProviderField('jellyfin', 'serverUrl', e.target.value);
                     setPingStatus(null);
                   }}
-                  placeholder="https://jellyfin.flockingreeds.farm"
+                  placeholder="https://jellyfin.yourdomain.com"
                   className="flex-1 rounded-xl border border-zinc-800 bg-zinc-950 px-3.5 py-2.5 text-sm text-white placeholder-zinc-500 focus:border-emerald-500 focus:outline-none font-mono"
                 />
 

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDownToLine,
   Car,
@@ -11,6 +11,7 @@ import {
   CheckCircle2,
   ChevronUp,
   Coffee,
+  Compass,
   Database,
   Disc,
   Gauge,
@@ -40,6 +41,7 @@ import {
   Sparkles,
   Star,
   Sun,
+  Trash2,
   Users,
   Volume2,
   VolumeX,
@@ -51,6 +53,7 @@ import { SlidingToggle } from './components/SlidingToggle';
 import { SourcesHubView } from './components/SourcesHubView';
 import { SpotifyImporterView } from './components/SpotifyImporterView';
 import { AudioLabVaultView } from './components/AudioLabVaultView';
+import { RequestDiscoverView } from './components/RequestDiscoverView';
 import { CarModeOverlay } from './components/CarModeOverlay';
 import { NowPlayingDrawer } from './components/NowPlayingDrawer';
 import { BrokeifyOnboardingModal } from './components/BrokeifyOnboardingModal';
@@ -59,10 +62,13 @@ import { useAudioEngine } from './hooks/useAudioEngine';
 import { MusicProviderManager } from './services/MusicProviderManager';
 import type {
   BrokeifyCloudSettings,
+  BrokeifyServerIntegrations,
   CloudSyncStatus,
   Playlist,
   ProviderConfig,
   ProviderType,
+  SlskdGrabJob,
+  SlskdReadyNotification,
   Track,
 } from './types/music';
 import {
@@ -75,7 +81,7 @@ import {
 import { preloadTrackToVault } from './utils/offlineVault';
 import { createAlbumArtworkDataUri } from './utils/artworkGenerator';
 
-type CoreTab = 'library' | 'nowplaying' | 'settings';
+type CoreTab = 'library' | 'discover' | 'nowplaying' | 'settings';
 type LibrarySubTab = 'playlists' | 'songs' | 'albums' | 'artists';
 type SettingsSectionTab = 'sources' | 'audiolab' | 'spotify';
 
@@ -198,7 +204,101 @@ export default function App() {
   const [editingPlaylistNameInput, setEditingPlaylistNameInput] =
     useState<string>('');
 
-  // Call navigator.storage.persist() on app startup and auto-sync Jellyfin if credentials exist
+  // Server-Side Persistent Storage (/app/data/config.json) & slskd / ListenBrainz State
+  const [serverConfigPath, setServerConfigPath] = useState<string>(
+    '/app/data/config.json'
+  );
+  const [serverIntegrations, setServerIntegrations] =
+    useState<BrokeifyServerIntegrations>({
+      jellyfinUrl: '',
+      jellyfinToken: '',
+      jellyfinUserId: '',
+      jellyfinUsername: '',
+      slskdUrl: 'http://slskd:5030',
+      slskdApiKey: '',
+      listenbrainzUsername: '',
+      listenbrainzToken: '',
+    });
+  const [slskdJobs, setSlskdJobs] = useState<SlskdGrabJob[]>([]);
+  const [readyNotifications, setReadyNotifications] = useState<
+    SlskdReadyNotification[]
+  >([]);
+  const [confirmDeleteTrackId, setConfirmDeleteTrackId] = useState<
+    string | null
+  >(null);
+  const [deletingTrackId, setDeletingTrackId] = useState<string | null>(null);
+  const hasLoadedServerConfigRef = useRef<boolean>(false);
+  const scrobbledTrackIdsRef = useRef<Set<string>>(new Set());
+
+  // Sync Jellyfin library helper
+  const syncJellyfinProvider = (jfProv: ProviderConfig) => {
+    if (
+      !jfProv ||
+      !jfProv.enabled ||
+      !jfProv.serverUrl?.trim() ||
+      (!jfProv.token?.trim() && !jfProv.password?.trim())
+    ) {
+      return;
+    }
+    MusicProviderManager.fetchJellyfinMusic(jfProv).then(
+      ({ updatedConfig, tracks, playlists: syncedPlaylists }) => {
+        if (updatedConfig.status === 'connected') {
+          setProviders((prev) => {
+            const next = prev.map((p) => {
+              if (p.id === updatedConfig.id) return updatedConfig;
+              if (tracks.length > 0 && p.type === 'built-in') {
+                return { ...p, enabled: false };
+              }
+              return p;
+            });
+            MusicProviderManager.saveProviders(next);
+            return next;
+          });
+          if (tracks.length > 0) {
+            setRemoteTracks((prev) => {
+              const map = new Map<string, Track>();
+              for (const t of prev) map.set(t.id, t);
+              for (const t of tracks) map.set(t.id, t);
+              const updated = Array.from(map.values());
+              MusicProviderManager.saveCachedRemoteTracks(updated);
+              return updated;
+            });
+          }
+          if (syncedPlaylists.length > 0) {
+            setPlaylists((prev) => {
+              const customNames =
+                MusicProviderManager.loadCustomPlaylistNames();
+              const updated = mergePlaylistsPreservingCustomNames(
+                prev,
+                syncedPlaylists,
+                customNames
+              );
+              MusicProviderManager.savePlaylists(updated);
+              return updated;
+            });
+            setPinnedPlaylistId((prevPin) => {
+              if (
+                !prevPin ||
+                prevPin === 'pl-night-drive' ||
+                prevPin === 'pl-spite-anthem'
+              ) {
+                const nextPin = syncedPlaylists[0].id;
+                try {
+                  localStorage.setItem(PINNED_PLAYLIST_STORAGE_KEY, nextPin);
+                } catch {
+                  // ignore
+                }
+                return nextPin;
+              }
+              return prevPin;
+            });
+          }
+        }
+      }
+    );
+  };
+
+  // Call navigator.storage.persist() on app startup, load /api/config from server, and auto-sync Jellyfin
   useEffect(() => {
     let mounted = true;
     MusicProviderManager.ensurePersistentStorage().then((res) => {
@@ -207,72 +307,92 @@ export default function App() {
       }
     });
 
-    const initialProviders = MusicProviderManager.loadProviders();
-    const jfProv = initialProviders.find((p) => p.type === 'jellyfin');
-    if (
-      jfProv &&
-      jfProv.enabled &&
-      jfProv.serverUrl?.trim() &&
-      (jfProv.token?.trim() || jfProv.password?.trim())
-    ) {
-      MusicProviderManager.fetchJellyfinMusic(jfProv).then(
-        ({ updatedConfig, tracks, playlists: syncedPlaylists }) => {
-          if (!mounted) return;
-          if (updatedConfig.status === 'connected') {
-            setProviders((prev) => {
-              const next = prev.map((p) => {
-                if (p.id === updatedConfig.id) return updatedConfig;
-                if (tracks.length > 0 && p.type === 'built-in') {
-                  return { ...p, enabled: false };
-                }
-                return p;
-              });
-              MusicProviderManager.saveProviders(next);
-              return next;
-            });
-            if (tracks.length > 0) {
-              setRemoteTracks((prev) => {
-                const map = new Map<string, Track>();
-                for (const t of prev) map.set(t.id, t);
-                for (const t of tracks) map.set(t.id, t);
-                const updated = Array.from(map.values());
-                MusicProviderManager.saveCachedRemoteTracks(updated);
-                return updated;
-              });
-            }
-            if (syncedPlaylists.length > 0) {
-              setPlaylists((prev) => {
-                const customNames =
-                  MusicProviderManager.loadCustomPlaylistNames();
-                const updated = mergePlaylistsPreservingCustomNames(
-                  prev,
-                  syncedPlaylists,
-                  customNames
-                );
-                MusicProviderManager.savePlaylists(updated);
-                return updated;
-              });
-              setPinnedPlaylistId((prevPin) => {
-                if (
-                  !prevPin ||
-                  prevPin === 'pl-night-drive' ||
-                  prevPin === 'pl-spite-anthem'
-                ) {
-                  const nextPin = syncedPlaylists[0].id;
-                  try {
-                    localStorage.setItem(PINNED_PLAYLIST_STORAGE_KEY, nextPin);
-                  } catch {
-                    // ignore
-                  }
-                  return nextPin;
-                }
-                return prevPin;
-              });
-            }
-          }
+    // 1. Load persistent server-side /api/config (/app/data/config.json) so any device opening Brokeify is logged in immediately
+    fetch('/api/config')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!mounted || !data?.ok || !data.config) {
+          hasLoadedServerConfigRef.current = true;
+          const localProvs = MusicProviderManager.loadProviders();
+          const jfLocal = localProvs.find((p) => p.type === 'jellyfin');
+          if (jfLocal) syncJellyfinProvider(jfLocal);
+          return;
         }
-      );
-    }
+
+        if (data.configPath) {
+          setServerConfigPath(data.configPath);
+        }
+        const srv = data.config;
+        if (srv.integrations) {
+          setServerIntegrations((prev) => ({
+            ...prev,
+            ...srv.integrations,
+            listenbrainzUsername:
+              srv.integrations.listenbrainzUsername || '',
+          }));
+        }
+        if (srv.customPlaylistNames) {
+          MusicProviderManager.saveCustomPlaylistNames(srv.customPlaylistNames);
+        }
+        if (srv.audioPrefs) {
+          audio.restoreAudioPreferences(srv.audioPrefs);
+        }
+
+        let activeProvs = MusicProviderManager.loadProviders();
+        if (Array.isArray(srv.providers) && srv.providers.length > 0) {
+          activeProvs = mergeProvidersPreservingAuth(
+            activeProvs,
+            srv.providers
+          );
+        }
+        // Also hydrate Jellyfin provider from srv.integrations if token is stored there
+        if (srv.integrations?.jellyfinUrl && srv.integrations?.jellyfinToken) {
+          activeProvs = activeProvs.map((p) =>
+            p.type === 'jellyfin'
+              ? {
+                  ...p,
+                  enabled: true,
+                  serverUrl: srv.integrations.jellyfinUrl || p.serverUrl,
+                  token: srv.integrations.jellyfinToken || p.token,
+                  userId: srv.integrations.jellyfinUserId || p.userId,
+                  username: srv.integrations.jellyfinUsername || p.username,
+                  status: 'connected' as const,
+                }
+              : p
+          );
+          setIsOnboardingOpen(false);
+        }
+        setProviders(activeProvs);
+        MusicProviderManager.saveProviders(activeProvs);
+        if (MusicProviderManager.hasCompletedOnboarding(activeProvs)) {
+          setIsOnboardingOpen(false);
+        }
+
+        if (Array.isArray(srv.playlists) && srv.playlists.length > 0) {
+          setPlaylists((prev) => {
+            const customNames = MusicProviderManager.loadCustomPlaylistNames();
+            const merged = mergePlaylistsPreservingCustomNames(
+              prev,
+              srv.playlists,
+              customNames
+            );
+            MusicProviderManager.savePlaylists(merged);
+            return merged;
+          });
+        }
+
+        hasLoadedServerConfigRef.current = true;
+        const jfProv = activeProvs.find((p) => p.type === 'jellyfin');
+        if (jfProv) {
+          syncJellyfinProvider(jfProv);
+        }
+      })
+      .catch(() => {
+        hasLoadedServerConfigRef.current = true;
+        const initialProviders = MusicProviderManager.loadProviders();
+        const jfProv = initialProviders.find((p) => p.type === 'jellyfin');
+        if (jfProv) syncJellyfinProvider(jfProv);
+      });
 
     return () => {
       mounted = false;
@@ -628,6 +748,222 @@ export default function App() {
     playlists,
   ]);
 
+  // Persist configuration to /api/config (/app/data/config.json) on the backend server
+  const saveConfigToServer = async (
+    overrideIntegrations?: BrokeifyServerIntegrations
+  ) => {
+    const jfProv = providers.find((p) => p.type === 'jellyfin');
+    const activeIntegrations: BrokeifyServerIntegrations = {
+      ...(overrideIntegrations || serverIntegrations),
+      jellyfinUrl:
+        jfProv?.serverUrl ||
+        (overrideIntegrations || serverIntegrations).jellyfinUrl,
+      jellyfinToken:
+        jfProv?.token ||
+        (overrideIntegrations || serverIntegrations).jellyfinToken,
+      jellyfinUserId:
+        jfProv?.userId ||
+        (overrideIntegrations || serverIntegrations).jellyfinUserId,
+      jellyfinUsername:
+        jfProv?.username ||
+        (overrideIntegrations || serverIntegrations).jellyfinUsername,
+    };
+
+    try {
+      const resp = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          config: {
+            version: 2,
+            integrations: activeIntegrations,
+            audioPrefs: {
+              eqPreset: audio.eqPreset,
+              eqGains: audio.eqGains,
+              carVolumeLeveler: audio.carVolumeLeveler,
+              stabilizerStrength: audio.stabilizerStrength,
+              lufsNormalizationEnabled: audio.lufsNormalizationEnabled,
+              smartAntiRepeatEnabled: audio.smartAntiRepeatEnabled,
+              crossfadeSeconds: audio.crossfadeSeconds,
+              offlinePreloadCount: audio.offlinePreloadCount,
+              streamBufferSeconds: audio.streamBufferSeconds,
+              shuffleEnabled: audio.shuffleEnabled,
+              repeatMode: audio.repeatMode,
+              visualTheme: audio.visualTheme,
+            },
+            providers,
+            playlists,
+            customPlaylistNames:
+              MusicProviderManager.loadCustomPlaylistNames(),
+            pinnedPlaylistId,
+          },
+        }),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.configPath) setServerConfigPath(data.configPath);
+      }
+    } catch {
+      // ignore offline error
+    }
+  };
+
+  useEffect(() => {
+    if (!hasLoadedServerConfigRef.current) return;
+    const t = setTimeout(() => {
+      saveConfigToServer();
+    }, 600);
+    return () => clearTimeout(t);
+  }, [
+    providers,
+    playlists,
+    pinnedPlaylistId,
+    serverIntegrations,
+    audio.eqPreset,
+    audio.eqGains,
+    audio.carVolumeLeveler,
+    audio.stabilizerStrength,
+    audio.lufsNormalizationEnabled,
+    audio.smartAntiRepeatEnabled,
+    audio.crossfadeSeconds,
+    audio.offlinePreloadCount,
+    audio.streamBufferSeconds,
+    audio.shuffleEnabled,
+    audio.repeatMode,
+    audio.visualTheme,
+  ]);
+
+  // Poll /api/slskd/status every 6 seconds to update transfer progress & display "is ready to play!" banners
+  const fetchSlskdStatus = async () => {
+    try {
+      const resp = await fetch('/api/slskd/status');
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (Array.isArray(data.jobs)) {
+        setSlskdJobs(data.jobs);
+      }
+      if (Array.isArray(data.notifications)) {
+        setReadyNotifications((prev) => {
+          if (
+            data.notifications.length > prev.length &&
+            data.notifications[0]
+          ) {
+            // Auto-sync Jellyfin when a new download completes!
+            const jfProv = providers.find((p) => p.type === 'jellyfin');
+            if (jfProv) syncJellyfinProvider(jfProv);
+          }
+          return data.notifications;
+        });
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  useEffect(() => {
+    fetchSlskdStatus();
+    const interval = setInterval(fetchSlskdStatus, 6000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Automatic ListenBrainz Scrobbling (playing_now on track start + single listen at 50% or 240s)
+  useEffect(() => {
+    const tr = audio.currentTrack;
+    if (!tr || !audio.isPlaying || !serverIntegrations.listenbrainzToken) {
+      return;
+    }
+    fetch('/api/listenbrainz/scrobble', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        listenType: 'playing_now',
+        track: {
+          title: tr.title,
+          artist: tr.artist,
+          album: tr.album,
+          duration: tr.duration,
+        },
+      }),
+    }).catch(() => {});
+  }, [
+    audio.currentTrack?.id,
+    audio.isPlaying,
+    serverIntegrations.listenbrainzToken,
+  ]);
+
+  useEffect(() => {
+    const tr = audio.currentTrack;
+    if (!tr || !audio.isPlaying || !serverIntegrations.listenbrainzToken) {
+      return;
+    }
+    const threshold = Math.min(240, Math.max(30, (tr.duration || 180) * 0.5));
+    if (
+      audio.currentTime >= threshold &&
+      !scrobbledTrackIdsRef.current.has(tr.id)
+    ) {
+      scrobbledTrackIdsRef.current.add(tr.id);
+      fetch('/api/listenbrainz/scrobble', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          listenType: 'single',
+          track: {
+            title: tr.title,
+            artist: tr.artist,
+            album: tr.album,
+            duration: tr.duration,
+          },
+        }),
+      }).catch(() => {});
+    }
+  }, [
+    audio.currentTime,
+    audio.currentTrack,
+    audio.isPlaying,
+    serverIntegrations.listenbrainzToken,
+  ]);
+
+  // Permanently delete a duplicate track from the Jellyfin server's hard drive via DELETE /api/jellyfin/items/:id
+  const handleDeleteTrackFromJellyfin = async (track: Track) => {
+    setDeletingTrackId(track.id);
+    try {
+      const jfProv = providers.find((p) => p.type === 'jellyfin');
+      const resp = await fetch(
+        `/api/jellyfin/items/${encodeURIComponent(track.id)}`,
+        {
+          method: 'DELETE',
+          headers: {
+            'x-jellyfin-url': jfProv?.serverUrl || '',
+            'x-jellyfin-token': jfProv?.token || '',
+          },
+        }
+      );
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || !data.ok) {
+        setToastMessage(
+          `⚠️ ${data.error || `Failed to delete "${track.title}" from Jellyfin`}`
+        );
+      } else {
+        setRemoteTracks((prev) => {
+          const remaining = prev.filter((t) => t.id !== track.id);
+          MusicProviderManager.saveCachedRemoteTracks(remaining);
+          return remaining;
+        });
+        audio.setQueue(audio.queue.filter((t) => t.id !== track.id));
+        setToastMessage(
+          `🗑️ Permanently deleted "${track.title}" from Jellyfin server!`
+        );
+      }
+    } catch (err) {
+      setToastMessage(
+        `⚠️ ${err instanceof Error ? err.message : 'Delete request failed'}`
+      );
+    } finally {
+      setDeletingTrackId(null);
+      setConfirmDeleteTrackId(null);
+    }
+  };
+
   const handleUpdateProviders = (next: ProviderConfig[]) => {
     setProviders(next);
     MusicProviderManager.saveProviders(next);
@@ -915,7 +1251,7 @@ export default function App() {
               </div>
             </button>
 
-            {/* Desktop Core 3-Tab Navigation */}
+            {/* Desktop Core 4-Tab Navigation (Library, Request / Discover, Now Playing, Settings) */}
             <nav
               aria-label="Primary Navigation"
               className="hidden md:flex items-center gap-1 rounded-xl border border-zinc-700/80 bg-zinc-950/80 p-1 text-xs font-mono font-semibold"
@@ -931,6 +1267,24 @@ export default function App() {
                 }`}
               >
                 Library
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab('discover')}
+                data-testid="tab-discover"
+                className={`px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap inline-flex items-center gap-1.5 ${
+                  activeTab === 'discover'
+                    ? 'bg-[#00ff66] text-zinc-950 font-bold'
+                    : 'text-zinc-300 hover:text-white'
+                }`}
+              >
+                <Compass className="w-3.5 h-3.5" />
+                <span>Request / Discover</span>
+                {slskdJobs.some(
+                  (j) => j.status === 'searching' || j.status === 'downloading'
+                ) && (
+                  <span className="w-2 h-2 rounded-full bg-purple-400 animate-pulse" />
+                )}
               </button>
               <button
                 type="button"
@@ -996,6 +1350,49 @@ export default function App() {
 
       {/* Main Content Container */}
       <main className="relative z-10 flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 pt-5 space-y-6">
+        {/* Celebratory slskd Download Completed & Jellyfin Refreshed Notification Banner */}
+        {readyNotifications.length > 0 && (
+          <div
+            role="status"
+            data-testid="slskd-ready-banner"
+            className="winamp-bezel rounded-2xl border border-[#00ff66] bg-emerald-950/50 px-4 py-3 flex flex-wrap items-center justify-between gap-3 shadow-lg"
+          >
+            <div className="flex items-center gap-2.5 text-xs sm:text-sm font-mono font-bold text-[#00ff66]">
+              <CheckCircle2 className="w-5 h-5 shrink-0" />
+              <span>{readyNotifications[0].message}</span>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  const jfProv = providers.find((p) => p.type === 'jellyfin');
+                  if (jfProv) syncJellyfinProvider(jfProv);
+                  setActiveTab('library');
+                  setLibrarySubTab('songs');
+                }}
+                className="rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-3.5 py-1.5 text-xs font-mono font-bold text-zinc-950"
+              >
+                Sync &amp; Play Now ▶
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  fetch('/api/slskd/notifications/dismiss', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id: readyNotifications[0].id }),
+                  }).catch(() => {});
+                  setReadyNotifications((prev) => prev.slice(1));
+                }}
+                className="rounded-xl border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs font-mono text-zinc-300 hover:text-white"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* =====================================================================
             TAB 1: LIBRARY (DEFAULT SCREEN)
            ===================================================================== */}
@@ -1742,6 +2139,50 @@ export default function App() {
                             </div>
 
                             <div className="flex items-center gap-2 shrink-0">
+                              {/* Delete Duplicate Track from Jellyfin Server Hard Drive (2-step confirmation) */}
+                              {track.source === 'jellyfin' && (
+                                <>
+                                  {confirmDeleteTrackId === track.id ? (
+                                    <div className="inline-flex items-center gap-1 rounded-xl border border-rose-500/60 bg-rose-950/60 px-2 py-1">
+                                      <button
+                                        type="button"
+                                        disabled={deletingTrackId === track.id}
+                                        onClick={() =>
+                                          handleDeleteTrackFromJellyfin(track)
+                                        }
+                                        data-testid={`confirm-delete-track-${track.id}`}
+                                        className="rounded-lg bg-rose-500 hover:bg-rose-400 px-2 py-1 text-[11px] font-mono font-bold text-white"
+                                      >
+                                        {deletingTrackId === track.id
+                                          ? 'Deleting...'
+                                          : 'Delete File'}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          setConfirmDeleteTrackId(null)
+                                        }
+                                        className="rounded-lg bg-zinc-800 px-1.5 py-1 text-[11px] font-mono text-zinc-300 hover:text-white"
+                                      >
+                                        Cancel
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setConfirmDeleteTrackId(track.id)
+                                      }
+                                      data-testid={`delete-jellyfin-track-${track.id}`}
+                                      title="Permanently delete duplicate track from Jellyfin server hard drive (DELETE /api/jellyfin/items/:id)"
+                                      className="inline-flex items-center justify-center rounded-xl border border-zinc-800 bg-zinc-950 hover:border-rose-500/50 hover:text-rose-400 p-2 text-zinc-500 transition-colors min-h-[36px] min-w-[36px]"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  )}
+                                </>
+                              )}
+
                               <button
                                 type="button"
                                 onClick={() => audio.queueTrackNext(track)}
@@ -1931,6 +2372,24 @@ export default function App() {
               </section>
             )}
           </div>
+        )}
+
+        {/* =====================================================================
+            TAB 1B: REQUEST MUSIC / DISCOVER (EXPLO REPLACEMENT: MUSICBRAINZ + LISTENBRAINZ + SLSKD)
+           ===================================================================== */}
+        {activeTab === 'discover' && (
+          <RequestDiscoverView
+            catalog={allTracks}
+            integrations={serverIntegrations}
+            jobs={slskdJobs}
+            onPlayTrack={(track) => audio.playSpecificTrack(track, allTracks)}
+            onRefreshStatus={fetchSlskdStatus}
+            onOpenSettingsSources={() => {
+              setActiveTab('settings');
+              setSettingsSubTab('sources');
+            }}
+            onShowToast={(msg) => setToastMessage(msg)}
+          />
         )}
 
         {/* =====================================================================
@@ -2564,6 +3023,17 @@ export default function App() {
                 onApplyRestoredCloudSettings={handleApplyRestoredCloudSettings}
                 onOpenOnboardingModal={() => setIsOnboardingOpen(true)}
                 onLogoutProvider={handleLogoutProvider}
+                serverIntegrations={serverIntegrations}
+                serverConfigPath={serverConfigPath}
+                onUpdateServerIntegrations={(next) => {
+                  setServerIntegrations(next);
+                }}
+                onSaveServerConfigNow={async () => {
+                  await saveConfigToServer(serverIntegrations);
+                  setToastMessage(
+                    `💾 Saved configuration & keys to ${serverConfigPath}`
+                  );
+                }}
               />
             )}
 
@@ -2847,10 +3317,10 @@ export default function App() {
           </div>
         </div>
 
-        {/* Responsive Mobile 3-Tab Bottom Navigation Bar */}
+        {/* Responsive Mobile 4-Tab Bottom Navigation Bar */}
         <nav
           aria-label="Mobile Bottom Navigation"
-          className="md:hidden grid grid-cols-3 border-t border-zinc-800/80 bg-[#070a0f] h-12"
+          className="md:hidden grid grid-cols-4 border-t border-zinc-800/80 bg-[#070a0f] h-12"
         >
           <button
             type="button"
@@ -2866,6 +3336,18 @@ export default function App() {
           </button>
           <button
             type="button"
+            onClick={() => setActiveTab('discover')}
+            className={`flex flex-col items-center justify-center min-h-[44px] ${
+              activeTab === 'discover' ? 'text-[#00ff66]' : 'text-zinc-400'
+            }`}
+          >
+            <Compass className="w-4 h-4" />
+            <span className="text-[10px] font-mono font-semibold mt-0.5">
+              Discover
+            </span>
+          </button>
+          <button
+            type="button"
             onClick={() => setActiveTab('nowplaying')}
             className={`flex flex-col items-center justify-center min-h-[44px] ${
               activeTab === 'nowplaying' ? 'text-[#00ff66]' : 'text-zinc-400'
@@ -2873,7 +3355,7 @@ export default function App() {
           >
             <Radio className="w-4 h-4" />
             <span className="text-[10px] font-mono font-semibold mt-0.5">
-              Now Playing
+              Playing
             </span>
           </button>
           <button
