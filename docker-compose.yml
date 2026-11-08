@@ -1,5 +1,9 @@
 services:
   brokeify:
+    # OPTION A (Fastest with 1-click Dockge Update): Pull prebuilt image from GitHub Container Registry
+    # image: ghcr.io/mr-nickey/brokeify:latest
+
+    # OPTION B: Build straight from your GitHub repository branch (Use "Deploy" in Dockge to rebuild)
     build: https://github.com/Mr-Nickey/brokeify.git#main
     container_name: brokeify
     restart: unless-stopped
