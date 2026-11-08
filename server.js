@@ -313,50 +313,82 @@ return true;`,
 
 function readServerConfig() {
   try {
+    let parsed = {};
     if (fs.existsSync(CONFIG_FILE_PATH)) {
       const raw = fs.readFileSync(CONFIG_FILE_PATH, 'utf-8');
-      const parsed = JSON.parse(raw);
-      return {
-        ...DEFAULT_SERVER_CONFIG,
-        ...parsed,
-        integrations: {
-          ...DEFAULT_SERVER_CONFIG.integrations,
-          ...(parsed.integrations || {}),
-          listenbrainzUsername:
-            parsed.integrations?.listenbrainzUsername || '',
-        },
-        audioPrefs: {
-          ...DEFAULT_SERVER_CONFIG.audioPrefs,
-          ...(parsed.audioPrefs || {}),
-        },
-        discoveryFilters: {
-          ...DEFAULT_SERVER_CONFIG.discoveryFilters,
-          ...(parsed.discoveryFilters || {}),
-        },
-        customTheme: {
-          ...DEFAULT_SERVER_CONFIG.customTheme,
-          ...(parsed.customTheme || {}),
-        },
-        picardConfig: {
-          ...DEFAULT_SERVER_CONFIG.picardConfig,
-          ...(parsed.picardConfig || {}),
-        },
-        autopilotRules: Array.isArray(parsed.autopilotRules)
-          ? parsed.autopilotRules
-          : [],
-        playStats:
-          parsed.playStats && typeof parsed.playStats === 'object'
-            ? parsed.playStats
-            : {},
-        customPlaylistNames: {
-          ...(parsed.customPlaylistNames || {}),
-        },
-        playbackSession:
-          parsed.playbackSession && typeof parsed.playbackSession === 'object'
-            ? parsed.playbackSession
-            : null,
-      };
+      parsed = JSON.parse(raw) || {};
     }
+
+    const envIntegrations = {
+      ...(process.env.JELLYFIN_URL
+        ? { jellyfinUrl: process.env.JELLYFIN_URL }
+        : {}),
+      ...(process.env.JELLYFIN_TOKEN
+        ? { jellyfinToken: process.env.JELLYFIN_TOKEN }
+        : {}),
+      ...(process.env.SLSKD_URL ? { slskdUrl: process.env.SLSKD_URL } : {}),
+      ...(process.env.SLSKD_API_KEY
+        ? { slskdApiKey: process.env.SLSKD_API_KEY }
+        : {}),
+      ...(process.env.LIDARR_URL ? { lidarrUrl: process.env.LIDARR_URL } : {}),
+      ...(process.env.LIDARR_API_KEY
+        ? { lidarrApiKey: process.env.LIDARR_API_KEY }
+        : {}),
+      ...(process.env.LISTENBRAINZ_USER || process.env.LISTENBRAINZ_USERNAME
+        ? {
+            listenbrainzUsername:
+              process.env.LISTENBRAINZ_USER ||
+              process.env.LISTENBRAINZ_USERNAME,
+          }
+        : {}),
+      ...(process.env.LISTENBRAINZ_TOKEN
+        ? { listenbrainzToken: process.env.LISTENBRAINZ_TOKEN }
+        : {}),
+    };
+
+    return {
+      ...DEFAULT_SERVER_CONFIG,
+      ...parsed,
+      integrations: {
+        ...DEFAULT_SERVER_CONFIG.integrations,
+        ...(parsed.integrations || {}),
+        ...envIntegrations,
+        listenbrainzUsername:
+          envIntegrations.listenbrainzUsername ||
+          parsed.integrations?.listenbrainzUsername ||
+          '',
+      },
+      audioPrefs: {
+        ...DEFAULT_SERVER_CONFIG.audioPrefs,
+        ...(parsed.audioPrefs || {}),
+      },
+      discoveryFilters: {
+        ...DEFAULT_SERVER_CONFIG.discoveryFilters,
+        ...(parsed.discoveryFilters || {}),
+      },
+      customTheme: {
+        ...DEFAULT_SERVER_CONFIG.customTheme,
+        ...(parsed.customTheme || {}),
+      },
+      picardConfig: {
+        ...DEFAULT_SERVER_CONFIG.picardConfig,
+        ...(parsed.picardConfig || {}),
+      },
+      autopilotRules: Array.isArray(parsed.autopilotRules)
+        ? parsed.autopilotRules
+        : [],
+      playStats:
+        parsed.playStats && typeof parsed.playStats === 'object'
+          ? parsed.playStats
+          : {},
+      customPlaylistNames: {
+        ...(parsed.customPlaylistNames || {}),
+      },
+      playbackSession:
+        parsed.playbackSession && typeof parsed.playbackSession === 'object'
+          ? parsed.playbackSession
+          : null,
+    };
   } catch (err) {
     console.error('[Brokeify] Failed to read config.json:', err);
   }
