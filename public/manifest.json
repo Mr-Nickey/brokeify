@@ -1,0 +1,40 @@
+{
+  "id": "/",
+  "name": "Brokeify — Self-Hosted & Car-Ready Music Player",
+  "short_name": "Brokeify",
+  "description": "Self-hosted music aggregator and offline car audio player for Jellyfin, Navidrome, Emby, and Plex with FLAC/MP3 loudness stabilization, seamless crossfade, and IndexedDB offline playlist vault.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#070a0f",
+  "theme_color": "#070a0f",
+  "dir": "ltr",
+  "lang": "en-US",
+  "categories": ["music", "entertainment", "utilities"],
+  "prefer_related_applications": false,
+  "launch_handler": {
+    "client_mode": "navigate-existing"
+  },
+  "icons": [
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

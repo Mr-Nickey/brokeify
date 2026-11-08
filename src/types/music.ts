@@ -66,6 +66,7 @@ export interface Track {
 export interface Playlist {
   id: string;
   name: string;
+  originalName?: string;
   description: string;
   source: ProviderType | 'mixed' | 'spotify-resolved';
   trackIds: string[];
@@ -126,6 +127,7 @@ export interface BrokeifyAudioPreferences {
   stabilizerStrength?: StabilizerStrength;
   visualTheme?: VisualThemeId;
   streamBufferSeconds?: number;
+  smartAntiRepeatEnabled?: boolean;
 }
 
 export interface BrokeifyCloudSettings {

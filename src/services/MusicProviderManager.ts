@@ -229,19 +229,52 @@ export class MusicProviderManager {
     }
   }
 
+  static loadCustomPlaylistNames(): Record<string, string> {
+    try {
+      const raw = localStorage.getItem('brokeify_playlist_custom_names_v1');
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  static saveCustomPlaylistNames(map: Record<string, string>): void {
+    try {
+      localStorage.setItem(
+        'brokeify_playlist_custom_names_v1',
+        JSON.stringify(map)
+      );
+    } catch {
+      // Ignore storage quota errors
+    }
+  }
+
   static loadPlaylists(): Playlist[] {
     try {
+      const customNames = MusicProviderManager.loadCustomPlaylistNames();
       const raw = localStorage.getItem(PLAYLISTS_STORAGE_KEY);
       if (!raw) return [];
       const parsed = JSON.parse(raw) as Playlist[];
       if (!Array.isArray(parsed)) return [];
-      return parsed.filter(
-        (pl) =>
-          pl &&
-          pl.source !== 'built-in' &&
-          pl.id !== 'pl-night-drive' &&
-          pl.id !== 'pl-spite-anthem'
-      );
+      return parsed
+        .filter(
+          (pl) =>
+            pl &&
+            pl.source !== 'built-in' &&
+            pl.id !== 'pl-night-drive' &&
+            pl.id !== 'pl-spite-anthem'
+        )
+        .map((pl) => {
+          const realName = pl.originalName || pl.name;
+          const customName = customNames[pl.id]?.trim();
+          return {
+            ...pl,
+            originalName: realName,
+            name: customName || pl.name,
+          };
+        });
     } catch {
       return [];
     }

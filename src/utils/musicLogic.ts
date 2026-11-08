@@ -1,6 +1,7 @@
 import type {
   BrokeifyCloudSettings,
   EQPresetName,
+  Playlist,
   ProviderConfig,
   SpotifyImportedItem,
   SpotifyResolvedItem,
@@ -866,8 +867,11 @@ export function parseCloudSettingsResponse(
           : 'cyber-deck',
         streamBufferSeconds:
           typeof parsed.audioPrefs.streamBufferSeconds === 'number'
-            ? Math.max(0, Math.min(8, Math.round(parsed.audioPrefs.streamBufferSeconds)))
-            : 3,
+            ? Math.max(0, Math.min(15, Math.round(parsed.audioPrefs.streamBufferSeconds)))
+            : 6,
+        smartAntiRepeatEnabled: Boolean(
+          parsed.audioPrefs.smartAntiRepeatEnabled ?? true
+        ),
       },
       providers: Array.isArray(parsed.providers) ? parsed.providers : [],
       playlists: Array.isArray(parsed.playlists) ? parsed.playlists : [],
@@ -875,6 +879,30 @@ export function parseCloudSettingsResponse(
   } catch {
     return null;
   }
+}
+
+/**
+ * Computes how many seconds of continuous audio are currently buffered ahead of `currentTime`.
+ * Used by the proactive pre-buffering check and mid-song anti-skip monitor on variable mobile networks.
+ */
+export function computeBufferedAheadSeconds(
+  ranges: readonly { start: number; end: number }[],
+  currentTime: number
+): number {
+  if (!ranges || ranges.length === 0) return 0;
+  const now = Math.max(0, currentTime || 0);
+  // Find range containing `now` (with 0.35s tolerance for initial seek/start)
+  for (const r of ranges) {
+    if (now + 0.35 >= r.start && now <= r.end) {
+      return Number(Math.max(0, r.end - now).toFixed(2));
+    }
+  }
+  // Fallback: check highest buffered end if currentTime is at 0
+  if (now < 0.5) {
+    const lastEnd = ranges[ranges.length - 1]?.end ?? 0;
+    return Number(Math.max(0, lastEnd - now).toFixed(2));
+  }
+  return 0;
 }
 
 /**
@@ -908,6 +936,52 @@ export function mergeProvidersPreservingAuth(
       token: inc.token?.trim() ? inc.token : prev.token,
       userId: inc.userId?.trim() ? inc.userId : prev.userId,
       salt: inc.salt?.trim() ? inc.salt : prev.salt,
+    });
+  }
+
+  return Array.from(byId.values());
+}
+
+/**
+ * Merges incoming server playlists with existing playlists while preserving any custom user-defined
+ * playlist names (`name`) and always keeping the server's real playlist name in `originalName`.
+ */
+export function mergePlaylistsPreservingCustomNames(
+  existingPlaylists: readonly Playlist[],
+  incomingPlaylists: readonly Playlist[],
+  customNamesById: Record<string, string> = {}
+): Playlist[] {
+  const byId = new Map<string, Playlist>();
+  for (const pl of existingPlaylists) {
+    const realName = pl.originalName || pl.name;
+    const customName = customNamesById[pl.id]?.trim();
+    byId.set(pl.id, {
+      ...pl,
+      originalName: realName,
+      name: customName || pl.name,
+    });
+  }
+
+  for (const inc of incomingPlaylists) {
+    const prev = byId.get(inc.id);
+    const serverRealName = inc.originalName || inc.name;
+    const savedCustom = customNamesById[inc.id]?.trim();
+    const prevHadCustomName =
+      prev &&
+      prev.name.trim() &&
+      prev.originalName &&
+      prev.name !== prev.originalName
+        ? prev.name.trim()
+        : '';
+
+    const effectiveDisplayName =
+      savedCustom || prevHadCustomName || inc.name || serverRealName;
+
+    byId.set(inc.id, {
+      ...(prev || {}),
+      ...inc,
+      originalName: serverRealName,
+      name: effectiveDisplayName,
     });
   }
 
@@ -1019,6 +1093,235 @@ export function buildClientInstantMix(
   ];
 
   return combined.slice(0, Math.max(1, limit));
+}
+
+/**
+ * Extracts a canonical song title signature so duplicate downloads with messy tags
+ * (e.g. "(When You Gonna) Give It Up To Me (Radio Version) - Sean Paul; Keyshia Cole" vs
+ * "(When You Gonna) Give It Up To Me (feat. Keyshia Cole) (Radio Version)")
+ * produce the exact same fingerprint ("when you gonna give it up to me").
+ */
+export function getCanonicalSongSignature(
+  track: Pick<Track, 'title' | 'artist'>
+): string {
+  let rawTitle = (track.title || '').trim();
+  // Strip leading track numbers like "01. " or "02 - "
+  rawTitle = rawTitle.replace(/^\d{1,3}(?:\s*[._-]\s*|\s+)/, '');
+
+  // Strip common edition/version/feat parentheticals & brackets before splitting on " - "
+  const stripEditions = (s: string) =>
+    s
+      .replace(
+        /\(\s*(?:feat\.?|ft\.?|featuring|with|radio\s+version|radio\s+edit|album\s+version|single\s+version|remaster(?:ed)?|live|deluxe|explicit|clean|official\s+.*?|audio|video|lyrics?|bonus\s+track|version|edit|mix).*?\)/gi,
+        ' '
+      )
+      .replace(
+        /\[\s*(?:feat\.?|ft\.?|featuring|with|radio\s+version|radio\s+edit|album\s+version|single\s+version|remaster(?:ed)?|live|deluxe|explicit|clean|official\s+.*?|audio|video|lyrics?|bonus\s+track|version|edit|mix).*?\]/gi,
+        ' '
+      );
+
+  rawTitle = stripEditions(rawTitle);
+
+  // If the downloader embedded "Song Title - Artist1; Artist2" in the title field, take the core title segment
+  if (rawTitle.includes(' - ')) {
+    const segments = rawTitle
+      .split(' - ')
+      .map((seg) => stripEditions(seg).trim())
+      .filter(Boolean);
+    if (segments.length >= 2) {
+      // Pick the first non-empty segment unless it's just the artist name
+      const cleanArtist = normalizeMatchToken(track.artist || '');
+      const seg0Norm = normalizeMatchToken(segments[0]);
+      if (
+        cleanArtist &&
+        cleanArtist.length > 2 &&
+        seg0Norm === cleanArtist &&
+        segments[1]
+      ) {
+        rawTitle = segments[1];
+      } else {
+        rawTitle = segments[0];
+      }
+    }
+  }
+
+  // Strip inline "feat. ..." or "ft. ..." at the end of the title
+  rawTitle = rawTitle.replace(/\b(?:feat\.?|ft\.?|featuring)\s+.*$/i, '');
+
+  // Normalize punctuation (turns "(When You Gonna) Give It Up To Me" into "when you gonna give it up to me")
+  const canonicalTitle = rawTitle
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return canonicalTitle || normalizeMatchToken(track.title || '');
+}
+
+/**
+ * Determines whether two tracks are the same underlying song (even if downloaded multiple times
+ * with slightly different filenames, feat. tags, or missing artist metadata like artist="a").
+ */
+export function areTracksSameSong(
+  a: Pick<Track, 'id' | 'title' | 'artist'> | null | undefined,
+  b: Pick<Track, 'id' | 'title' | 'artist'> | null | undefined
+): boolean {
+  if (!a || !b) return false;
+  if (a.id === b.id) return true;
+
+  const sigA = getCanonicalSongSignature(a);
+  const sigB = getCanonicalSongSignature(b);
+  if (!sigA || !sigB) return false;
+
+  if (sigA === sigB) {
+    return true;
+  }
+
+  // Also catch cases where one canonical title is a prefix/substring of the other (>= 10 chars) and shares artist
+  if (sigA.length >= 10 && sigB.length >= 10) {
+    if (sigA.includes(sigB) || sigB.includes(sigA)) {
+      const artA = normalizeMatchToken(a.artist || '');
+      const artB = normalizeMatchToken(b.artist || '');
+      if (
+        !artA ||
+        !artB ||
+        artA.length <= 2 ||
+        artB.length <= 2 ||
+        artA.includes(artB) ||
+        artB.includes(artA)
+      ) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Scores a track's metadata & audio quality so when multiple duplicate copies of the same song exist,
+ * Brokeify keeps the best copy (real artist name instead of "a"/"Unknown" + lossless/higher bitrate).
+ */
+function scoreTrackCopyQuality(track: Track): number {
+  let score = 0;
+  const artist = (track.artist || '').trim();
+  if (
+    artist.length > 2 &&
+    artist.toLowerCase() !== 'unknown artist' &&
+    artist.toLowerCase() !== 'unknown'
+  ) {
+    score += 30;
+  }
+  if (!track.title.includes(';')) {
+    score += 10;
+  }
+  if (track.bitrateKbps) {
+    score += Math.min(25, Math.round(track.bitrateKbps / 60));
+  }
+  const fmt = (track.format || '').toUpperCase();
+  if (fmt.includes('FLAC') || fmt.includes('WAV') || fmt.includes('ALAC')) {
+    score += 20;
+  }
+  return score;
+}
+
+/**
+ * Smart Anti-Repeat & Deduplication Engine:
+ * - When `removeDuplicateSongs` is true (default), collapses duplicate downloaded copies of the same song
+ *   (keeping the highest-quality copy with the cleanest tags) AND ensures no two identical songs ever sit back-to-back.
+ * - When `removeDuplicateSongs` is false, keeps all tracks but spreads any duplicate copies apart so they never play back-to-back.
+ */
+export function dedupeAndSpreadTracks(
+  tracks: readonly Track[],
+  removeDuplicateSongs = true
+): Track[] {
+  if (tracks.length <= 1) return [...tracks];
+
+  if (removeDuplicateSongs) {
+    const bySignature = new Map<string, Track>();
+    const order: string[] = [];
+
+    for (const tr of tracks) {
+      const sig = getCanonicalSongSignature(tr) || tr.id;
+      const existing = bySignature.get(sig);
+      if (!existing) {
+        bySignature.set(sig, tr);
+        order.push(sig);
+      } else if (scoreTrackCopyQuality(tr) > scoreTrackCopyQuality(existing)) {
+        bySignature.set(sig, tr);
+      }
+    }
+
+    return order
+      .map((sig) => bySignature.get(sig))
+      .filter((t): t is Track => Boolean(t));
+  }
+
+  // Spread-apart mode: reorder any back-to-back duplicates so they never play consecutively
+  const result = [...tracks];
+  for (let i = 1; i < result.length; i++) {
+    if (areTracksSameSong(result[i - 1], result[i])) {
+      let swapIdx = -1;
+      for (let j = i + 1; j < result.length; j++) {
+        if (!areTracksSameSong(result[i - 1], result[j])) {
+          swapIdx = j;
+          break;
+        }
+      }
+      if (swapIdx !== -1) {
+        const temp = result[i];
+        result[i] = result[swapIdx];
+        result[swapIdx] = temp;
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * Shuffles tracks using Fisher-Yates while deduplicating identical downloaded songs (when `smartAntiRepeat` is true)
+ * and spacing tracks so the same song or same artist doesn't play back-to-back.
+ */
+export function smartAntiRepeatShuffle(
+  tracks: readonly Track[],
+  smartAntiRepeat = true,
+  randomFn: () => number = Math.random
+): Track[] {
+  const basePool = smartAntiRepeat
+    ? dedupeAndSpreadTracks(tracks, true)
+    : [...tracks];
+  const shuffled = fisherYatesShuffle(basePool, randomFn);
+
+  // Space out same-artist or same-song tracks so playback feels freshly mixed
+  for (let i = 1; i < shuffled.length; i++) {
+    const prev = shuffled[i - 1];
+    const curr = shuffled[i];
+    const sameSong = areTracksSameSong(prev, curr);
+    const sameArtist =
+      normalizeMatchToken(prev.artist) === normalizeMatchToken(curr.artist) &&
+      normalizeMatchToken(prev.artist).length > 2;
+
+    if (sameSong || sameArtist) {
+      let swapIdx = -1;
+      for (let j = i + 1; j < shuffled.length; j++) {
+        const cand = shuffled[j];
+        if (
+          !areTracksSameSong(prev, cand) &&
+          normalizeMatchToken(prev.artist) !== normalizeMatchToken(cand.artist)
+        ) {
+          swapIdx = j;
+          break;
+        }
+      }
+      if (swapIdx !== -1) {
+        const tmp = shuffled[i];
+        shuffled[i] = shuffled[swapIdx];
+        shuffled[swapIdx] = tmp;
+      }
+    }
+  }
+
+  return shuffled;
 }
 
 

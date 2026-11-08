@@ -7,12 +7,16 @@ import type {
   VisualThemeId,
 } from '../types/music';
 import {
+  areTracksSameSong,
   buildJellyfinStreamCandidates,
+  computeBufferedAheadSeconds,
   computeTrackStabilizationGain,
+  dedupeAndSpreadTracks,
   EQ_FREQUENCIES,
   EQ_PRESETS,
   fisherYatesShuffle,
   isValidVisualTheme,
+  smartAntiRepeatShuffle,
 } from '../utils/musicLogic';
 import {
   getAllVaultEntries,
@@ -20,6 +24,23 @@ import {
   preloadTrackToVault,
   removeTrackFromVault,
 } from '../utils/offlineVault';
+
+function getBufferedRangesFromAudio(
+  audio: HTMLAudioElement
+): { start: number; end: number }[] {
+  const ranges: { start: number; end: number }[] = [];
+  try {
+    if (audio.buffered && audio.buffered.length > 0) {
+      for (let i = 0; i < audio.buffered.length; i++) {
+        ranges.push({
+          start: audio.buffered.start(i),
+          end: audio.buffered.end(i),
+        });
+      }
+    }
+  } catch {}
+  return ranges;
+}
 
 export function useAudioEngine(initialQueue: Track[]) {
   const [queue, setQueue] = useState<Track[]>(initialQueue);
@@ -141,20 +162,43 @@ export function useAudioEngine(initialQueue: Track[]) {
     return 'cyber-deck';
   });
 
-  // Pre-Play Anti-Skip Stream Buffer (0s to 8s, default 3s) so cellular streams buffer before playing
+  // Pre-Play & Mid-Song Anti-Skip Stream Buffer (0s to 15s, default 6s) for variable mobile networks
   const [streamBufferSeconds, setStreamBufferSeconds] = useState<number>(() => {
     try {
       const saved = localStorage.getItem('brokeify_audio_prefs_v1');
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (typeof parsed.streamBufferSeconds === 'number') {
-          return Math.max(0, Math.min(8, Math.round(parsed.streamBufferSeconds)));
+        if (
+          typeof parsed.streamBufferSeconds === 'number' &&
+          parsed.streamBufferUpgradedV2 === true
+        ) {
+          return Math.max(
+            0,
+            Math.min(15, Math.round(parsed.streamBufferSeconds))
+          );
         }
       }
     } catch {}
-    return 3;
+    return 6;
   });
   const [isBuffering, setIsBuffering] = useState<boolean>(false);
+  const [bufferedAheadSeconds, setBufferedAheadSeconds] = useState<number>(0);
+
+  // Smart Anti-Repeat & Duplicate Song Guard (default ON so duplicate downloads never play back-to-back)
+  const [smartAntiRepeatEnabled, setSmartAntiRepeatEnabled] = useState<boolean>(
+    () => {
+      try {
+        const saved = localStorage.getItem('brokeify_audio_prefs_v1');
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (typeof parsed.smartAntiRepeatEnabled === 'boolean') {
+            return parsed.smartAntiRepeatEnabled;
+          }
+        }
+      } catch {}
+      return true;
+    }
+  );
 
   // IndexedDB Offline Vault & Lookahead Preloader State
   const [cachedTrackIds, setCachedTrackIds] = useState<Set<string>>(new Set());
@@ -175,6 +219,14 @@ export function useAudioEngine(initialQueue: Track[]) {
   const fadeInIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const crossfadeTriggeredForTrackRef = useRef<string | null>(null);
   const isCrossfadeTransitionRef = useRef<boolean>(false);
+  const isRebufferingRef = useRef<boolean>(false);
+  const streamBufferSecondsRef = useRef<number>(streamBufferSeconds);
+  const nextTrackWarmupAudioRef = useRef<HTMLAudioElement | null>(null);
+  const warmedNextTrackIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    streamBufferSecondsRef.current = streamBufferSeconds;
+  }, [streamBufferSeconds]);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
@@ -186,7 +238,7 @@ export function useAudioEngine(initialQueue: Track[]) {
   const activeObjectUrlRef = useRef<string | null>(null);
   const onEndedCallbackRef = useRef<() => void>(() => {});
 
-  // Keep queue synchronized when initialQueue updates
+  // Keep queue synchronized when initialQueue updates (and deduplicate when Smart Anti-Repeat is active)
   useEffect(() => {
     setQueue((prevQueue) => {
       const cleanedPrev = prevQueue.filter(
@@ -194,15 +246,22 @@ export function useAudioEngine(initialQueue: Track[]) {
           t && t.source !== 'built-in' && !t.streamUrl.startsWith('synth://')
       );
       if (initialQueue.length === 0) {
-        return cleanedPrev;
+        return smartAntiRepeatEnabled
+          ? dedupeAndSpreadTracks(cleanedPrev, true)
+          : cleanedPrev;
       }
       if (cleanedPrev.length === 0) {
-        return initialQueue;
+        return smartAntiRepeatEnabled
+          ? dedupeAndSpreadTracks(initialQueue, true)
+          : initialQueue;
       }
       const byId = new Map(initialQueue.map((t) => [t.id, t]));
-      return cleanedPrev.map((t) => byId.get(t.id) || t);
+      const mapped = cleanedPrev.map((t) => byId.get(t.id) || t);
+      return smartAntiRepeatEnabled
+        ? dedupeAndSpreadTracks(mapped, true)
+        : mapped;
     });
-  }, [initialQueue]);
+  }, [initialQueue, smartAntiRepeatEnabled]);
 
   const currentTrack: Track | null = queue[currentIndex] || queue[0] || null;
 
@@ -255,9 +314,22 @@ export function useAudioEngine(initialQueue: Track[]) {
   }, [refreshVaultState]);
 
   const bindAudioEvents = useCallback((audio: HTMLAudioElement) => {
+    const syncBufferedAhead = () => {
+      const ahead = computeBufferedAheadSeconds(
+        getBufferedRangesFromAudio(audio),
+        audio.currentTime || 0
+      );
+      setBufferedAheadSeconds(ahead);
+      return ahead;
+    };
+
     const handleTimeUpdate = () => {
       const nowTime = audio.currentTime || 0;
       setCurrentTime(nowTime);
+      syncBufferedAhead();
+    };
+    const handleProgress = () => {
+      syncBufferedAhead();
     };
     const handleLoadedMetadata = () => {
       if (
@@ -267,28 +339,64 @@ export function useAudioEngine(initialQueue: Track[]) {
       ) {
         setDuration(audio.duration);
       }
+      syncBufferedAhead();
     };
     const handlePlay = () => setIsPlaying(true);
+    const handlePlaying = () => {
+      isRebufferingRef.current = false;
+      setIsBuffering(false);
+      setIsPlaying(true);
+      syncBufferedAhead();
+    };
     const handlePause = () => {
-      if (!audio.ended) {
+      // Do not flip isPlaying to false if we paused momentarily for proactive anti-skip rebuffering
+      if (!audio.ended && !isRebufferingRef.current) {
         setIsPlaying(false);
       }
     };
+    const handleWaitingOrStalled = () => {
+      if (
+        !audio.ended &&
+        audio.src &&
+        !audio.src.startsWith('blob:') &&
+        streamBufferSecondsRef.current > 0
+      ) {
+        setIsBuffering(true);
+      }
+    };
+    const handleCanPlayThrough = () => {
+      if (!isRebufferingRef.current) {
+        setIsBuffering(false);
+      }
+      syncBufferedAhead();
+    };
     const handleEnded = () => {
+      isRebufferingRef.current = false;
+      setIsBuffering(false);
       onEndedCallbackRef.current();
     };
 
     audio.addEventListener('timeupdate', handleTimeUpdate);
+    audio.addEventListener('progress', handleProgress);
     audio.addEventListener('loadedmetadata', handleLoadedMetadata);
     audio.addEventListener('play', handlePlay);
+    audio.addEventListener('playing', handlePlaying);
     audio.addEventListener('pause', handlePause);
+    audio.addEventListener('waiting', handleWaitingOrStalled);
+    audio.addEventListener('stalled', handleWaitingOrStalled);
+    audio.addEventListener('canplaythrough', handleCanPlayThrough);
     audio.addEventListener('ended', handleEnded);
 
     return () => {
       audio.removeEventListener('timeupdate', handleTimeUpdate);
+      audio.removeEventListener('progress', handleProgress);
       audio.removeEventListener('loadedmetadata', handleLoadedMetadata);
       audio.removeEventListener('play', handlePlay);
+      audio.removeEventListener('playing', handlePlaying);
       audio.removeEventListener('pause', handlePause);
+      audio.removeEventListener('waiting', handleWaitingOrStalled);
+      audio.removeEventListener('stalled', handleWaitingOrStalled);
+      audio.removeEventListener('canplaythrough', handleCanPlayThrough);
       audio.removeEventListener('ended', handleEnded);
     };
   }, []);
@@ -304,6 +412,12 @@ export function useAudioEngine(initialQueue: Track[]) {
     return () => {
       if (fadeInIntervalRef.current) {
         clearInterval(fadeInIntervalRef.current);
+      }
+      if (nextTrackWarmupAudioRef.current) {
+        try {
+          nextTrackWarmupAudioRef.current.pause();
+          nextTrackWarmupAudioRef.current.removeAttribute('src');
+        } catch {}
       }
       audio.pause();
       unbind();
@@ -627,9 +741,9 @@ export function useAudioEngine(initialQueue: Track[]) {
   const loadRequestIdRef = useRef<number>(0);
 
   /**
-   * Pre-Play Anti-Skip Buffer:
-   * Waits until the browser has buffered `targetBufferSec` seconds of audio (or fires `canplaythrough`)
-   * before starting playback so cellular streams don't stutter or skip in the first few seconds.
+   * Proactive Pre-Play & Mid-Song Anti-Skip Buffer:
+   * Waits until the browser has buffered `targetBufferSec` seconds of continuous audio ahead of `currentTime`
+   * (or fires `canplaythrough` with a safe cushion) before starting or resuming playback on variable mobile networks.
    */
   const waitForStreamPreBuffer = useCallback(
     (audio: HTMLAudioElement, targetBufferSec: number): Promise<void> => {
@@ -643,22 +757,34 @@ export function useAudioEngine(initialQueue: Track[]) {
           settled = true;
           clearInterval(checkTimer);
           clearTimeout(maxWaitTimer);
-          audio.removeEventListener('canplaythrough', finish);
+          audio.removeEventListener('canplaythrough', handleCanPlayThrough);
           audio.removeEventListener('error', finish);
           resolve();
         };
 
         const hasEnoughBuffer = () => {
-          if (audio.readyState >= 4) return true;
-          try {
-            if (audio.buffered && audio.buffered.length > 0) {
-              const bufferedEnd = audio.buffered.end(audio.buffered.length - 1);
-              if (bufferedEnd >= targetBufferSec) {
-                return true;
-              }
-            }
-          } catch {}
+          const ahead = computeBufferedAheadSeconds(
+            getBufferedRangesFromAudio(audio),
+            audio.currentTime || 0
+          );
+          setBufferedAheadSeconds(ahead);
+          if (ahead >= targetBufferSec) {
+            return true;
+          }
+          // If browser signals readyState HAVE_ENOUGH_DATA (4) and at least half of target cushion is buffered
+          if (
+            audio.readyState >= 4 &&
+            ahead >= Math.min(2.5, targetBufferSec * 0.5)
+          ) {
+            return true;
+          }
           return false;
+        };
+
+        const handleCanPlayThrough = () => {
+          if (hasEnoughBuffer() || audio.readyState >= 4) {
+            finish();
+          }
         };
 
         if (hasEnoughBuffer()) {
@@ -666,7 +792,7 @@ export function useAudioEngine(initialQueue: Track[]) {
           return;
         }
 
-        audio.addEventListener('canplaythrough', finish, { once: true });
+        audio.addEventListener('canplaythrough', handleCanPlayThrough);
         audio.addEventListener('error', finish, { once: true });
 
         const checkTimer = setInterval(() => {
@@ -675,8 +801,8 @@ export function useAudioEngine(initialQueue: Track[]) {
           }
         }, 80);
 
-        // Cap pre-buffer wait so slow/transcoding streams still start reliably
-        const maxWaitMs = Math.min(3500, Math.max(900, targetBufferSec * 750));
+        // Allow up to 5.5s on variable mobile networks to build the target 6s anti-skip cushion
+        const maxWaitMs = Math.min(5500, Math.max(1500, targetBufferSec * 850));
         const maxWaitTimer = setTimeout(finish, maxWaitMs);
       });
     },
@@ -720,6 +846,7 @@ export function useAudioEngine(initialQueue: Track[]) {
   const loadAndPlayTrack = useCallback(
     async (track: Track, autoPlay: boolean) => {
       const requestId = ++loadRequestIdRef.current;
+      isRebufferingRef.current = false;
       const useCrossfade =
         autoPlay && isCrossfadeTransitionRef.current && crossfadeSeconds > 0;
       isCrossfadeTransitionRef.current = false;
@@ -734,6 +861,7 @@ export function useAudioEngine(initialQueue: Track[]) {
       crossfadeTriggeredForTrackRef.current = null;
       setDuration(track.duration || 180);
       setCurrentTime(0);
+      setBufferedAheadSeconds(0);
 
       if (activeObjectUrlRef.current) {
         URL.revokeObjectURL(activeObjectUrlRef.current);
@@ -778,7 +906,7 @@ export function useAudioEngine(initialQueue: Track[]) {
         }
       }
 
-      // 2. Direct HTTP Progressive Streaming (with Pre-Play Anti-Skip Buffer & 4-stage fallback for Jellyfin/Emby)
+      // 2. Direct HTTP Progressive Streaming (with Proactive Pre-Play Anti-Skip Buffer & 4-stage fallback for Jellyfin/Emby)
       const audio = ensureUntaintedAudioElement();
       audio.removeAttribute('crossOrigin');
 
@@ -818,7 +946,7 @@ export function useAudioEngine(initialQueue: Track[]) {
           audio.src = candidateUrl;
           audio.load();
 
-          // Wait for Pre-Play Anti-Skip Buffer (e.g. 3 seconds buffered) before starting playback
+          // Wait for Proactive Pre-Play Anti-Skip Buffer (default 6 seconds buffered) before starting playback
           await waitForStreamPreBuffer(audio, streamBufferSeconds);
           if (requestId !== loadRequestIdRef.current) return;
 
@@ -855,6 +983,122 @@ export function useAudioEngine(initialQueue: Track[]) {
     ]
   );
 
+  // Proactive Mid-Song Buffer Health Monitor & Next-Track HTTP Stream Pre-Warmer:
+  // 1. Monitors `bufferedAheadSeconds` every 500ms while playing over a mobile network.
+  //    If the buffer cushion drops critically low (< 1.1s ahead) mid-song, proactively pauses into
+  //    clean re-buffering mode until a safe cushion (up to 6s) refills, preventing rapid skipping/crackling!
+  // 2. Once the current track has >= 8s buffered ahead (or is within 35s of finishing), pre-warms
+  //    the next track's HTTP stream in a background `<audio preload="auto">` element.
+  useEffect(() => {
+    if (!isPlaying || !currentTrack) return;
+
+    const monitorInterval = setInterval(async () => {
+      const audio = audioRef.current;
+      if (!audio || !audio.src || audio.ended) return;
+
+      const isLocalBlob = audio.src.startsWith('blob:');
+      const ahead = computeBufferedAheadSeconds(
+        getBufferedRangesFromAudio(audio),
+        audio.currentTime || 0
+      );
+      setBufferedAheadSeconds(ahead);
+
+      const remaining = (audio.duration || duration) - (audio.currentTime || 0);
+
+      // 1. Proactive Mid-Song Anti-Skip Rebuffer Check on variable cellular connections
+      if (
+        !isLocalBlob &&
+        streamBufferSeconds > 0 &&
+        !isRebufferingRef.current &&
+        !isCrossfading &&
+        audio.currentTime > 1.5 &&
+        remaining > 4.5 &&
+        (ahead < 1.1 || audio.readyState < 3)
+      ) {
+        isRebufferingRef.current = true;
+        setIsBuffering(true);
+        const activeReqId = loadRequestIdRef.current;
+        try {
+          audio.pause();
+          const refillTarget = Math.max(
+            3,
+            Math.min(6, streamBufferSeconds || 6)
+          );
+          await waitForStreamPreBuffer(audio, refillTarget);
+          if (
+            activeReqId === loadRequestIdRef.current &&
+            isRebufferingRef.current &&
+            audioRef.current === audio
+          ) {
+            await audio.play();
+          }
+        } catch {
+          // Ignore transient resume error
+        } finally {
+          if (activeReqId === loadRequestIdRef.current) {
+            isRebufferingRef.current = false;
+            setIsBuffering(false);
+          }
+        }
+        return;
+      }
+
+      // 2. Proactive Next-Track HTTP Stream Pre-Warming
+      if (
+        queue.length > 1 &&
+        (isLocalBlob ||
+          ahead >= Math.max(8, streamBufferSeconds) ||
+          remaining <= 35)
+      ) {
+        const nextIdx = (currentIndex + 1) % queue.length;
+        const nextTrack = queue[nextIdx];
+        if (
+          nextTrack &&
+          nextTrack.id !== currentTrack.id &&
+          warmedNextTrackIdRef.current !== nextTrack.id &&
+          !cachedTrackIds.has(nextTrack.id)
+        ) {
+          warmedNextTrackIdRef.current = nextTrack.id;
+          let latestToken = '';
+          let latestUserId = '';
+          try {
+            latestToken = localStorage.getItem('jellyfin_token') || '';
+            latestUserId = localStorage.getItem('jellyfin_user_id') || '';
+          } catch {}
+          const nextCandidates = buildJellyfinStreamCandidates(
+            nextTrack,
+            latestToken,
+            latestUserId
+          );
+          if (nextCandidates.length > 0) {
+            try {
+              const warmupAudio =
+                nextTrackWarmupAudioRef.current || new Audio();
+              warmupAudio.preload = 'auto';
+              warmupAudio.muted = true;
+              warmupAudio.removeAttribute('crossOrigin');
+              warmupAudio.src = nextCandidates[0];
+              warmupAudio.load();
+              nextTrackWarmupAudioRef.current = warmupAudio;
+            } catch {}
+          }
+        }
+      }
+    }, 500);
+
+    return () => clearInterval(monitorInterval);
+  }, [
+    cachedTrackIds,
+    currentIndex,
+    currentTrack,
+    duration,
+    isCrossfading,
+    isPlaying,
+    queue,
+    streamBufferSeconds,
+    waitForStreamPreBuffer,
+  ]);
+
   // Trigger Seamless Crossfade when approaching the end of a track
   useEffect(() => {
     if (
@@ -884,6 +1128,8 @@ export function useAudioEngine(initialQueue: Track[]) {
 
     const audio = audioRef.current;
     if (isPlaying) {
+      isRebufferingRef.current = false;
+      setIsBuffering(false);
       audio?.pause();
       setIsPlaying(false);
       return;
@@ -905,15 +1151,31 @@ export function useAudioEngine(initialQueue: Track[]) {
   const playNext = useCallback(() => {
     if (queue.length === 0) return;
 
+    const current = queue[currentIndex];
     if (repeatMode === 'one') {
-      const current = queue[currentIndex];
       if (current) {
         loadAndPlayTrack(current, true);
       }
       return;
     }
 
-    const nextIdx = currentIndex + 1;
+    let step = 1;
+    // When Smart Anti-Repeat is active, never allow a duplicate downloaded copy of the current song to play back-to-back
+    if (smartAntiRepeatEnabled && current && queue.length > 1) {
+      while (step < queue.length) {
+        const candidateIdx = currentIndex + step;
+        if (candidateIdx >= queue.length && repeatMode === 'off') {
+          break;
+        }
+        const candidate = queue[candidateIdx % queue.length];
+        if (!areTracksSameSong(current, candidate)) {
+          break;
+        }
+        step += 1;
+      }
+    }
+
+    const nextIdx = currentIndex + step;
     if (nextIdx >= queue.length && repeatMode === 'off') {
       setIsPlaying(false);
       return;
@@ -925,7 +1187,13 @@ export function useAudioEngine(initialQueue: Track[]) {
     if (nextTrack) {
       loadAndPlayTrack(nextTrack, true);
     }
-  }, [currentIndex, loadAndPlayTrack, queue, repeatMode]);
+  }, [
+    currentIndex,
+    loadAndPlayTrack,
+    queue,
+    repeatMode,
+    smartAntiRepeatEnabled,
+  ]);
 
   useEffect(() => {
     onEndedCallbackRef.current = playNext;
@@ -962,10 +1230,28 @@ export function useAudioEngine(initialQueue: Track[]) {
 
   const playSpecificTrack = useCallback(
     (track: Track, customQueue?: Track[]) => {
-      const activeList = customQueue && customQueue.length > 0 ? customQueue : queue;
-      if (customQueue && customQueue.length > 0) {
-        setQueue(customQueue);
+      const rawList =
+        customQueue && customQueue.length > 0 ? customQueue : queue;
+      // If Smart Anti-Repeat is enabled, collapse duplicate copies while ensuring the clicked `track` is preserved
+      let activeList = rawList;
+      if (smartAntiRepeatEnabled && rawList.length > 1) {
+        const deduped = dedupeAndSpreadTracks(rawList, true);
+        // Replace any canonical twin of `track` with the exact `track` the user clicked
+        const twinIdx = deduped.findIndex((t) => areTracksSameSong(t, track));
+        if (twinIdx >= 0) {
+          deduped[twinIdx] = track;
+        } else {
+          deduped.unshift(track);
+        }
+        activeList = deduped;
       }
+
+      if (customQueue && customQueue.length > 0) {
+        setQueue(activeList);
+      } else if (activeList !== queue) {
+        setQueue(activeList);
+      }
+
       const idx = activeList.findIndex((t) => t.id === track.id);
       if (idx >= 0) {
         setCurrentIndex(idx);
@@ -975,7 +1261,7 @@ export function useAudioEngine(initialQueue: Track[]) {
       }
       loadAndPlayTrack(track, true);
     },
-    [loadAndPlayTrack, queue]
+    [loadAndPlayTrack, queue, smartAntiRepeatEnabled]
   );
 
   const queueTrackNext = useCallback(
@@ -994,14 +1280,21 @@ export function useAudioEngine(initialQueue: Track[]) {
       const nextState = !prev;
       if (nextState && queue.length > 1) {
         const current = queue[currentIndex];
-        const remaining = queue.filter((_, idx) => idx !== currentIndex);
-        const shuffled = fisherYatesShuffle(remaining);
+        const remaining = queue.filter(
+          (t, idx) =>
+            idx !== currentIndex &&
+            (!smartAntiRepeatEnabled || !areTracksSameSong(current, t))
+        );
+        const shuffled = smartAntiRepeatShuffle(
+          remaining,
+          smartAntiRepeatEnabled
+        );
         setQueue(current ? [current, ...shuffled] : shuffled);
         setCurrentIndex(0);
       }
       return nextState;
     });
-  }, [currentIndex, queue]);
+  }, [currentIndex, queue, smartAntiRepeatEnabled]);
 
   const cycleRepeatMode = useCallback(() => {
     setRepeatMode((prev) => {
@@ -1040,6 +1333,8 @@ export function useAudioEngine(initialQueue: Track[]) {
           crossfadeSeconds,
           offlinePreloadCount,
           streamBufferSeconds,
+          streamBufferUpgradedV2: true,
+          smartAntiRepeatEnabled,
           shuffleEnabled,
           repeatMode,
           visualTheme,
@@ -1055,6 +1350,7 @@ export function useAudioEngine(initialQueue: Track[]) {
     crossfadeSeconds,
     offlinePreloadCount,
     streamBufferSeconds,
+    smartAntiRepeatEnabled,
     shuffleEnabled,
     repeatMode,
     visualTheme,
@@ -1074,6 +1370,7 @@ export function useAudioEngine(initialQueue: Track[]) {
       stabilizerStrength?: StabilizerStrength;
       visualTheme?: VisualThemeId;
       streamBufferSeconds?: number;
+      smartAntiRepeatEnabled?: boolean;
     }) => {
       if (prefs.eqPreset) setEqPreset(prefs.eqPreset);
       if (Array.isArray(prefs.eqGains) && prefs.eqGains.length === 5) {
@@ -1097,8 +1394,11 @@ export function useAudioEngine(initialQueue: Track[]) {
       }
       if (typeof prefs.streamBufferSeconds === 'number') {
         setStreamBufferSeconds(
-          Math.max(0, Math.min(8, Math.round(prefs.streamBufferSeconds)))
+          Math.max(0, Math.min(15, Math.round(prefs.streamBufferSeconds)))
         );
+      }
+      if (typeof prefs.smartAntiRepeatEnabled === 'boolean') {
+        setSmartAntiRepeatEnabled(prefs.smartAntiRepeatEnabled);
       }
       if (
         prefs.stabilizerStrength === 'off' ||
@@ -1289,6 +1589,7 @@ export function useAudioEngine(initialQueue: Track[]) {
     currentTrack,
     isPlaying,
     isBuffering,
+    bufferedAheadSeconds,
     currentTime,
     duration,
     volume,
@@ -1313,6 +1614,8 @@ export function useAudioEngine(initialQueue: Track[]) {
     setOfflinePreloadCount,
     streamBufferSeconds,
     setStreamBufferSeconds,
+    smartAntiRepeatEnabled,
+    setSmartAntiRepeatEnabled,
     eqPreset,
     eqGains,
     applyEqPreset,

@@ -42,6 +42,9 @@ interface AudioLabVaultViewProps {
   onChangeOfflinePreloadCount: (count: number) => void;
   streamBufferSeconds: number;
   onChangeStreamBufferSeconds: (sec: number) => void;
+  bufferedAheadSeconds?: number;
+  smartAntiRepeatEnabled?: boolean;
+  onToggleSmartAntiRepeat?: (next: boolean) => void;
   eqPreset: EQPresetName;
   eqGains: number[];
   onApplyPreset: (preset: Exclude<EQPresetName, 'Custom'>) => void;
@@ -71,6 +74,9 @@ export const AudioLabVaultView: React.FC<AudioLabVaultViewProps> = ({
   onChangeOfflinePreloadCount,
   streamBufferSeconds,
   onChangeStreamBufferSeconds,
+  bufferedAheadSeconds = 0,
+  smartAntiRepeatEnabled = true,
+  onToggleSmartAntiRepeat,
   eqPreset,
   eqGains,
   onApplyPreset,
@@ -240,13 +246,13 @@ export const AudioLabVaultView: React.FC<AudioLabVaultViewProps> = ({
               </div>
             </div>
 
-            {/* Pre-Play Anti-Skip Stream Buffer Slider (0s to 8s, default 3s) */}
+            {/* Proactive Pre-Play & Mid-Song Anti-Skip Stream Buffer Slider (0s to 15s, default 6s) */}
             <div className="rounded-xl border border-emerald-500/40 bg-zinc-950/80 p-4 space-y-2">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-1.5">
                   <Database className="w-3.5 h-3.5 text-[#00ff66]" />
                   <span className="text-xs font-bold text-white">
-                    Pre-Play Anti-Skip Stream Buffer
+                    Proactive Anti-Skip Stream Buffer
                   </span>
                 </div>
                 <span
@@ -255,19 +261,19 @@ export const AudioLabVaultView: React.FC<AudioLabVaultViewProps> = ({
                 >
                   {streamBufferSeconds === 0
                     ? 'Instant (0s)'
-                    : `${streamBufferSeconds}s Pre-Buffer`}
+                    : `${streamBufferSeconds}s Cushion`}
                 </span>
               </div>
               <p className="text-[11px] text-zinc-400 leading-relaxed">
-                Buffers {streamBufferSeconds || 0} seconds of audio before
-                starting playback and uses Android&apos;s native hardware
-                decoder (zero FM-radio compression or cellular skipping).
+                Pre-buffers {streamBufferSeconds || 0}s before starting,
+                monitors mid-song buffer health to prevent cellular skipping,
+                and pre-warms the next song automatically.
               </p>
 
               <input
                 type="range"
                 min={0}
-                max={8}
+                max={15}
                 step={1}
                 value={streamBufferSeconds}
                 aria-label="Pre-Play Anti-Skip Stream Buffer in Seconds"
@@ -280,9 +286,19 @@ export const AudioLabVaultView: React.FC<AudioLabVaultViewProps> = ({
 
               <div className="flex justify-between text-[10px] font-mono text-zinc-500 tabular-nums">
                 <span>0s (Instant)</span>
-                <span>3s (Recommended)</span>
-                <span>5s (Highway)</span>
-                <span>8s (Max Buffer)</span>
+                <span>6s (Default)</span>
+                <span>10s (Highway)</span>
+                <span>15s (Max)</span>
+              </div>
+
+              <div className="winamp-lcd rounded-lg px-3 py-1.5 text-[11px] font-mono text-zinc-300 flex items-center justify-between">
+                <span>Live Buffer Ahead:</span>
+                <strong
+                  data-testid="live-buffered-ahead-readout"
+                  className="text-[#00ff66] tabular-nums"
+                >
+                  {bufferedAheadSeconds.toFixed(1)}s buffered
+                </strong>
               </div>
             </div>
 
@@ -350,6 +366,29 @@ export const AudioLabVaultView: React.FC<AudioLabVaultViewProps> = ({
                 testId="audiolab-toggle-lufs"
               />
             </div>
+
+            {/* Toggle 3: Smart Anti-Repeat & Duplicate Song Guard */}
+            {onToggleSmartAntiRepeat && (
+              <div className="flex items-start justify-between gap-4 rounded-xl border border-emerald-500/35 bg-zinc-950/80 p-4">
+                <div className="space-y-1">
+                  <div className="text-sm font-semibold text-white">
+                    Smart Anti-Repeat &amp; Duplicate Song Guard
+                  </div>
+                  <p className="text-xs text-zinc-400 leading-relaxed">
+                    Fingerprints song titles &amp; artists to collapse duplicate
+                    downloads and guarantee the same song never plays
+                    back-to-back.
+                  </p>
+                </div>
+                <SlidingToggle
+                  checked={smartAntiRepeatEnabled}
+                  onChange={onToggleSmartAntiRepeat}
+                  label={smartAntiRepeatEnabled ? 'ON' : 'OFF'}
+                  ariaLabel="Toggle Smart Anti-Repeat Duplicate Song Guard"
+                  testId="audiolab-toggle-smart-antirepeat"
+                />
+              </div>
+            )}
           </div>
         </section>
 

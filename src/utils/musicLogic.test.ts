@@ -33,8 +33,173 @@ import {
   buildJellyfinGlobalPlaylistsUrl,
   VISUAL_THEMES,
   isValidVisualTheme,
+  computeBufferedAheadSeconds,
+  getCanonicalSongSignature,
+  areTracksSameSong,
+  dedupeAndSpreadTracks,
+  smartAntiRepeatShuffle,
+  mergePlaylistsPreservingCustomNames,
 } from './musicLogic';
-import type { BrokeifyCloudSettings, ProviderConfig, Track } from '../types/music';
+import type {
+  BrokeifyCloudSettings,
+  Playlist,
+  ProviderConfig,
+  Track,
+} from '../types/music';
+
+test('Smart Anti-Repeat fingerprints duplicate downloader copies and never plays the same song back-to-back', () => {
+  const dup1: Track = {
+    id: 'jf-dup-1',
+    title:
+      '(When You Gonna) Give It Up To Me (Radio Version) - Sean Paul; Keyshia Cole',
+    artist: 'a',
+    album: 'Unknown',
+    duration: 243,
+    source: 'jellyfin',
+    sourceName: 'Jellyfin',
+    streamUrl: 'https://jellyfin.local/Audio/1/universal',
+    artworkUrl: '',
+    accentColor: '#10b981',
+  };
+  const dup2: Track = {
+    ...dup1,
+    id: 'jf-dup-2',
+    streamUrl: 'https://jellyfin.local/Audio/2/universal',
+  };
+  const dup3: Track = {
+    ...dup1,
+    id: 'jf-dup-3',
+    streamUrl: 'https://jellyfin.local/Audio/3/universal',
+  };
+  const cleanCopy: Track = {
+    id: 'jf-dup-4',
+    title:
+      '(When You Gonna) Give It Up To Me (feat. Keyshia Cole) (Radio Version)',
+    artist: 'Sean Paul',
+    album: 'The Trinity',
+    duration: 243,
+    source: 'jellyfin',
+    sourceName: 'Jellyfin',
+    streamUrl: 'https://jellyfin.local/Audio/4/universal',
+    artworkUrl: '',
+    accentColor: '#10b981',
+    format: 'FLAC',
+    bitrateKbps: 980,
+  };
+  const otherSong: Track = {
+    id: 'jf-other-1',
+    title: 'Temperature',
+    artist: 'Sean Paul',
+    album: 'The Trinity',
+    duration: 218,
+    source: 'jellyfin',
+    sourceName: 'Jellyfin',
+    streamUrl: 'https://jellyfin.local/Audio/5/universal',
+    artworkUrl: '',
+    accentColor: '#10b981',
+  };
+
+  assert.equal(
+    getCanonicalSongSignature(dup1),
+    'when you gonna give it up to me'
+  );
+  assert.equal(
+    getCanonicalSongSignature(cleanCopy),
+    'when you gonna give it up to me'
+  );
+  assert.equal(areTracksSameSong(dup1, cleanCopy), true);
+  assert.equal(areTracksSameSong(dup1, otherSong), false);
+
+  // Deduplicating collapses the 4 copies into 1 (keeping the clean copy with artist "Sean Paul")
+  const collapsed = dedupeAndSpreadTracks(
+    [dup1, dup2, dup3, cleanCopy, otherSong],
+    true
+  );
+  assert.equal(collapsed.length, 2);
+  assert.equal(collapsed[0].id, 'jf-dup-4');
+  assert.equal(collapsed[0].artist, 'Sean Paul');
+  assert.equal(collapsed[1].id, 'jf-other-1');
+
+  const shuffled = smartAntiRepeatShuffle(
+    [dup1, dup2, dup3, cleanCopy, otherSong],
+    true,
+    () => 0.42
+  );
+  assert.equal(shuffled.length, 2);
+});
+
+test('mergePlaylistsPreservingCustomNames preserves custom playlist names while keeping the real server name in originalName', () => {
+  const existing: Playlist[] = [
+    {
+      id: 'jellyfin-pl-101',
+      name: 'Truck Driving Bangers',
+      originalName: ' jellyfin_auto_import_2026 ',
+      description: 'Synced playlist',
+      source: 'jellyfin',
+      trackIds: ['t1', 't2'],
+      createdAt: '2026-11-01',
+      coverAccent: '#10b981',
+    },
+  ];
+  const incomingFromServer: Playlist[] = [
+    {
+      id: 'jellyfin-pl-101',
+      name: 'jellyfin_auto_import_2026',
+      description: 'Synced playlist updated',
+      source: 'jellyfin',
+      trackIds: ['t1', 't2', 't3'],
+      createdAt: '2026-11-08',
+      coverAccent: '#10b981',
+    },
+  ];
+
+  const merged = mergePlaylistsPreservingCustomNames(
+    existing,
+    incomingFromServer,
+    { 'jellyfin-pl-101': 'Truck Driving Bangers' }
+  );
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].name, 'Truck Driving Bangers');
+  assert.equal(merged[0].originalName, 'jellyfin_auto_import_2026');
+  assert.deepEqual(merged[0].trackIds, ['t1', 't2', 't3']);
+});
+
+test('Proactive stream buffer defaults to 6s and computeBufferedAheadSeconds measures ahead cushion accurately', () => {
+  const sampleSettings: BrokeifyCloudSettings = {
+    version: 1,
+    updatedAt: '2026-11-08T12:00:00.000Z',
+    audioPrefs: {
+      eqPreset: 'Car Stereo',
+      eqGains: [4.5, 2.0, -1.5, 2.5, 4.0],
+      carVolumeLeveler: true,
+      lufsNormalizationEnabled: true,
+      shuffleEnabled: false,
+      repeatMode: 'all',
+    },
+    providers: [],
+    playlists: [],
+  };
+  const parsed = parseCloudSettingsResponse(
+    serializeCloudSettingsPayload(sampleSettings)
+  );
+  assert.equal(parsed?.audioPrefs.streamBufferSeconds, 6);
+
+  assert.equal(computeBufferedAheadSeconds([], 10), 0);
+  assert.equal(
+    computeBufferedAheadSeconds([{ start: 0, end: 18.5 }], 12.0),
+    6.5
+  );
+  assert.equal(
+    computeBufferedAheadSeconds(
+      [
+        { start: 0, end: 5 },
+        { start: 20, end: 32.4 },
+      ],
+      22.4
+    ),
+    10
+  );
+});
 
 test('ROTATING_SPITE_TAGLINES includes all 3 required taglines', () => {
   assert.equal(ROTATING_SPITE_TAGLINES.length, 3);

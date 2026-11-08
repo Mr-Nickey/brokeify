@@ -7,6 +7,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   ArrowDownToLine,
   Car,
+  Check,
   CheckCircle2,
   ChevronUp,
   Coffee,
@@ -21,14 +22,17 @@ import {
   Music,
   Palette,
   Pause,
+  Pencil,
   Play,
   Plus,
   Radio,
   Repeat,
   Repeat1,
+  RotateCcw,
   Search,
   Server,
   Settings,
+  ShieldCheck,
   Shuffle,
   SkipBack,
   SkipForward,
@@ -39,10 +43,10 @@ import {
   Users,
   Volume2,
   VolumeX,
+  X,
 } from 'lucide-react';
 import { BrokeifyLogo } from './components/BrokeifyLogo';
 import { BuyMeACoffeeModal } from './components/BuyMeACoffeeModal';
-import { PWAInstallButton } from './components/PWAInstallButton';
 import { SlidingToggle } from './components/SlidingToggle';
 import { SourcesHubView } from './components/SourcesHubView';
 import { SpotifyImporterView } from './components/SpotifyImporterView';
@@ -62,8 +66,10 @@ import type {
   Track,
 } from './types/music';
 import {
-  fisherYatesShuffle,
+  dedupeAndSpreadTracks,
+  mergePlaylistsPreservingCustomNames,
   mergeProvidersPreservingAuth,
+  smartAntiRepeatShuffle,
   VISUAL_THEMES,
 } from './utils/musicLogic';
 import { preloadTrackToVault } from './utils/offlineVault';
@@ -185,6 +191,13 @@ export default function App() {
   const [showNewPlaylistForm, setShowNewPlaylistForm] = useState<boolean>(false);
   const [newPlaylistName, setNewPlaylistName] = useState<string>('');
 
+  // Playlist Rename State (Custom Display Name + Real Server Name preserved)
+  const [editingPlaylistId, setEditingPlaylistId] = useState<string | null>(
+    null
+  );
+  const [editingPlaylistNameInput, setEditingPlaylistNameInput] =
+    useState<string>('');
+
   // Call navigator.storage.persist() on app startup and auto-sync Jellyfin if credentials exist
   useEffect(() => {
     let mounted = true;
@@ -229,10 +242,13 @@ export default function App() {
             }
             if (syncedPlaylists.length > 0) {
               setPlaylists((prev) => {
-                const byId = new Map<string, Playlist>();
-                for (const pl of prev) byId.set(pl.id, pl);
-                for (const pl of syncedPlaylists) byId.set(pl.id, pl);
-                const updated = Array.from(byId.values());
+                const customNames =
+                  MusicProviderManager.loadCustomPlaylistNames();
+                const updated = mergePlaylistsPreservingCustomNames(
+                  prev,
+                  syncedPlaylists,
+                  customNames
+                );
                 MusicProviderManager.savePlaylists(updated);
                 return updated;
               });
@@ -364,20 +380,97 @@ export default function App() {
     return matched.length > 0 ? matched : allTracks.slice(0, 6);
   };
 
-  // Play playlist in order (1 click)
+  // Start renaming a playlist
+  const handleStartRenamePlaylist = (pl: Playlist) => {
+    setEditingPlaylistId(pl.id);
+    setEditingPlaylistNameInput(pl.name);
+  };
+
+  // Save custom playlist name while keeping real originalName intact
+  const handleSavePlaylistName = (pl: Playlist) => {
+    const trimmed = editingPlaylistNameInput.trim();
+    if (!trimmed) return;
+    const realName = pl.originalName || pl.name;
+    const customNames = MusicProviderManager.loadCustomPlaylistNames();
+    if (trimmed === realName) {
+      delete customNames[pl.id];
+    } else {
+      customNames[pl.id] = trimmed;
+    }
+    MusicProviderManager.saveCustomPlaylistNames(customNames);
+
+    setPlaylists((prev) => {
+      const updated = prev.map((item) =>
+        item.id === pl.id
+          ? {
+              ...item,
+              name: trimmed,
+              originalName: realName,
+            }
+          : item
+      );
+      MusicProviderManager.savePlaylists(updated);
+      return updated;
+    });
+    setEditingPlaylistId(null);
+    setEditingPlaylistNameInput('');
+    setToastMessage(
+      trimmed === realName
+        ? `Restored playlist real name: "${realName}"`
+        : `Renamed playlist to "${trimmed}" (Real name: "${realName}")`
+    );
+  };
+
+  // Reset playlist back to its real server name
+  const handleResetPlaylistName = (pl: Playlist) => {
+    const realName = pl.originalName || pl.name;
+    const customNames = MusicProviderManager.loadCustomPlaylistNames();
+    delete customNames[pl.id];
+    MusicProviderManager.saveCustomPlaylistNames(customNames);
+
+    setPlaylists((prev) => {
+      const updated = prev.map((item) =>
+        item.id === pl.id
+          ? {
+              ...item,
+              name: realName,
+              originalName: realName,
+            }
+          : item
+      );
+      MusicProviderManager.savePlaylists(updated);
+      return updated;
+    });
+    setEditingPlaylistId(null);
+    setEditingPlaylistNameInput('');
+    setToastMessage(`Restored real playlist name: "${realName}"`);
+  };
+
+  // Play playlist in order (1 click, with duplicate-song collapse when Smart Anti-Repeat is active)
   const handlePlayPlaylistInOrder = (pl: Playlist) => {
-    const plTracks = getTracksForPlaylist(pl);
-    if (plTracks.length === 0) return;
+    const rawTracks = getTracksForPlaylist(pl);
+    if (rawTracks.length === 0) return;
+    const plTracks = audio.smartAntiRepeatEnabled
+      ? dedupeAndSpreadTracks(rawTracks, true)
+      : rawTracks;
     audio.playSpecificTrack(plTracks[0], plTracks);
   };
 
-  // Shuffle & Play playlist immediately (1 click)
+  // Shuffle & Play playlist immediately (1 click, using Smart Anti-Repeat so duplicate songs never play back-to-back)
   const handleShufflePlayPlaylist = (pl: Playlist) => {
     const plTracks = getTracksForPlaylist(pl);
     if (plTracks.length === 0) return;
-    const shuffled = fisherYatesShuffle(plTracks);
+    const shuffled = smartAntiRepeatShuffle(
+      plTracks,
+      audio.smartAntiRepeatEnabled
+    );
+    const removedCount = Math.max(0, plTracks.length - shuffled.length);
     audio.playSpecificTrack(shuffled[0], shuffled);
-    setToastMessage(`🔀 Shuffling "${pl.name}" (${shuffled.length} tracks)`);
+    setToastMessage(
+      removedCount > 0
+        ? `🔀 Shuffling "${pl.name}" (${shuffled.length} tracks · ${removedCount} duplicate copies skipped)`
+        : `🔀 Shuffling "${pl.name}" (${shuffled.length} tracks)`
+    );
   };
 
   const handleApplyRestoredCloudSettings = (
@@ -398,20 +491,18 @@ export default function App() {
     }
     if (Array.isArray(restored.playlists) && restored.playlists.length > 0) {
       setPlaylists((prev) => {
-        const byId = new Map<string, Playlist>();
-        for (const p of prev) {
-          if (p.source !== 'built-in') byId.set(p.id, p);
-        }
-        for (const p of restored.playlists) {
-          if (
+        const filteredIncoming = restored.playlists.filter(
+          (p) =>
             p.source !== 'built-in' &&
             p.id !== 'pl-night-drive' &&
             p.id !== 'pl-spite-anthem'
-          ) {
-            byId.set(p.id, p);
-          }
-        }
-        const mergedPl = Array.from(byId.values());
+        );
+        const customNames = MusicProviderManager.loadCustomPlaylistNames();
+        const mergedPl = mergePlaylistsPreservingCustomNames(
+          prev.filter((p) => p.source !== 'built-in'),
+          filteredIncoming,
+          customNames
+        );
         MusicProviderManager.savePlaylists(mergedPl);
         return mergedPl;
       });
@@ -465,6 +556,7 @@ export default function App() {
         offlinePreloadCount: audio.offlinePreloadCount,
         streamBufferSeconds: audio.streamBufferSeconds,
         shuffleEnabled: audio.shuffleEnabled,
+        smartAntiRepeatEnabled: audio.smartAntiRepeatEnabled,
         repeatMode: audio.repeatMode,
         visualTheme: audio.visualTheme,
       },
@@ -503,6 +595,7 @@ export default function App() {
         offlinePreloadCount: audio.offlinePreloadCount,
         streamBufferSeconds: audio.streamBufferSeconds,
         shuffleEnabled: audio.shuffleEnabled,
+        smartAntiRepeatEnabled: audio.smartAntiRepeatEnabled,
         repeatMode: audio.repeatMode,
         visualTheme: audio.visualTheme,
       },
@@ -528,6 +621,7 @@ export default function App() {
     audio.offlinePreloadCount,
     audio.streamBufferSeconds,
     audio.shuffleEnabled,
+    audio.smartAntiRepeatEnabled,
     audio.repeatMode,
     audio.visualTheme,
     providers,
@@ -549,17 +643,23 @@ export default function App() {
       return updated;
     });
     if (newTracks.length > 0) {
-      audio.setQueue(newTracks);
+      audio.setQueue(
+        audio.smartAntiRepeatEnabled
+          ? dedupeAndSpreadTracks(newTracks, true)
+          : newTracks
+      );
     }
   };
 
   const handleMergeRemotePlaylists = (newPlaylists: Playlist[]) => {
     if (newPlaylists.length === 0) return;
     setPlaylists((prev) => {
-      const byId = new Map<string, Playlist>();
-      for (const pl of prev) byId.set(pl.id, pl);
-      for (const pl of newPlaylists) byId.set(pl.id, pl);
-      const updated = Array.from(byId.values());
+      const customNames = MusicProviderManager.loadCustomPlaylistNames();
+      const updated = mergePlaylistsPreservingCustomNames(
+        prev,
+        newPlaylists,
+        customNames
+      );
       MusicProviderManager.savePlaylists(updated);
       return updated;
     });
@@ -596,7 +696,7 @@ export default function App() {
 
   const handleSaveResolvedPlaylist = (newPl: Playlist) => {
     setPlaylists((prev) => {
-      const updated = [newPl, ...prev];
+      const updated = [{ ...newPl, originalName: newPl.originalName || newPl.name }, ...prev];
       MusicProviderManager.savePlaylists(updated);
       return updated;
     });
@@ -607,9 +707,11 @@ export default function App() {
   const handleCreateCustomPlaylist = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newPlaylistName.trim()) return;
+    const trimmed = newPlaylistName.trim();
     const pl: Playlist = {
       id: `pl-custom-${Date.now()}`,
-      name: newPlaylistName.trim(),
+      name: trimmed,
+      originalName: trimmed,
       description: 'Unified multi-source playlist created in Brokeify.',
       source: 'mixed',
       trackIds: allTracks.slice(0, 4).map((t) => t.id),
@@ -950,6 +1052,16 @@ export default function App() {
                           >
                             {pinnedFavoritePlaylist.name}
                           </h3>
+                          {pinnedFavoritePlaylist.originalName &&
+                            pinnedFavoritePlaylist.originalName !==
+                              pinnedFavoritePlaylist.name && (
+                              <div
+                                title={`Real Name: ${pinnedFavoritePlaylist.originalName}`}
+                                className="text-[10px] font-mono text-zinc-400 truncate block max-w-full"
+                              >
+                                Real: {pinnedFavoritePlaylist.originalName}
+                              </div>
+                            )}
                         </div>
                         <span className="text-[10px] font-mono text-zinc-400 shrink-0">
                           {getTracksForPlaylist(pinnedFavoritePlaylist).length}tr
@@ -1195,6 +1307,9 @@ export default function App() {
                         plTracks.every((t) => audio.cachedTrackIds.has(t.id));
                       const isDownloading = downloadingPlaylistId === pl.id;
                       const isPinned = pinnedFavoritePlaylist?.id === pl.id;
+                      const realPlaylistName = pl.originalName || pl.name;
+                      const hasCustomName = realPlaylistName !== pl.name;
+                      const isEditingThis = editingPlaylistId === pl.id;
 
                       return (
                         <div
@@ -1206,7 +1321,7 @@ export default function App() {
                               : 'border-zinc-800/90 hover:border-zinc-700'
                           }`}
                         >
-                          <div className="space-y-2">
+                          <div className="space-y-2.5">
                             <div className="flex items-start justify-between gap-2">
                               <button
                                 type="button"
@@ -1217,16 +1332,59 @@ export default function App() {
                                 className="text-left min-w-0 flex-1 overflow-hidden"
                               >
                                 <div className="flex items-center gap-1.5">
-                                  <h3 className="text-base font-bold text-white group-hover:text-[#00ff66] transition-colors truncate">
+                                  <h3
+                                    data-testid={`playlist-display-name-${pl.id}`}
+                                    className="text-base font-bold text-white group-hover:text-[#00ff66] transition-colors truncate"
+                                  >
                                     {pl.name}
                                   </h3>
+                                  {hasCustomName && (
+                                    <span className="rounded bg-purple-500/20 border border-purple-500/40 px-1.5 py-0.5 text-[9px] font-mono font-bold uppercase text-purple-300 shrink-0">
+                                      Renamed
+                                    </span>
+                                  )}
                                 </div>
-                                <p className="text-xs text-zinc-400 mt-1 line-clamp-2">
+
+                                {/* Always display the Real / Original Server Name alongside the custom Playlist Name */}
+                                <div
+                                  data-testid={`playlist-real-name-${pl.id}`}
+                                  className="mt-1 rounded-lg border border-zinc-800/90 bg-zinc-950/80 px-2 py-1 text-[11px] font-mono text-zinc-300 flex items-center gap-1.5 truncate"
+                                  title={`Real Server Playlist Name: ${realPlaylistName}`}
+                                >
+                                  <span className="text-zinc-500 shrink-0">
+                                    Real Name:
+                                  </span>
+                                  <span className="text-[#00ff66] font-semibold truncate">
+                                    {realPlaylistName}
+                                  </span>
+                                </div>
+
+                                <p className="text-xs text-zinc-400 mt-1.5 line-clamp-2">
                                   {pl.description}
                                 </p>
                               </button>
 
                               <div className="flex items-center gap-1.5 shrink-0">
+                                {/* Rename Playlist Button */}
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    isEditingThis
+                                      ? setEditingPlaylistId(null)
+                                      : handleStartRenamePlaylist(pl)
+                                  }
+                                  data-testid={`rename-playlist-btn-${pl.id}`}
+                                  aria-label={`Rename playlist ${pl.name}`}
+                                  title="Rename Playlist (keeps Real Name visible)"
+                                  className={`min-h-[34px] min-w-[34px] rounded-xl border flex items-center justify-center transition-colors ${
+                                    isEditingThis
+                                      ? 'border-[#00ff66] bg-emerald-500/20 text-[#00ff66]'
+                                      : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-white'
+                                  }`}
+                                >
+                                  <Pencil className="w-3.5 h-3.5" />
+                                </button>
+
                                 {/* Star / Pin Favorite Playlist Button */}
                                 <button
                                   type="button"
@@ -1286,6 +1444,68 @@ export default function App() {
                                 </button>
                               </div>
                             </div>
+
+                            {/* Inline Rename Editor */}
+                            {isEditingThis && (
+                              <form
+                                onSubmit={(e) => {
+                                  e.preventDefault();
+                                  handleSavePlaylistName(pl);
+                                }}
+                                data-testid={`rename-playlist-form-${pl.id}`}
+                                className="rounded-xl border border-emerald-500/40 bg-zinc-950/95 p-2.5 space-y-2"
+                              >
+                                <div className="flex items-center justify-between text-[10px] font-mono text-zinc-400">
+                                  <span>Custom Display Name:</span>
+                                  <span className="text-zinc-500 truncate max-w-[180px]">
+                                    Real: {realPlaylistName}
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                  <input
+                                    type="text"
+                                    value={editingPlaylistNameInput}
+                                    onChange={(e) =>
+                                      setEditingPlaylistNameInput(
+                                        e.target.value
+                                      )
+                                    }
+                                    placeholder="Enter custom playlist name..."
+                                    aria-label="Custom playlist name"
+                                    data-testid={`rename-playlist-input-${pl.id}`}
+                                    className="flex-1 min-w-0 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs text-white focus:border-[#00ff66] focus:outline-none"
+                                  />
+                                  <button
+                                    type="submit"
+                                    data-testid={`save-playlist-name-${pl.id}`}
+                                    title="Save Custom Name"
+                                    className="rounded-lg bg-[#00ff66] hover:bg-emerald-400 px-2.5 py-1.5 text-xs font-mono font-bold text-zinc-950 inline-flex items-center gap-1 shrink-0 min-h-[32px]"
+                                  >
+                                    <Check className="w-3.5 h-3.5" />
+                                    <span>Save</span>
+                                  </button>
+                                  {hasCustomName && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleResetPlaylistName(pl)}
+                                      data-testid={`reset-playlist-name-${pl.id}`}
+                                      title={`Reset to real name (${realPlaylistName})`}
+                                      className="rounded-lg border border-zinc-700 bg-zinc-900 hover:text-amber-300 px-2 py-1.5 text-xs font-mono text-zinc-300 inline-flex items-center gap-1 shrink-0 min-h-[32px]"
+                                    >
+                                      <RotateCcw className="w-3.5 h-3.5" />
+                                    </button>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={() => setEditingPlaylistId(null)}
+                                    title="Cancel"
+                                    className="rounded-lg border border-zinc-800 bg-zinc-900 hover:text-white p-1.5 text-zinc-400 shrink-0 min-h-[32px]"
+                                  >
+                                    <X className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                              </form>
+                            )}
 
                             <div className="text-[11px] font-mono text-zinc-400 flex items-center gap-2">
                               <span>{plTracks.length} tracks</span>
@@ -1359,22 +1579,42 @@ export default function App() {
                     ))}
                   </div>
 
-                  <div className="flex items-center gap-2">
-                    {selectedPlaylistId && (
-                      <button
-                        type="button"
-                        onClick={() => setSelectedPlaylistId(null)}
-                        className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs font-mono font-semibold text-[#00ff66] hover:text-white min-h-[32px]"
-                      >
-                        Clear Playlist Filter (Show All {allTracks.length})
-                      </button>
-                    )}
+                  <div className="flex flex-wrap items-center gap-2">
+                    {selectedPlaylistId && (() => {
+                      const activePl = visiblePlaylists.find(
+                        (p) => p.id === selectedPlaylistId
+                      );
+                      const realPlName =
+                        activePl?.originalName || activePl?.name || '';
+                      return (
+                        <div className="flex items-center gap-2">
+                          {activePl && (
+                            <span className="rounded-lg border border-purple-500/40 bg-purple-950/30 px-2.5 py-1 text-xs font-mono text-purple-200">
+                              Playlist: <strong>{activePl.name}</strong>
+                              {realPlName && realPlName !== activePl.name
+                                ? ` (Real: ${realPlName})`
+                                : ''}
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => setSelectedPlaylistId(null)}
+                            className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs font-mono font-semibold text-[#00ff66] hover:text-white min-h-[32px]"
+                          >
+                            Clear Playlist Filter (Show All {allTracks.length})
+                          </button>
+                        </div>
+                      );
+                    })()}
 
                     <button
                       type="button"
                       onClick={() => {
                         if (displayedTracks.length > 0) {
-                          const shuffled = fisherYatesShuffle(displayedTracks);
+                          const shuffled = smartAntiRepeatShuffle(
+                            displayedTracks,
+                            audio.smartAntiRepeatEnabled
+                          );
                           audio.playSpecificTrack(shuffled[0], shuffled);
                           setToastMessage(
                             `🔀 Shuffling ${shuffled.length} songs`
@@ -1606,7 +1846,10 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => {
-                          const shuffled = fisherYatesShuffle(group.tracks);
+                          const shuffled = smartAntiRepeatShuffle(
+                            group.tracks,
+                            audio.smartAntiRepeatEnabled
+                          );
                           audio.playSpecificTrack(shuffled[0], shuffled);
                         }}
                         className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#a855f7] hover:bg-purple-400 py-2 px-3 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[36px]"
@@ -1671,7 +1914,10 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => {
-                          const shuffled = fisherYatesShuffle(group.tracks);
+                          const shuffled = smartAntiRepeatShuffle(
+                            group.tracks,
+                            audio.smartAntiRepeatEnabled
+                          );
                           audio.playSpecificTrack(shuffled[0], shuffled);
                         }}
                         className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#a855f7] hover:bg-purple-400 py-2 px-3 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[36px]"
@@ -1954,26 +2200,64 @@ export default function App() {
 
             {/* Right 5 Columns: Up Next Queue + Crossfade Slider + Offline Queue Slider (2 to 12 Tracks) */}
             <aside className="lg:col-span-5 winamp-bezel rounded-3xl border border-zinc-700/80 overflow-hidden">
-              <div className="winamp-titlebar px-5 py-3 flex items-center justify-between border-b border-zinc-700/80">
+              <div className="winamp-titlebar px-5 py-3 flex flex-wrap items-center justify-between gap-2 border-b border-zinc-700/80">
                 <div>
                   <h3 className="text-xs font-mono font-bold uppercase tracking-wider text-white">
                     UP NEXT QUEUE ({audio.queue.length})
                   </h3>
                 </div>
 
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (audio.queue.length > 0) {
-                      const shuffled = fisherYatesShuffle(audio.queue);
-                      audio.playSpecificTrack(shuffled[0], shuffled);
-                    }
-                  }}
-                  className="inline-flex items-center gap-1.5 rounded-lg bg-[#a855f7] hover:bg-purple-400 px-3 py-1 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[32px]"
-                >
-                  <Shuffle className="w-3.5 h-3.5" />
-                  <span>Shuffle</span>
-                </button>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const nextVal = !audio.smartAntiRepeatEnabled;
+                      audio.setSmartAntiRepeatEnabled(nextVal);
+                      if (nextVal && audio.queue.length > 1) {
+                        const deduped = dedupeAndSpreadTracks(
+                          audio.queue,
+                          true
+                        );
+                        audio.setQueue(deduped);
+                      }
+                      setToastMessage(
+                        nextVal
+                          ? '🛡️ Smart Anti-Repeat ON: Duplicate song copies blocked from playing back-to-back'
+                          : 'Smart Anti-Repeat Off'
+                      );
+                    }}
+                    data-testid="nowplaying-antirepeat-btn"
+                    title="Smart Anti-Repeat & Duplicate Song Guard: Never play duplicate downloads of the same song back-to-back"
+                    className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-mono font-bold transition-colors min-h-[32px] ${
+                      audio.smartAntiRepeatEnabled
+                        ? 'border-emerald-500/60 bg-emerald-500/15 text-[#00ff66]'
+                        : 'border-zinc-700 bg-zinc-900 text-zinc-400 hover:text-white'
+                    }`}
+                  >
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    <span>
+                      No Back-to-Back:{' '}
+                      {audio.smartAntiRepeatEnabled ? 'ON' : 'OFF'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (audio.queue.length > 0) {
+                        const shuffled = smartAntiRepeatShuffle(
+                          audio.queue,
+                          audio.smartAntiRepeatEnabled
+                        );
+                        audio.playSpecificTrack(shuffled[0], shuffled);
+                      }
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-[#a855f7] hover:bg-purple-400 px-3 py-1 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[32px]"
+                  >
+                    <Shuffle className="w-3.5 h-3.5" />
+                    <span>Shuffle</span>
+                  </button>
+                </div>
               </div>
 
               <div className="p-5 space-y-4">
@@ -2125,8 +2409,6 @@ export default function App() {
               </div>
 
               <div className="flex flex-wrap items-center gap-1.5">
-                <PWAInstallButton />
-
                 <button
                   type="button"
                   onClick={() => setIsOnboardingOpen(true)}
@@ -2300,7 +2582,6 @@ export default function App() {
                       />
                     </div>
                   </div>
-                  <PWAInstallButton />
                 </div>
 
                 <AudioLabVaultView
@@ -2312,12 +2593,15 @@ export default function App() {
                   onChangeStabilizerStrength={audio.setStabilizerStrength}
                   lufsNormalizationEnabled={audio.lufsNormalizationEnabled}
                   onToggleLufsNormalization={audio.setLufsNormalizationEnabled}
+                  smartAntiRepeatEnabled={audio.smartAntiRepeatEnabled}
+                  onToggleSmartAntiRepeat={audio.setSmartAntiRepeatEnabled}
                   crossfadeSeconds={audio.crossfadeSeconds}
                   onChangeCrossfadeSeconds={audio.setCrossfadeSeconds}
                   offlinePreloadCount={audio.offlinePreloadCount}
                   onChangeOfflinePreloadCount={audio.setOfflinePreloadCount}
                   streamBufferSeconds={audio.streamBufferSeconds}
                   onChangeStreamBufferSeconds={audio.setStreamBufferSeconds}
+                  bufferedAheadSeconds={audio.bufferedAheadSeconds}
                   eqPreset={audio.eqPreset}
                   eqGains={audio.eqGains}
                   onApplyPreset={audio.applyEqPreset}
