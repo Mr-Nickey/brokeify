@@ -2,9 +2,9 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# Copy package files and install dependencies
-COPY package*.json ./
-RUN npm install
+# Copy package files and install dependencies (with --legacy-peer-deps to prevent ERESOLVE conflicts)
+COPY package*.json .npmrc* ./
+RUN npm install --legacy-peer-deps
 
 # Copy full source code and build the Vite React frontend
 COPY . .
