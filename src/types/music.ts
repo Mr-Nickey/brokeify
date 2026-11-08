@@ -125,6 +125,7 @@ export interface BrokeifyAudioPreferences {
   offlinePreloadCount?: number;
   stabilizerStrength?: StabilizerStrength;
   visualTheme?: VisualThemeId;
+  streamBufferSeconds?: number;
 }
 
 export interface BrokeifyCloudSettings {

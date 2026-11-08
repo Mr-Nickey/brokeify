@@ -864,6 +864,10 @@ export function parseCloudSettingsResponse(
         visualTheme: isValidVisualTheme(parsed.audioPrefs.visualTheme)
           ? parsed.audioPrefs.visualTheme
           : 'cyber-deck',
+        streamBufferSeconds:
+          typeof parsed.audioPrefs.streamBufferSeconds === 'number'
+            ? Math.max(0, Math.min(8, Math.round(parsed.audioPrefs.streamBufferSeconds)))
+            : 3,
       },
       providers: Array.isArray(parsed.providers) ? parsed.providers : [],
       playlists: Array.isArray(parsed.playlists) ? parsed.playlists : [],

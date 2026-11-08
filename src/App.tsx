@@ -463,6 +463,7 @@ export default function App() {
         lufsNormalizationEnabled: audio.lufsNormalizationEnabled,
         crossfadeSeconds: audio.crossfadeSeconds,
         offlinePreloadCount: audio.offlinePreloadCount,
+        streamBufferSeconds: audio.streamBufferSeconds,
         shuffleEnabled: audio.shuffleEnabled,
         repeatMode: audio.repeatMode,
         visualTheme: audio.visualTheme,
@@ -482,7 +483,7 @@ export default function App() {
     });
   };
 
-  // Auto-push settings to Jellyfin /DisplayPreferences/brokeify whenever EQ, Crossfade, Preload, Visual Theme, or Playlists change
+  // Auto-push settings to Jellyfin /DisplayPreferences/brokeify whenever EQ, Crossfade, Preload, Buffer, Visual Theme, or Playlists change
   useEffect(() => {
     const jfConfig = providers.find(
       (p) => p.type === 'jellyfin' && p.enabled && p.token && p.userId
@@ -500,6 +501,7 @@ export default function App() {
         lufsNormalizationEnabled: audio.lufsNormalizationEnabled,
         crossfadeSeconds: audio.crossfadeSeconds,
         offlinePreloadCount: audio.offlinePreloadCount,
+        streamBufferSeconds: audio.streamBufferSeconds,
         shuffleEnabled: audio.shuffleEnabled,
         repeatMode: audio.repeatMode,
         visualTheme: audio.visualTheme,
@@ -524,6 +526,7 @@ export default function App() {
     audio.lufsNormalizationEnabled,
     audio.crossfadeSeconds,
     audio.offlinePreloadCount,
+    audio.streamBufferSeconds,
     audio.shuffleEnabled,
     audio.repeatMode,
     audio.visualTheme,
@@ -2122,6 +2125,8 @@ export default function App() {
               </div>
 
               <div className="flex flex-wrap items-center gap-1.5">
+                <PWAInstallButton />
+
                 <button
                   type="button"
                   onClick={() => setIsOnboardingOpen(true)}
@@ -2311,6 +2316,8 @@ export default function App() {
                   onChangeCrossfadeSeconds={audio.setCrossfadeSeconds}
                   offlinePreloadCount={audio.offlinePreloadCount}
                   onChangeOfflinePreloadCount={audio.setOfflinePreloadCount}
+                  streamBufferSeconds={audio.streamBufferSeconds}
+                  onChangeStreamBufferSeconds={audio.setStreamBufferSeconds}
                   eqPreset={audio.eqPreset}
                   eqGains={audio.eqGains}
                   onApplyPreset={audio.applyEqPreset}
@@ -2411,7 +2418,16 @@ export default function App() {
               </div>
               <div className="text-[11px] sm:text-xs text-zinc-400 truncate flex items-center gap-1.5">
                 <span className="truncate">{audio.currentTrack?.artist}</span>
-                {audio.currentTrack &&
+                {audio.isBuffering ? (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span className="text-amber-300 font-mono font-semibold inline-flex items-center gap-1 whitespace-nowrap">
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                      Buffering {audio.streamBufferSeconds}s...
+                    </span>
+                  </>
+                ) : (
+                  audio.currentTrack &&
                   audio.cachedTrackIds.has(audio.currentTrack.id) && (
                     <>
                       <span aria-hidden="true">·</span>
@@ -2419,14 +2435,15 @@ export default function App() {
                         Vaulted
                       </span>
                     </>
-                  )}
+                  )
+                )}
               </div>
             </div>
             <ChevronUp className="w-4 h-4 text-zinc-400 group-hover:text-white shrink-0" />
           </button>
 
-          {/* Center Transport Controls (Clean: Prev, Play/Pause, Skip Song, Repeat Song) */}
-          <div className="flex items-center gap-1.5 sm:gap-2.5">
+          {/* Center Transport Controls: Prev, Play/Pause, Prominent Skip Song, and Shuffle */}
+          <div className="flex items-center gap-1.5 sm:gap-2">
             <button
               type="button"
               onClick={audio.playPrevious}
@@ -2452,10 +2469,36 @@ export default function App() {
             <button
               type="button"
               onClick={audio.playNext}
-              aria-label="Next track"
-              className="p-2 rounded-xl text-zinc-300 hover:bg-zinc-900 hover:text-white min-h-[38px] min-w-[38px] flex items-center justify-center"
+              aria-label="Skip Song"
+              title="Skip Song"
+              data-testid="bottombar-skip-song-btn"
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-emerald-500/50 bg-zinc-900/90 hover:bg-zinc-800 text-[#00ff66] font-mono text-xs font-bold min-h-[38px]"
             >
               <SkipForward className="w-4 h-4 sm:w-5 sm:h-5" />
+              <span className="hidden xs:inline sm:inline">Skip</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                audio.toggleShuffle();
+                setToastMessage(
+                  !audio.shuffleEnabled
+                    ? '🔀 Queue Shuffle Enabled'
+                    : 'Queue Shuffle Off'
+                );
+              }}
+              aria-label="Toggle Shuffle Queue"
+              title="Mix / Shuffle Queue"
+              data-testid="bottombar-shuffle-btn"
+              className={`inline-flex items-center gap-1 px-2.5 py-2 rounded-xl border font-mono text-xs font-bold min-h-[38px] transition-colors ${
+                audio.shuffleEnabled
+                  ? 'border-purple-500/70 bg-purple-500/20 text-purple-300'
+                  : 'border-zinc-800 bg-zinc-900/80 text-zinc-300 hover:text-white'
+              }`}
+            >
+              <Shuffle className="w-4 h-4" />
+              <span className="hidden sm:inline">Shuffle</span>
             </button>
 
             <button
@@ -2463,7 +2506,7 @@ export default function App() {
               onClick={audio.cycleRepeatMode}
               aria-label={`Repeat mode: ${audio.repeatMode}`}
               title={`Repeat: ${audio.repeatMode.toUpperCase()}`}
-              className={`p-2 rounded-xl min-h-[38px] min-w-[38px] flex items-center justify-center transition-colors ${
+              className={`hidden sm:flex p-2 rounded-xl min-h-[38px] min-w-[38px] items-center justify-center transition-colors ${
                 audio.repeatMode !== 'off'
                   ? 'text-[#00ff66] bg-emerald-500/15'
                   : 'text-zinc-400 hover:text-white'

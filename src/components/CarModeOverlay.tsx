@@ -162,7 +162,7 @@ export const CarModeOverlay: React.FC<CarModeOverlayProps> = ({
           </div>
         </div>
 
-        {/* Simple Giant 4-Button Car Transport: PREVIOUS SONG | PLAY/PAUSE | SKIP SONG | REPEAT SONG */}
+        {/* Simple Giant 4-Button Car Transport: PREVIOUS SONG | PLAY/PAUSE | SKIP SONG | SHUFFLE */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 pt-1">
           <button
             type="button"
@@ -214,28 +214,18 @@ export const CarModeOverlay: React.FC<CarModeOverlayProps> = ({
 
           <button
             type="button"
-            onClick={onCycleRepeat}
-            aria-label={`Repeat Song Mode: ${repeatMode}`}
-            data-testid="carmode-repeat-song-btn"
+            onClick={onToggleShuffle}
+            aria-label="Shuffle Queue"
+            data-testid="carmode-shuffle-btn"
             className={`h-24 sm:h-28 rounded-3xl border-2 active:scale-[0.98] flex flex-col items-center justify-center gap-1.5 transition-transform ${
-              repeatMode === 'one'
-                ? 'border-amber-400 bg-amber-500/20 text-amber-300'
-                : repeatMode === 'all'
-                ? 'border-purple-500 bg-purple-500/20 text-purple-200'
-                : 'border-zinc-700 bg-zinc-900 text-zinc-300'
+              shuffleEnabled
+                ? 'border-purple-400 bg-purple-500/25 text-purple-200'
+                : 'border-zinc-700 bg-zinc-900 text-zinc-200 hover:bg-zinc-800'
             }`}
           >
-            {repeatMode === 'one' ? (
-              <Repeat1 className="w-8 h-8 text-amber-300" />
-            ) : (
-              <Repeat className="w-8 h-8" />
-            )}
+            <Shuffle className="w-8 h-8 text-purple-400" />
             <span className="text-xs sm:text-sm font-mono font-bold uppercase">
-              {repeatMode === 'one'
-                ? 'REPEAT 1'
-                : repeatMode === 'all'
-                ? 'REPEAT ALL'
-                : 'REPEAT OFF'}
+              {shuffleEnabled ? 'SHUFFLE ON' : 'SHUFFLE'}
             </span>
           </button>
         </div>
@@ -257,7 +247,7 @@ export const CarModeOverlay: React.FC<CarModeOverlayProps> = ({
             <div>
               <div className="text-xs font-bold">FLAC/MP3 Stabilizer</div>
               <div className="text-[11px] text-zinc-400 font-mono">
-                Aggressive Leveler
+                Hardware Leveler
               </div>
             </div>
           </div>
@@ -293,24 +283,29 @@ export const CarModeOverlay: React.FC<CarModeOverlayProps> = ({
 
         <button
           type="button"
-          onClick={onToggleShuffle}
+          onClick={onCycleRepeat}
+          data-testid="carmode-repeat-song-btn"
           className={`min-h-[60px] rounded-2xl border-2 px-4 py-2.5 flex items-center justify-between text-left transition-colors ${
-            shuffleEnabled
-              ? 'border-purple-500 bg-purple-500/15 text-white'
+            repeatMode !== 'off'
+              ? 'border-amber-400 bg-amber-500/15 text-white'
               : 'border-zinc-800 bg-zinc-900 text-zinc-300'
           }`}
         >
           <div className="flex items-center gap-2.5">
-            <Shuffle className="w-5 h-5 text-purple-400 shrink-0" />
+            {repeatMode === 'one' ? (
+              <Repeat1 className="w-5 h-5 text-amber-400 shrink-0" />
+            ) : (
+              <Repeat className="w-5 h-5 text-amber-400 shrink-0" />
+            )}
             <div>
-              <div className="text-xs font-bold">Shuffle Queue</div>
+              <div className="text-xs font-bold">Repeat Mode</div>
               <div className="text-[11px] text-zinc-400 font-mono">
-                Fisher-Yates
+                Loop song or queue
               </div>
             </div>
           </div>
-          <span className="text-xs font-mono font-bold text-purple-400">
-            {shuffleEnabled ? 'ON' : 'OFF'}
+          <span className="text-xs font-mono font-bold text-amber-400 uppercase">
+            {repeatMode}
           </span>
         </button>
 

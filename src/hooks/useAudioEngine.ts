@@ -141,6 +141,21 @@ export function useAudioEngine(initialQueue: Track[]) {
     return 'cyber-deck';
   });
 
+  // Pre-Play Anti-Skip Stream Buffer (0s to 8s, default 3s) so cellular streams buffer before playing
+  const [streamBufferSeconds, setStreamBufferSeconds] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('brokeify_audio_prefs_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (typeof parsed.streamBufferSeconds === 'number') {
+          return Math.max(0, Math.min(8, Math.round(parsed.streamBufferSeconds)));
+        }
+      }
+    } catch {}
+    return 3;
+  });
+  const [isBuffering, setIsBuffering] = useState<boolean>(false);
+
   // IndexedDB Offline Vault & Lookahead Preloader State
   const [cachedTrackIds, setCachedTrackIds] = useState<Set<string>>(new Set());
   const [preloadingTrackIds, setPreloadingTrackIds] = useState<Set<string>>(
@@ -544,7 +559,8 @@ export function useAudioEngine(initialQueue: Track[]) {
     }
   }, [volume, isMuted, currentTrack, getEffectiveHtmlVolume]);
 
-  // Configurable Lookahead Preloader (2 to 12 tracks ahead + current track) for heavy dead-zone offline areas
+  // Configurable Lookahead Preloader (2 to 12 tracks ahead) for heavy dead-zone offline areas
+  // Waits 15 seconds after playback stabilizes and pauses 1.5s between downloads so it NEVER steals cellular bandwidth from the active song!
   useEffect(() => {
     if (!currentTrack || queue.length === 0 || !isPlaying) return;
 
@@ -552,10 +568,7 @@ export function useAudioEngine(initialQueue: Track[]) {
     const maxLookahead = Math.max(2, Math.min(12, offlinePreloadCount));
     const lookaheadTracks: Track[] = [];
 
-    // Include current track first so it is vaulted for offline replay & full Web Audio DSP
-    lookaheadTracks.push(currentTrack);
-
-    // Queue up to `maxLookahead` upcoming tracks
+    // Queue up to `maxLookahead` upcoming tracks first (do not re-download the currently streaming song simultaneously)
     const countToQueue = Math.min(maxLookahead, Math.max(0, queue.length - 1));
     for (let offset = 1; offset <= countToQueue; offset++) {
       const candidate = queue[(currentIndex + offset) % queue.length];
@@ -566,6 +579,7 @@ export function useAudioEngine(initialQueue: Track[]) {
         lookaheadTracks.push(candidate);
       }
     }
+    lookaheadTracks.push(currentTrack);
 
     const startTimer = setTimeout(async () => {
       for (const tr of lookaheadTracks) {
@@ -591,8 +605,11 @@ export function useAudioEngine(initialQueue: Track[]) {
             await refreshVaultState();
           }
         }
+
+        // Give the live audio stream a 1.5-second breather between background track downloads
+        await new Promise((r) => setTimeout(r, 1500));
       }
-    }, 3000);
+    }, 15000);
 
     return () => {
       cancelled = true;
@@ -608,6 +625,63 @@ export function useAudioEngine(initialQueue: Track[]) {
   ]);
 
   const loadRequestIdRef = useRef<number>(0);
+
+  /**
+   * Pre-Play Anti-Skip Buffer:
+   * Waits until the browser has buffered `targetBufferSec` seconds of audio (or fires `canplaythrough`)
+   * before starting playback so cellular streams don't stutter or skip in the first few seconds.
+   */
+  const waitForStreamPreBuffer = useCallback(
+    (audio: HTMLAudioElement, targetBufferSec: number): Promise<void> => {
+      if (targetBufferSec <= 0) {
+        return Promise.resolve();
+      }
+      return new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearInterval(checkTimer);
+          clearTimeout(maxWaitTimer);
+          audio.removeEventListener('canplaythrough', finish);
+          audio.removeEventListener('error', finish);
+          resolve();
+        };
+
+        const hasEnoughBuffer = () => {
+          if (audio.readyState >= 4) return true;
+          try {
+            if (audio.buffered && audio.buffered.length > 0) {
+              const bufferedEnd = audio.buffered.end(audio.buffered.length - 1);
+              if (bufferedEnd >= targetBufferSec) {
+                return true;
+              }
+            }
+          } catch {}
+          return false;
+        };
+
+        if (hasEnoughBuffer()) {
+          resolve();
+          return;
+        }
+
+        audio.addEventListener('canplaythrough', finish, { once: true });
+        audio.addEventListener('error', finish, { once: true });
+
+        const checkTimer = setInterval(() => {
+          if (hasEnoughBuffer()) {
+            finish();
+          }
+        }, 80);
+
+        // Cap pre-buffer wait so slow/transcoding streams still start reliably
+        const maxWaitMs = Math.min(3500, Math.max(900, targetBufferSec * 750));
+        const maxWaitTimer = setTimeout(finish, maxWaitMs);
+      });
+    },
+    []
+  );
 
   // Smoothly ramps in the newly started audio element when transitioning via Crossfade
   const startIncomingVolumeRamp = useCallback(
@@ -667,17 +741,19 @@ export function useAudioEngine(initialQueue: Track[]) {
       }
 
       // 1. Check IndexedDB Offline Vault first
+      // Uses pure hardware <audio> decoding (ensureUntaintedAudioElement) so cached tracks NEVER pass through
+      // heavy Web Audio brickwall compression ("FM radio" distortion) or stutter when Google Maps is active!
       const cachedBlob = await getCachedTrackBlob(track.id);
       if (requestId !== loadRequestIdRef.current) return;
 
       if (cachedBlob) {
-        const audio = audioRef.current || ensureUntaintedAudioElement();
+        const audio = ensureUntaintedAudioElement();
         const objUrl = URL.createObjectURL(cachedBlob);
         activeObjectUrlRef.current = objUrl;
         audio.src = objUrl;
 
         if (autoPlay) {
-          ensureAudioGraph();
+          setIsBuffering(false);
           startIncomingVolumeRamp(
             audio,
             track,
@@ -702,7 +778,7 @@ export function useAudioEngine(initialQueue: Track[]) {
         }
       }
 
-      // 2. Direct HTTP Progressive Streaming (with 4-stage fallback for Jellyfin/Emby)
+      // 2. Direct HTTP Progressive Streaming (with Pre-Play Anti-Skip Buffer & 4-stage fallback for Jellyfin/Emby)
       const audio = ensureUntaintedAudioElement();
       audio.removeAttribute('crossOrigin');
 
@@ -720,6 +796,7 @@ export function useAudioEngine(initialQueue: Track[]) {
       );
 
       if (candidates.length === 0) {
+        setIsBuffering(false);
         setIsPlaying(false);
         return;
       }
@@ -733,10 +810,18 @@ export function useAudioEngine(initialQueue: Track[]) {
       for (const candidateUrl of candidates) {
         if (requestId !== loadRequestIdRef.current) return;
         try {
+          if (streamBufferSeconds > 0) {
+            setIsBuffering(true);
+          }
           audio.pause();
           audio.removeAttribute('crossOrigin');
           audio.src = candidateUrl;
           audio.load();
+
+          // Wait for Pre-Play Anti-Skip Buffer (e.g. 3 seconds buffered) before starting playback
+          await waitForStreamPreBuffer(audio, streamBufferSeconds);
+          if (requestId !== loadRequestIdRef.current) return;
+
           startIncomingVolumeRamp(
             audio,
             track,
@@ -744,6 +829,7 @@ export function useAudioEngine(initialQueue: Track[]) {
           );
           await audio.play();
           if (requestId === loadRequestIdRef.current) {
+            setIsBuffering(false);
             setIsPlaying(true);
           }
           return;
@@ -753,17 +839,19 @@ export function useAudioEngine(initialQueue: Track[]) {
       }
 
       if (requestId === loadRequestIdRef.current) {
+        setIsBuffering(false);
         setIsPlaying(false);
       }
     },
     [
       crossfadeSeconds,
       detachAndFadeOutCurrentAudio,
-      ensureAudioGraph,
       ensureUntaintedAudioElement,
       getEffectiveHtmlVolume,
       refreshVaultState,
       startIncomingVolumeRamp,
+      streamBufferSeconds,
+      waitForStreamPreBuffer,
     ]
   );
 
@@ -803,9 +891,6 @@ export function useAudioEngine(initialQueue: Track[]) {
 
     if (audio && audio.src && audio.currentTime > 0 && !audio.ended) {
       try {
-        if (audio.src.startsWith('blob:')) {
-          ensureAudioGraph();
-        }
         await audio.play();
         setIsPlaying(true);
         return;
@@ -815,7 +900,7 @@ export function useAudioEngine(initialQueue: Track[]) {
     }
 
     await loadAndPlayTrack(currentTrack, true);
-  }, [currentTrack, ensureAudioGraph, isPlaying, loadAndPlayTrack]);
+  }, [currentTrack, isPlaying, loadAndPlayTrack]);
 
   const playNext = useCallback(() => {
     if (queue.length === 0) return;
@@ -954,6 +1039,7 @@ export function useAudioEngine(initialQueue: Track[]) {
           lufsNormalizationEnabled,
           crossfadeSeconds,
           offlinePreloadCount,
+          streamBufferSeconds,
           shuffleEnabled,
           repeatMode,
           visualTheme,
@@ -968,6 +1054,7 @@ export function useAudioEngine(initialQueue: Track[]) {
     lufsNormalizationEnabled,
     crossfadeSeconds,
     offlinePreloadCount,
+    streamBufferSeconds,
     shuffleEnabled,
     repeatMode,
     visualTheme,
@@ -986,6 +1073,7 @@ export function useAudioEngine(initialQueue: Track[]) {
       offlinePreloadCount?: number;
       stabilizerStrength?: StabilizerStrength;
       visualTheme?: VisualThemeId;
+      streamBufferSeconds?: number;
     }) => {
       if (prefs.eqPreset) setEqPreset(prefs.eqPreset);
       if (Array.isArray(prefs.eqGains) && prefs.eqGains.length === 5) {
@@ -1007,6 +1095,11 @@ export function useAudioEngine(initialQueue: Track[]) {
           Math.max(2, Math.min(12, Math.round(prefs.offlinePreloadCount)))
         );
       }
+      if (typeof prefs.streamBufferSeconds === 'number') {
+        setStreamBufferSeconds(
+          Math.max(0, Math.min(8, Math.round(prefs.streamBufferSeconds)))
+        );
+      }
       if (
         prefs.stabilizerStrength === 'off' ||
         prefs.stabilizerStrength === 'normal' ||
@@ -1021,9 +1114,53 @@ export function useAudioEngine(initialQueue: Track[]) {
     []
   );
 
-  // Android Auto & Bluetooth Car Steering Wheel Controls via navigator.mediaSession
-  // Strictly exposes Play/Pause, Next Song (Skip Song), and Previous/Repeat Song (NO 10-sec seek buttons!)
-  // Displays ONLY the track title and artist (never appends server name!)
+  // Stable refs for MediaSession action handlers so Android Auto's bottom split-screen bar (under Google Maps)
+  // NEVER loses or resets its Skip Song (nexttrack) button during timeupdate ticks!
+  const togglePlayPauseRef = useRef(togglePlayPause);
+  const playNextRef = useRef(playNext);
+  const playPreviousRef = useRef(playPrevious);
+  useEffect(() => {
+    togglePlayPauseRef.current = togglePlayPause;
+    playNextRef.current = playNext;
+    playPreviousRef.current = playPrevious;
+  }, [togglePlayPause, playNext, playPrevious]);
+
+  // 1. Register Android Auto MediaSession Transport Action Handlers ONCE (Zero thrashing!)
+  // Explicitly registers nexttrack (Skip Song) and previoustrack, and clears seekforward/seekbackward/seekto
+  // so Android Auto's compact bar below Google Maps ALWAYS displays Play/Pause + Skip Song (⏭)!
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) {
+      return;
+    }
+    const registerHandlers = () => {
+      try {
+        navigator.mediaSession.setActionHandler('play', () => {
+          togglePlayPauseRef.current();
+        });
+        navigator.mediaSession.setActionHandler('pause', () => {
+          togglePlayPauseRef.current();
+        });
+        navigator.mediaSession.setActionHandler('nexttrack', () => {
+          playNextRef.current();
+        });
+        navigator.mediaSession.setActionHandler('previoustrack', () => {
+          playPreviousRef.current();
+        });
+        // Clear all seek/scrub handlers so Android Auto's compact split-screen bar below Google Maps
+        // dedicates its action slots strictly to Play/Pause and Skip Song (nexttrack)!
+        try {
+          navigator.mediaSession.setActionHandler('seekbackward', null);
+          navigator.mediaSession.setActionHandler('seekforward', null);
+          navigator.mediaSession.setActionHandler('seekto', null);
+        } catch {}
+      } catch {}
+    };
+
+    registerHandlers();
+  }, [currentTrack?.id, isPlaying]);
+
+  // 2. Update Android Auto MediaMetadata ONLY when the track changes (NOT 4x/sec on currentTime!)
+  // Uses bitmap PNG icons so Android's native MediaNotification decoder never stalls on SVG data URIs.
   useEffect(() => {
     if (
       typeof navigator === 'undefined' ||
@@ -1033,70 +1170,62 @@ export function useAudioEngine(initialQueue: Track[]) {
       return;
     }
     try {
+      const hasHttpArtwork =
+        Boolean(currentTrack.artworkUrl) &&
+        /^https?:\/\//i.test(currentTrack.artworkUrl);
+
+      const artworkList: MediaImage[] = hasHttpArtwork
+        ? [
+            {
+              src: currentTrack.artworkUrl,
+              sizes: '512x512',
+              type: 'image/jpeg',
+            },
+            {
+              src: '/pwa-512x512.png',
+              sizes: '512x512',
+              type: 'image/png',
+            },
+          ]
+        : [
+            {
+              src: '/pwa-512x512.png',
+              sizes: '512x512',
+              type: 'image/png',
+            },
+            {
+              src: '/pwa-192x192.png',
+              sizes: '192x192',
+              type: 'image/png',
+            },
+          ];
+
       navigator.mediaSession.metadata = new MediaMetadata({
         title: currentTrack.title,
         artist: currentTrack.artist,
         album: currentTrack.album,
-        artwork: [
-          {
-            src: currentTrack.artworkUrl,
-            sizes: '512x512',
-            type: 'image/svg+xml',
-          },
-        ],
+        artwork: artworkList,
       });
-
-      navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
-
-      // Explicitly disable 10-second seekforward/seekbackward so Android Auto head units
-      // always render Skip Song (nexttrack) & Previous/Repeat Song (previoustrack) beside Play/Pause!
-      try {
-        navigator.mediaSession.setActionHandler('seekbackward', null);
-        navigator.mediaSession.setActionHandler('seekforward', null);
-      } catch {}
-
-      navigator.mediaSession.setActionHandler('play', () => {
-        if (!isPlaying) togglePlayPause();
-      });
-      navigator.mediaSession.setActionHandler('pause', () => {
-        if (isPlaying) togglePlayPause();
-      });
-      navigator.mediaSession.setActionHandler('previoustrack', () => {
-        playPrevious();
-      });
-      navigator.mediaSession.setActionHandler('nexttrack', () => {
-        playNext();
-      });
-      navigator.mediaSession.setActionHandler('seekto', (details) => {
-        if (typeof details.seekTime === 'number') {
-          seekTo(details.seekTime);
-        }
-      });
-
-      if ('setPositionState' in navigator.mediaSession && duration > 0) {
-        try {
-          navigator.mediaSession.setPositionState({
-            duration: Math.max(1, duration),
-            playbackRate: 1,
-            position: Math.max(0, Math.min(duration, currentTime)),
-          });
-        } catch {}
-      }
-    } catch {
-      // Ignore unsupported MediaSession actions
-    }
+    } catch {}
   }, [
-    currentTrack,
-    currentTime,
-    duration,
-    isPlaying,
-    playNext,
-    playPrevious,
-    seekTo,
-    togglePlayPause,
+    currentTrack?.id,
+    currentTrack?.title,
+    currentTrack?.artist,
+    currentTrack?.album,
+    currentTrack?.artworkUrl,
   ]);
 
-  // Sample 24-band frequency spectrum + 64-point oscilloscope waveform for 90s/2000s Winamp visualizer
+  // 3. Update Android Auto PlaybackState ONLY when play/pause toggles
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) {
+      return;
+    }
+    try {
+      navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+    } catch {}
+  }, [isPlaying]);
+
+  // Sample 24-band frequency spectrum + 64-point oscilloscope waveform for 90s/2000s visualizer
   useEffect(() => {
     if (!isPlaying) return;
     const interval = setInterval(() => {
@@ -1124,7 +1253,7 @@ export function useAudioEngine(initialQueue: Track[]) {
         }
       }
 
-      // Direct HTTP stream harmonic synthesizer for visualizer when Web Audio Analyser is bypassed for CORS safety
+      // Direct HTTP stream harmonic synthesizer for visualizer when using pure hardware <audio> decoding
       const t = Date.now() / 1000;
       const bpmFactor = ((currentTrack?.bpm || 120) / 120) * 2.4;
       const bars = Array.from({ length: 24 }, (_, i) => {
@@ -1159,6 +1288,7 @@ export function useAudioEngine(initialQueue: Track[]) {
     currentIndex,
     currentTrack,
     isPlaying,
+    isBuffering,
     currentTime,
     duration,
     volume,
@@ -1181,6 +1311,8 @@ export function useAudioEngine(initialQueue: Track[]) {
     isCrossfading,
     offlinePreloadCount,
     setOfflinePreloadCount,
+    streamBufferSeconds,
+    setStreamBufferSeconds,
     eqPreset,
     eqGains,
     applyEqPreset,

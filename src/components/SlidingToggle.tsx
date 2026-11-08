@@ -9,6 +9,7 @@ interface SlidingToggleProps {
   disabled?: boolean;
   size?: 'sm' | 'md';
   className?: string;
+  testId?: string;
 }
 
 /**
@@ -25,6 +26,7 @@ export const SlidingToggle: React.FC<SlidingToggleProps> = ({
   disabled = false,
   size = 'md',
   className = '',
+  testId,
 }) => {
   const isSm = size === 'sm';
 
@@ -34,6 +36,7 @@ export const SlidingToggle: React.FC<SlidingToggleProps> = ({
       role="switch"
       aria-checked={checked}
       aria-label={ariaLabel || label || 'Toggle switch'}
+      data-testid={testId}
       disabled={disabled}
       onClick={() => !disabled && onChange(!checked)}
       className={`group inline-flex items-center gap-3 text-left select-none transition-opacity min-h-[40px] ${

@@ -40,6 +40,8 @@ interface AudioLabVaultViewProps {
   onChangeCrossfadeSeconds: (sec: number) => void;
   offlinePreloadCount: number;
   onChangeOfflinePreloadCount: (count: number) => void;
+  streamBufferSeconds: number;
+  onChangeStreamBufferSeconds: (sec: number) => void;
   eqPreset: EQPresetName;
   eqGains: number[];
   onApplyPreset: (preset: Exclude<EQPresetName, 'Custom'>) => void;
@@ -67,6 +69,8 @@ export const AudioLabVaultView: React.FC<AudioLabVaultViewProps> = ({
   onChangeCrossfadeSeconds,
   offlinePreloadCount,
   onChangeOfflinePreloadCount,
+  streamBufferSeconds,
+  onChangeStreamBufferSeconds,
   eqPreset,
   eqGains,
   onApplyPreset,
@@ -233,6 +237,52 @@ export const AudioLabVaultView: React.FC<AudioLabVaultViewProps> = ({
                     {Math.round(currentStab.htmlElementScale * 100)}%
                   </strong>
                 </span>
+              </div>
+            </div>
+
+            {/* Pre-Play Anti-Skip Stream Buffer Slider (0s to 8s, default 3s) */}
+            <div className="rounded-xl border border-emerald-500/40 bg-zinc-950/80 p-4 space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5">
+                  <Database className="w-3.5 h-3.5 text-[#00ff66]" />
+                  <span className="text-xs font-bold text-white">
+                    Pre-Play Anti-Skip Stream Buffer
+                  </span>
+                </div>
+                <span
+                  data-testid="stream-buffer-value-label"
+                  className="text-xs font-mono font-bold text-[#00ff66] tabular-nums"
+                >
+                  {streamBufferSeconds === 0
+                    ? 'Instant (0s)'
+                    : `${streamBufferSeconds}s Pre-Buffer`}
+                </span>
+              </div>
+              <p className="text-[11px] text-zinc-400 leading-relaxed">
+                Buffers {streamBufferSeconds || 0} seconds of audio before
+                starting playback and uses Android&apos;s native hardware
+                decoder (zero FM-radio compression or cellular skipping).
+              </p>
+
+              <input
+                type="range"
+                min={0}
+                max={8}
+                step={1}
+                value={streamBufferSeconds}
+                aria-label="Pre-Play Anti-Skip Stream Buffer in Seconds"
+                data-testid="audiolab-stream-buffer-slider"
+                onChange={(e) =>
+                  onChangeStreamBufferSeconds(parseInt(e.target.value, 10))
+                }
+                className="w-full cursor-pointer"
+              />
+
+              <div className="flex justify-between text-[10px] font-mono text-zinc-500 tabular-nums">
+                <span>0s (Instant)</span>
+                <span>3s (Recommended)</span>
+                <span>5s (Highway)</span>
+                <span>8s (Max Buffer)</span>
               </div>
             </div>
 
