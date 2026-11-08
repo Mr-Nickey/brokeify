@@ -64,6 +64,10 @@ import { CarModeOverlay } from './components/CarModeOverlay';
 import { NowPlayingDrawer } from './components/NowPlayingDrawer';
 import { BrokeifyOnboardingModal } from './components/BrokeifyOnboardingModal';
 import { WinampVisualizer } from './components/WinampVisualizer';
+import {
+  PWAInstallButton,
+  MobilePixelInstallBanner,
+} from './components/PWAInstallButton';
 import { useAudioEngine } from './hooks/useAudioEngine';
 import { MusicProviderManager } from './services/MusicProviderManager';
 import type {
@@ -1901,8 +1905,10 @@ export default function App() {
             </nav>
           </div>
 
-          {/* Right: Car Mode 🚗 and Settings ⚙️ */}
+          {/* Right: PWA Install to Phone 📱, Car Mode 🚗 and Settings ⚙️ */}
           <div className="flex items-center gap-2 shrink-0 ml-auto">
+            <PWAInstallButton />
+
             <button
               type="button"
               onClick={() => setIsCarModeOpen(true)}
@@ -1938,6 +1944,9 @@ export default function App() {
 
       {/* Main Content Container — Fluid up to 1920px so 32" & 72" TVs, Chromecasts, Laptops, Car Displays & Phones all look crisp */}
       <main className="relative z-10 flex-1 w-full max-w-[1920px] mx-auto px-3 sm:px-6 xl:px-10 pt-5 space-y-6">
+        {/* Prominent Mobile Pixel / Android In-App Install Prompt Banner */}
+        <MobilePixelInstallBanner />
+
         {/* Cross-Device Playback Handoff Banner ("Pause on Phone -> Press Play on Chromecast / TV and Keep Listening") */}
         {remotePlaybackSession?.track &&
           remotePlaybackSession.deviceId !== deviceIdentity.deviceId && (

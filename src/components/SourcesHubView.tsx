@@ -21,6 +21,8 @@ import {
   Save,
   Server,
   ShieldCheck,
+  Smartphone,
+  Sparkles,
   Terminal,
   Wifi,
   WifiOff,
@@ -43,6 +45,7 @@ import {
   clearArtworkCache,
   getArtworkCacheStats,
 } from '../utils/artworkCache';
+import { PWAInstallButton } from './PWAInstallButton';
 import { SlidingToggle } from './SlidingToggle';
 import { VersionChecker } from './VersionChecker';
 
@@ -2063,6 +2066,57 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
               )}
               <span>Purge Artwork Cache</span>
             </button>
+          </div>
+        </div>
+      </section>
+
+      {/* Section 2B: Android Pixel & Mobile PWA Installation */}
+      <section
+        aria-labelledby="pwa-mobile-install-heading"
+        data-testid="pwa-mobile-install-section"
+        className="rounded-2xl border border-emerald-500/40 bg-zinc-900/40 p-5 sm:p-6 space-y-4"
+      >
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-zinc-800/80 pb-4">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2.5">
+              <Smartphone className="w-5 h-5 text-[#00ff66] shrink-0" />
+              <h2
+                id="pwa-mobile-install-heading"
+                className="text-lg font-bold text-white tracking-tight"
+              >
+                Pixel Phone &amp; Mobile WebAPK Installation
+              </h2>
+            </div>
+            <p className="text-xs text-zinc-400">
+              Install Brokeify directly to your Android Pixel phone as a standalone fullscreen app with offline caching and lock-screen playback.
+            </p>
+          </div>
+
+          <div className="shrink-0">
+            <PWAInstallButton />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs font-mono">
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4 space-y-1.5">
+            <span className="text-[#00ff66] font-bold block">1. 1-Tap Home Screen</span>
+            <p className="text-zinc-400 text-[11px] leading-relaxed">
+              In Chrome on your Pixel phone, tap the button above or tap Chrome menu (⋮) &rarr; &ldquo;Install app&rdquo;. Android builds a signed native WebAPK with the emerald icon in your App Drawer.
+            </p>
+          </div>
+
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4 space-y-1.5">
+            <span className="text-purple-300 font-bold block">2. Lock-Screen &amp; Car Mode</span>
+            <p className="text-zinc-400 text-[11px] leading-relaxed">
+              Standalone mode hides browser tabs and address bars. Connects cleanly to your car stereo with high-contrast oversized buttons and Android Auto Bluetooth metadata.
+            </p>
+          </div>
+
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4 space-y-1.5">
+            <span className="text-sky-300 font-bold block">3. Multi-Gigabyte Offline Vault</span>
+            <p className="text-zinc-400 text-[11px] leading-relaxed">
+              Android grants Brokeify persistent storage permissions (<code className="text-[#00ff66]">navigator.storage.persist()</code>) to store entire offline playlists and cached album art on your Pixel&apos;s internal SSD.
+            </p>
           </div>
         </div>
       </section>
