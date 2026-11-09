@@ -39,8 +39,23 @@ try {
 export const DB_PATH =
   process.env.BROKEIFY_DB_PATH || path.join(DATA_DIR, 'brokeify.db');
 
-export let MUSIC_DIR = resolveWritableDir([
+function resolveMusicDir(preferredPaths: string[]): string {
+  for (const candidate of preferredPaths) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+        fs.accessSync(candidate, fs.constants.R_OK);
+        return candidate;
+      }
+    } catch {
+      // Try next candidate
+    }
+  }
+  return resolveWritableDir(preferredPaths);
+}
+
+export let MUSIC_DIR = resolveMusicDir([
   process.env.BROKEIFY_MUSIC_DIR || '/music',
+  '/music',
   '/app/downloads',
   path.resolve(process.cwd(), 'music'),
 ]);
@@ -57,9 +72,20 @@ const SUPPORTED_AUDIO_EXTENSIONS = new Set([
   '.m4a',
   '.wav',
   '.aac',
+  '.wma',
 ]);
 
 const SUPPORTED_PLAYLIST_EXTENSIONS = new Set(['.m3u', '.m3u8']);
+
+export function isSupportedAudioFile(filePath: string): boolean {
+  const ext = path.extname(String(filePath || '')).toLowerCase();
+  return SUPPORTED_AUDIO_EXTENSIONS.has(ext);
+}
+
+export function isSupportedPlaylistFile(filePath: string): boolean {
+  const ext = path.extname(String(filePath || '')).toLowerCase();
+  return SUPPORTED_PLAYLIST_EXTENSIONS.has(ext);
+}
 
 const COVER_FILENAMES = [
   'cover.jpg',
@@ -663,39 +689,57 @@ function parseFallbackFromFilePath(filePath: string): {
   album: string;
   title: string;
   trackNumber: number;
+  discNumber: number;
   year: number | null;
 } {
   const ext = path.extname(filePath);
   const base = path.basename(filePath, ext).trim();
-  const parentDir = path.basename(path.dirname(filePath)).trim();
-  const grandParentDir = path.basename(path.dirname(path.dirname(filePath))).trim();
+
+  // Compute path segments relative to MUSIC_DIR for deep nested folders (e.g. /music/Artist/Album/Disc 1/01.flac)
+  const rel = path.relative(MUSIC_DIR, filePath);
+  const rawSegments = rel
+    .split(/[/\\]+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && s !== '.' && s !== '..');
+  // Remove the filename itself from folder segments
+  const folderSegments = rawSegments.slice(0, -1);
 
   let title = base;
   let artist = 'Unknown Artist';
-  let album =
-    parentDir && parentDir !== 'music' && parentDir !== 'downloads'
-      ? parentDir
-      : 'Singles';
+  let album = 'Singles';
   let trackNumber = 1;
+  let discNumber = 1;
   let year: number | null = null;
 
-  const yearMatch = album.match(/\((\d{4})\)/);
+  if (folderSegments.length >= 1) {
+    const lastFolder = folderSegments[folderSegments.length - 1];
+    // Check if the immediate parent folder is a Disc folder (e.g., "CD1", "Disc 1", "Disk 2")
+    const discMatch = lastFolder.match(/^(?:cd|disc|disk)\s*(\d{1,2})$/i);
+    if (discMatch && folderSegments.length >= 2) {
+      discNumber = parseInt(discMatch[1], 10) || 1;
+      album = folderSegments[folderSegments.length - 2];
+      if (folderSegments.length >= 3) {
+        artist = folderSegments[folderSegments.length - 3];
+      }
+    } else if (folderSegments.length === 1) {
+      // /music/Artist/01 - Track.flac OR /music/Album/01 - Track.flac
+      artist = folderSegments[0];
+      album = folderSegments[0];
+    } else {
+      // /music/Artist/Album/01.flac or /music/Genre/Artist/Album/01.flac
+      album = lastFolder;
+      artist = folderSegments[folderSegments.length - 2];
+    }
+  }
+
+  const yearMatch = album.match(/\((\d{4})\)|\[(\d{4})\]/);
   if (yearMatch) {
-    year = parseInt(yearMatch[1], 10);
-    album = album.replace(/\s*\(\d{4}\)\s*/, '').trim() || album;
+    year = parseInt(yearMatch[1] || yearMatch[2], 10);
+    album =
+      album.replace(/\s*(?:\(\d{4}\)|\[\d{4}\])\s*/, '').trim() || album;
   }
 
-  if (
-    grandParentDir &&
-    grandParentDir !== 'music' &&
-    grandParentDir !== 'downloads' &&
-    grandParentDir !== '/' &&
-    grandParentDir !== '.'
-  ) {
-    artist = grandParentDir;
-  }
-
-  const numPrefix = base.match(/^(\d{1,3})\s*[-._]\s*(.+)$/);
+  const numPrefix = base.match(/^(\d{1,3})\s*[-._\s]\s*(.+)$/);
   if (numPrefix) {
     trackNumber = parseInt(numPrefix[1], 10);
     title = numPrefix[2].trim();
@@ -711,7 +755,7 @@ function parseFallbackFromFilePath(filePath: string): {
     }
   }
 
-  return { artist, album, title, trackNumber, year };
+  return { artist, album, title, trackNumber, discNumber, year };
 }
 
 export async function indexAudioFile(filePath: string): Promise<string | null> {
@@ -719,8 +763,8 @@ export async function indexAudioFile(filePath: string): Promise<string | null> {
     const resolvedPath = path.resolve(filePath);
     if (!fs.existsSync(resolvedPath)) return null;
 
+    if (!isSupportedAudioFile(resolvedPath)) return null;
     const ext = path.extname(resolvedPath).toLowerCase();
-    if (!SUPPORTED_AUDIO_EXTENSIONS.has(ext)) return null;
 
     const fallback = parseFallbackFromFilePath(resolvedPath);
 
@@ -730,7 +774,7 @@ export async function indexAudioFile(filePath: string): Promise<string | null> {
     let year: number | null = fallback.year;
     let genre = 'Music';
     let trackNumber = fallback.trackNumber;
-    let discNumber = 1;
+    let discNumber = fallback.discNumber;
     let durationMs = 180000;
     let format = ext.replace('.', '').toUpperCase();
     let bitrate = 320;
@@ -755,7 +799,7 @@ export async function indexAudioFile(filePath: string): Promise<string | null> {
         genre = c.genre[0].trim();
       }
       if (c.track?.no) trackNumber = Number(c.track.no) || trackNumber;
-      if (c.disk?.no) discNumber = Number(c.disk.no) || 1;
+      if (c.disk?.no) discNumber = Number(c.disk.no) || discNumber;
       if (f.duration && f.duration > 0) {
         durationMs = Math.round(f.duration * 1000);
       }
@@ -779,6 +823,8 @@ export async function indexAudioFile(filePath: string): Promise<string | null> {
           format = 'OGG';
         } else if (upperCodec.includes('AAC') || upperCodec.includes('ALAC')) {
           format = upperCodec.includes('ALAC') ? 'ALAC' : 'AAC';
+        } else if (upperCodec.includes('WMA')) {
+          format = 'WMA';
         } else if (upperCodec.includes('PCM') || ext === '.wav') {
           format = 'WAV';
         }
@@ -818,16 +864,19 @@ export async function indexAudioFile(filePath: string): Promise<string | null> {
 
     if (!finalCoverPath) {
       const trackDir = path.dirname(resolvedPath);
-      for (const candidateName of COVER_FILENAMES) {
-        const candidateFile = path.join(trackDir, candidateName);
-        if (fs.existsSync(candidateFile)) {
-          try {
+      try {
+        const dirFiles = fs.readdirSync(trackDir);
+        const lowerSet = new Map(dirFiles.map((f) => [f.toLowerCase(), f]));
+        for (const candidateName of COVER_FILENAMES) {
+          const actualName = lowerSet.get(candidateName.toLowerCase());
+          if (actualName) {
+            const candidateFile = path.join(trackDir, actualName);
             fs.copyFileSync(candidateFile, targetCoverPath);
             finalCoverPath = targetCoverPath;
             break;
-          } catch {}
+          }
         }
-      }
+      } catch {}
     }
 
     const existingArtist = db.artists.get(artistId);
@@ -1047,10 +1096,22 @@ export function inspectMusicDrive(targetDir?: string): MusicDriveStatus {
     }
     if (readable) {
       try {
-        const entries = fs.readdirSync(dirToCheck, { withFileTypes: true });
-        for (const entry of entries) {
-          if (!entry.name.startsWith('.') && entry.isDirectory()) {
-            subfolders.push(entry.name);
+        const names = fs.readdirSync(dirToCheck);
+        for (const name of names) {
+          if (
+            name.startsWith('.') ||
+            name === '$RECYCLE.BIN' ||
+            name === 'System Volume Information'
+          ) {
+            continue;
+          }
+          try {
+            const fullSubPath = path.join(dirToCheck, name);
+            if (fs.statSync(fullSubPath).isDirectory()) {
+              subfolders.push(name);
+            }
+          } catch {
+            // ignore unreadable entry
           }
         }
       } catch {
@@ -1061,8 +1122,8 @@ export function inspectMusicDrive(targetDir?: string): MusicDriveStatus {
 
   const walked =
     exists && readable
-      ? walkMusicDirectory(dirToCheck)
-      : { audioFiles: [], m3uFiles: [] };
+      ? walkMusicDirectory(dirToCheck, { logDiscovery: false })
+      : { audioFiles: [], m3uFiles: [], directoriesScanned: 0 };
   const indexedTrackCount = db.tracks.size;
 
   const audioFileCount = walked.audioFiles.length;
@@ -1075,9 +1136,9 @@ export function inspectMusicDrive(targetDir?: string): MusicDriveStatus {
   } else if (!readable) {
     statusMessage = `Directory "${dirToCheck}" exists but Brokeify does not have read permission. Check PUID/PGID or folder permissions.`;
   } else if (audioFileCount === 0) {
-    statusMessage = `No audio files (.flac, .mp3, .m4a, .ogg, .opus, .wav, .aac) found inside "${dirToCheck}". Mount your local music drive or NAS share to /music in Docker Compose, or point Brokeify to a folder containing your music files.`;
+    statusMessage = `No audio files (.flac, .mp3, .m4a, .ogg, .opus, .wav, .aac, .wma) found inside "${dirToCheck}" (scanned ${walked.directoriesScanned} directories). Mount your local music drive or NAS share to /music in Docker Compose, or point Brokeify to a folder containing your music files.`;
   } else {
-    statusMessage = `Connected to "${dirToCheck}" — ${audioFileCount} audio file(s) across ${subfolders.length} top-level folder(s) (${playlistFileCount} .m3u/.m3u8 playlist files).`;
+    statusMessage = `Connected to "${dirToCheck}" — ${audioFileCount} audio file(s) across ${walked.directoriesScanned} scanned folder(s) (${playlistFileCount} .m3u/.m3u8 playlist files).`;
   }
 
   return {
@@ -1085,7 +1146,7 @@ export function inspectMusicDrive(targetDir?: string): MusicDriveStatus {
     exists,
     readable,
     writable,
-    subfolders: subfolders.slice(0, 25),
+    subfolders: subfolders.slice(0, 50),
     audioFileCount,
     playlistFileCount,
     indexedTrackCount,
@@ -1094,50 +1155,102 @@ export function inspectMusicDrive(targetDir?: string): MusicDriveStatus {
   };
 }
 
-function walkMusicDirectory(dir: string): {
+/**
+ * Recursively traverses `/music/**` across all nested Artist / Album / Disc subfolders.
+ * Uses `fs.statSync(fullPath)` rather than relying on `Dirent.isDirectory()` so Windows
+ * NTFS bind mounts (`D:/...:/music`), WSL2 9P, SMB/CIFS, NFS, and symlinks are always
+ * traversed deeply without stopping at the root folder.
+ */
+export function walkMusicDirectory(
+  dir: string,
+  options?: { logDiscovery?: boolean }
+): {
   audioFiles: string[];
   m3uFiles: string[];
+  directoriesScanned: number;
 } {
   const audioFiles: string[] = [];
   const m3uFiles: string[] = [];
+  const visitedDirs = new Set<string>();
+  let directoriesScanned = 0;
+  const shouldLog = options?.logDiscovery !== false;
 
-  function walk(current: string, depth = 0) {
-    if (depth > 12) return;
-    let entries: fs.Dirent[] = [];
+  function walk(currentDir: string) {
+    let resolvedCurrent: string;
     try {
-      entries = fs.readdirSync(current, { withFileTypes: true });
+      resolvedCurrent = fs.realpathSync(currentDir);
     } catch {
+      resolvedCurrent = path.resolve(currentDir);
+    }
+
+    if (visitedDirs.has(resolvedCurrent)) return;
+    visitedDirs.add(resolvedCurrent);
+    directoriesScanned += 1;
+
+    let itemNames: string[] = [];
+    try {
+      itemNames = fs.readdirSync(currentDir);
+    } catch (err) {
+      if (shouldLog) {
+        console.warn(`[Scanner] Could not read directory ${currentDir}:`, err);
+      }
       return;
     }
-    for (const entry of entries) {
+
+    for (const name of itemNames) {
       if (
-        entry.name.startsWith('.') ||
-        entry.name === '$RECYCLE.BIN' ||
-        entry.name === 'System Volume Information'
+        name === '.' ||
+        name === '..' ||
+        name.startsWith('.') ||
+        name === '$RECYCLE.BIN' ||
+        name === 'System Volume Information'
       ) {
         continue;
       }
-      const fullPath = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        walk(fullPath, depth + 1);
-      } else if (entry.isFile()) {
-        const ext = path.extname(entry.name).toLowerCase();
-        if (SUPPORTED_AUDIO_EXTENSIONS.has(ext)) {
+
+      const fullPath = path.join(currentDir, name);
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(fullPath);
+      } catch {
+        continue;
+      }
+
+      if (stat.isDirectory()) {
+        walk(fullPath);
+      } else if (stat.isFile()) {
+        if (isSupportedAudioFile(fullPath)) {
           audioFiles.push(fullPath);
-        } else if (SUPPORTED_PLAYLIST_EXTENSIONS.has(ext)) {
+          if (shouldLog) {
+            console.log(`[Scanner] Found track: ${fullPath}`);
+          }
+        } else if (isSupportedPlaylistFile(fullPath)) {
           m3uFiles.push(fullPath);
+          if (shouldLog) {
+            console.log(`[Scanner] Found playlist: ${fullPath}`);
+          }
         }
       }
     }
   }
 
-  walk(dir, 0);
-  return { audioFiles, m3uFiles };
+  if (fs.existsSync(dir)) {
+    walk(dir);
+  }
+
+  if (shouldLog) {
+    console.log(
+      `[Scanner] Scanned ${directoriesScanned} directory(s) in ${dir} — discovered ${audioFiles.length} audio file(s) and ${m3uFiles.length} playlist(s)`
+    );
+  }
+
+  return { audioFiles, m3uFiles, directoriesScanned };
 }
 
 export async function runFullLibraryScan(): Promise<{
   indexedTracks: number;
   importedPlaylists: number;
+  directoriesScanned?: number;
 }> {
   if (scannerState.isScanning) {
     return {
@@ -1148,8 +1261,12 @@ export async function runFullLibraryScan(): Promise<{
 
   scannerState.isScanning = true;
   try {
+    console.log(`[Scanner] Starting recursive scan of ${MUSIC_DIR}/** ...`);
     purgeLegacySampleFiles(MUSIC_DIR);
-    const { audioFiles, m3uFiles } = walkMusicDirectory(MUSIC_DIR);
+    const { audioFiles, m3uFiles, directoriesScanned } = walkMusicDirectory(
+      MUSIC_DIR,
+      { logDiscovery: true }
+    );
 
     // Prune deleted files from DB first
     const diskSet = new Set(audioFiles.map((f) => path.resolve(f)));
@@ -1178,7 +1295,14 @@ export async function runFullLibraryScan(): Promise<{
 
     scannerState.lastScanAt = new Date().toISOString();
     syncDatabaseToPersistentDisk(true);
-    return { indexedTracks: indexedCount, importedPlaylists: m3uCount };
+    console.log(
+      `[Scanner] Finished indexing ${indexedCount} track(s) across ${directoriesScanned} directory(s) (${db.artists.size} artists, ${db.albums.size} albums, ${m3uCount} M3U playlists).`
+    );
+    return {
+      indexedTracks: indexedCount,
+      importedPlaylists: m3uCount,
+      directoriesScanned,
+    };
   } finally {
     scannerState.isScanning = false;
   }
@@ -1221,6 +1345,8 @@ export function startChokidarMusicWatcher() {
         persistent: true,
         ignoreInitial: true,
         ignorePermissionErrors: true,
+        followSymlinks: true,
+        usePolling: process.env.CHOKIDAR_USEPOLLING === 'true',
         awaitWriteFinish: {
           stabilityThreshold: 1500,
           pollInterval: 250,
@@ -1229,28 +1355,27 @@ export function startChokidarMusicWatcher() {
 
       activeWatcher
         .on('add', async (filePath) => {
-          const ext = path.extname(filePath).toLowerCase();
-          if (SUPPORTED_AUDIO_EXTENSIONS.has(ext)) {
+          if (isSupportedAudioFile(filePath)) {
+            console.log(`[Scanner] Found track: ${filePath}`);
             await indexAudioFile(filePath);
             syncDatabaseToPersistentDisk();
-          } else if (SUPPORTED_PLAYLIST_EXTENSIONS.has(ext)) {
+          } else if (isSupportedPlaylistFile(filePath)) {
+            console.log(`[Scanner] Found playlist: ${filePath}`);
             importM3uPlaylistFile(filePath);
             syncDatabaseToPersistentDisk();
           }
         })
         .on('change', async (filePath) => {
-          const ext = path.extname(filePath).toLowerCase();
-          if (SUPPORTED_AUDIO_EXTENSIONS.has(ext)) {
+          if (isSupportedAudioFile(filePath)) {
             await indexAudioFile(filePath);
             syncDatabaseToPersistentDisk();
-          } else if (SUPPORTED_PLAYLIST_EXTENSIONS.has(ext)) {
+          } else if (isSupportedPlaylistFile(filePath)) {
             importM3uPlaylistFile(filePath);
             syncDatabaseToPersistentDisk();
           }
         })
         .on('unlink', (filePath) => {
-          const ext = path.extname(filePath).toLowerCase();
-          if (SUPPORTED_AUDIO_EXTENSIONS.has(ext)) {
+          if (isSupportedAudioFile(filePath)) {
             removeAudioFileFromIndex(filePath);
             syncDatabaseToPersistentDisk();
           }
@@ -1535,6 +1660,7 @@ const MIME_BY_EXT: Record<string, string> = {
   '.m4a': 'audio/mp4',
   '.aac': 'audio/aac',
   '.wav': 'audio/wav',
+  '.wma': 'audio/x-ms-wma',
 };
 
 export function handleStreamTrack(req: Request, res: Response) {

@@ -946,18 +946,19 @@ app.get('/api/library/tracks', (req, res) => {
   });
 });
 
-// POST /api/library/rescan -> Triggers a full recursive scan of /music and .m3u/.m3u8 import
-app.post('/api/library/rescan', async (_req, res) => {
+// POST /api/library/rescan (and /api/library/scan) -> Triggers a full recursive scan of /music/** and .m3u/.m3u8 import
+app.post(['/api/library/rescan', '/api/library/scan'], async (_req, res) => {
   try {
     const scanResult = await runFullLibraryScan();
     const counts = getLocalLibraryStats();
+    const currentMusicDir = getMusicDir();
     res.json({
       ok: true,
       ...scanResult,
       ...counts,
-      musicDir: MUSIC_DIR,
+      musicDir: currentMusicDir,
       dbPath: DB_PATH,
-      message: `Scanned ${MUSIC_DIR}: indexed ${counts.totalTracks} tracks across ${counts.totalAlbums} albums & ${counts.totalArtists} artists (${counts.totalPlaylists} playlists).`,
+      message: `Scanned ${currentMusicDir} (${scanResult.directoriesScanned ?? 0} folders): indexed ${counts.totalTracks} tracks across ${counts.totalAlbums} albums & ${counts.totalArtists} artists (${counts.totalPlaylists} playlists).`,
     });
   } catch (err) {
     res.status(500).json({
