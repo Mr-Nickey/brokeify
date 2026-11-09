@@ -1,7 +1,5 @@
-const CACHE_NAME = 'brokeify-shell-v2';
+const CACHE_NAME = 'brokeify-standalone-v4';
 const PRECACHE_ASSETS = [
-  '/',
-  '/index.html',
   '/manifest.json',
   '/manifest.webmanifest',
   '/icon.svg',
@@ -40,41 +38,33 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return;
 
   const url = new URL(req.url);
-  // Never intercept cross-origin Jellyfin/Subsonic/Plex audio streams or API calls
   if (url.origin !== self.location.origin) {
     return;
   }
 
-  // Network-first for HTML navigation with offline cache fallback
-  if (req.mode === 'navigate') {
-    event.respondWith(
-      fetch(req)
-        .then((res) => {
-          const copy = res.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(req, copy));
-          return res;
-        })
-        .catch(() =>
-          caches.match(req).then((cached) => cached || caches.match('/index.html'))
-        )
-    );
+  // Never cache API endpoints, audio streams, or Vite dev source modules (/src/, /@vite, /node_modules)
+  if (
+    url.pathname.startsWith('/api/') ||
+    url.pathname.startsWith('/src/') ||
+    url.pathname.startsWith('/@') ||
+    url.pathname.startsWith('/node_modules/')
+  ) {
     return;
   }
 
-  // Stale-while-revalidate for same-origin static assets (JS, CSS, icons, manifest)
+  // Network-first for HTML navigation and JS/CSS bundles so updates appear immediately
   event.respondWith(
-    caches.match(req).then((cached) => {
-      const networkFetch = fetch(req)
-        .then((res) => {
-          if (res && res.status === 200) {
-            const copy = res.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(req, copy));
-          }
-          return res;
-        })
-        .catch(() => cached);
-      return cached || networkFetch;
-    })
+    fetch(req)
+      .then((res) => {
+        if (res && res.status === 200) {
+          const copy = res.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(req, copy));
+        }
+        return res;
+      })
+      .catch(() =>
+        caches.match(req).then((cached) => cached || caches.match('/index.html'))
+      )
   );
 });
 

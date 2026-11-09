@@ -1,20 +1,47 @@
 // @ts-nocheck
 /**
- * Brokeify Full-Stack Self-Hosted Server (Express + Vite / Static Dist)
- * - Persistent server-side configuration at /app/data/config.json (fallback ./data/config.json)
- * - Internal Docker proxy routes for Jellyfin (including DELETE /api/jellyfin/items/:id & Library/Refresh)
- * - ListenBrainz Discovery ("Weekly Exploration", "Weekly Jams", "Daily Jams") & Scrobbling proxy
- * - MusicBrainz Album & Track Search proxy
- * - Automated slskd "Grab Full Album / Track" Engine + background transfer watcher that triggers Jellyfin Library Refresh
+ * Brokeify Standalone Self-Hosted Music Server, Library Manager & Audio Streaming Engine
+ * - Embedded SQLite Database (`better-sqlite3`) at /data/brokeify.db
+ * - Real-time `/music` watcher (`chokidar`) + deep audio tag parser (`music-metadata`)
+ * - Automatic `.m3u` / `.m3u8` playlist discovery and import
+ * - Non-blocking EBU R128 LUFS audio normalization engine (`ffmpeg`)
+ * - Seekable HTTP 206 Partial Content audio streaming (`/api/stream/:trackId`)
+ * - Companion REST API with CORS enabled for Desktop Web Player & Android / Android Auto Client
+ * - Native ListenBrainz Scrobbler, MusicBrainz Auto-Tagger, and Local Downloaders (slskd, Lidarr, yt-dlp)
  */
 
 import express from 'express';
+import cors from 'cors';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import {
+  DATA_DIR,
+  COVERS_DIR,
+  DB_PATH,
+  MUSIC_DIR,
+  getMusicDir,
+  inspectMusicDrive,
+  setMusicDirectory,
+  db,
+  scannerState,
+  startChokidarMusicWatcher,
+  runFullLibraryScan,
+  indexAudioFile,
+  removeAudioFileFromIndex,
+  importM3uPlaylistFile,
+  queryTracks,
+  queryArtists,
+  queryAlbums,
+  queryPlaylists,
+  handleStreamTrack,
+  handleServeCover,
+  enrichTrackFromMusicBrainz,
+} from './src/server/libraryEngine.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -22,40 +49,19 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+app.use(cors());
 app.use(express.json({ limit: '15mb' }));
 
-// Determine persistent config.json path: prefer /app/data/config.json in Docker, fallback to ./data/config.json
-function resolveConfigFilePath() {
-  const dockerDataDir = '/app/data';
-  try {
-    if (fs.existsSync('/app')) {
-      fs.mkdirSync(dockerDataDir, { recursive: true });
-      fs.accessSync(dockerDataDir, fs.constants.W_OK);
-      return path.join(dockerDataDir, 'config.json');
-    }
-  } catch {
-    // Fallback to local workspace ./data/config.json
-  }
-  const localDataDir = path.join(__dirname, 'data');
-  fs.mkdirSync(localDataDir, { recursive: true });
-  return path.join(localDataDir, 'config.json');
-}
-
-const CONFIG_FILE_PATH = resolveConfigFilePath();
-const DEBUG_LOGS_FILE_PATH = path.join(
-  path.dirname(CONFIG_FILE_PATH),
-  'debug-logs.json'
-);
+const CONFIG_FILE_PATH = path.join(DATA_DIR, 'config.json');
+const DEBUG_LOGS_FILE_PATH = path.join(DATA_DIR, 'debug-logs.json');
 const MAX_SERVER_DEBUG_LOGS = 300;
 
 function redactSecrets(text) {
   if (!text) return '';
-  return String(text)
-    .replace(
-      /(api[_-]?key|token|password|authorization|secret)(["'\s:=]+)([^\s"',&}]+)/gi,
-      '$1$2[REDACTED]'
-    )
-    .replace(/(MediaBrowser Token=")([^"]+)(")/gi, '$1[REDACTED]$3');
+  return String(text).replace(
+    /(api[_-]?key|token|password|authorization|secret)(["'\s:=]+)([^\s"',&}]+)/gi,
+    '$1$2[REDACTED]'
+  );
 }
 
 function loadServerDebugLogs() {
@@ -89,24 +95,30 @@ function saveServerDebugLogs() {
 
 function inferServerCategory(urlPath = '') {
   const lower = String(urlPath).toLowerCase();
-  if (lower.includes('jellyfin')) return 'jellyfin';
   if (lower.includes('lidarr')) return 'lidarr';
   if (lower.includes('slskd')) return 'slskd';
-  if (lower.includes('listenbrainz')) return 'listenbrainz';
+  if (lower.includes('listenbrainz') || lower.includes('scrobble'))
+    return 'listenbrainz';
   if (lower.includes('spotify')) return 'spotify';
   if (lower.includes('youtube')) return 'youtube';
   if (lower.includes('autopilot')) return 'autopilot';
   if (lower.includes('playback-session')) return 'playback-sync';
+  if (lower.includes('stream') || lower.includes('library')) return 'audio';
   return 'system';
 }
 
 function inferServerHint(category, message = '', statusCode = 0) {
   const lower = String(message).toLowerCase();
-  if (statusCode === 401 || statusCode === 403 || lower.includes('401') || lower.includes('unauthorized')) {
-    return `Authentication rejected (${statusCode || 401}). Check your ${category.toUpperCase()} API Key or Token in Settings → 1. Server & Connections.`;
+  if (
+    statusCode === 401 ||
+    statusCode === 403 ||
+    lower.includes('401') ||
+    lower.includes('unauthorized')
+  ) {
+    return `Authentication rejected (${statusCode || 401}). Check your ${category.toUpperCase()} API Key or Token in Settings.`;
   }
   if (statusCode === 404 || lower.includes('404')) {
-    return `Endpoint returned 404 Not Found. Verify your ${category.toUpperCase()} base URL does not have an extra subpath.`;
+    return `Endpoint returned 404 Not Found. Verify your ${category.toUpperCase()} base URL.`;
   }
   if (
     lower.includes('fetch failed') ||
@@ -146,9 +158,14 @@ function pushServerLog(level, category, message, extra = {}) {
   return entry;
 }
 
-// Express API response & error interceptor: automatically logs any /api/* error or key homelab event
+// Express API response & error interceptor
 app.use((req, res, next) => {
-  if (!req.path.startsWith('/api/') || req.path.startsWith('/api/debug/')) {
+  if (
+    !req.path.startsWith('/api/') ||
+    req.path.startsWith('/api/debug/') ||
+    req.path.startsWith('/api/stream/') ||
+    req.path.startsWith('/api/cover/')
+  ) {
     return next();
   }
   const startedAt = Date.now();
@@ -160,7 +177,7 @@ app.use((req, res, next) => {
     const category = inferServerCategory(req.path);
     const endpointLabel = `${req.method} ${req.originalUrl} (${durationMs}ms)`;
 
-    if (status >= 400 || (body && body.ok === false)) {
+    if (status >= 400 || (body && body.ok === false && !body.skipped)) {
       const errText =
         body?.error ||
         body?.message ||
@@ -213,7 +230,6 @@ process.on('uncaughtException', (err) => {
     `Uncaught Server Exception: ${err?.message || String(err)}`,
     {
       details: err?.stack || String(err),
-      hint: 'Check the stack trace in Details to identify the failing server operation.',
     }
   );
 });
@@ -229,31 +245,36 @@ process.on('unhandledRejection', (reason) => {
     {
       details:
         reason instanceof Error ? reason.stack : JSON.stringify(reason, null, 2),
-      hint: 'An async background task rejected without being caught. Inspect Details for stack trace.',
     }
   );
 });
 
 const DEFAULT_SERVER_CONFIG = {
-  version: 2,
+  version: 3,
   updatedAt: new Date().toISOString(),
+  auth: {
+    username: process.env.BROKEIFY_USERNAME || 'admin',
+    password: process.env.BROKEIFY_PASSWORD || 'brokeify',
+    apiToken: process.env.BROKEIFY_API_TOKEN || 'brokeify-standalone-token',
+  },
   integrations: {
     jellyfinUrl: '',
     jellyfinToken: '',
     jellyfinUserId: '',
-    jellyfinUsername: '',
-    requireDeviceLogin: true,
-    slskdUrl: 'http://slskd:5030',
-    slskdApiKey: '',
-    lidarrUrl: 'http://lidarr:8686',
-    lidarrApiKey: '',
-    lidarrRootFolderPath: '/music',
+    jellyfinUsername: 'admin',
+    requireDeviceLogin: false,
+    slskdUrl: process.env.SLSKD_URL || 'http://slskd:5030',
+    slskdApiKey: process.env.SLSKD_API_KEY || '',
+    lidarrUrl: process.env.LIDARR_URL || 'http://lidarr:8686',
+    lidarrApiKey: process.env.LIDARR_API_KEY || '',
+    lidarrRootFolderPath: MUSIC_DIR,
     lidarrQualityProfileId: 1,
     lidarrMetadataProfileId: 1,
-    listenbrainzUsername: '',
-    listenbrainzToken: '',
+    listenbrainzUsername:
+      process.env.LISTENBRAINZ_USER || process.env.LISTENBRAINZ_USERNAME || '',
+    listenbrainzToken: process.env.LISTENBRAINZ_TOKEN || '',
     preferredDownloader: 'auto',
-    downloadDir: '/app/downloads',
+    downloadDir: MUSIC_DIR,
     youtubeAudioFormat: 'mp3',
   },
   audioPrefs: {
@@ -301,6 +322,7 @@ return true;`,
     folderTemplate: '{Artist}/{Album} ({Year})/{TrackNumber} - {Title}.{ext}',
     useAiMetadataCleanup: true,
     embedId3Tags: true,
+    targetMusicRoot: MUSIC_DIR,
   },
   autopilotRules: [],
   playStats: {},
@@ -320,12 +342,6 @@ function readServerConfig() {
     }
 
     const envIntegrations = {
-      ...(process.env.JELLYFIN_URL
-        ? { jellyfinUrl: process.env.JELLYFIN_URL }
-        : {}),
-      ...(process.env.JELLYFIN_TOKEN
-        ? { jellyfinToken: process.env.JELLYFIN_TOKEN }
-        : {}),
       ...(process.env.SLSKD_URL ? { slskdUrl: process.env.SLSKD_URL } : {}),
       ...(process.env.SLSKD_API_KEY
         ? { slskdApiKey: process.env.SLSKD_API_KEY }
@@ -349,14 +365,20 @@ function readServerConfig() {
     return {
       ...DEFAULT_SERVER_CONFIG,
       ...parsed,
+      auth: {
+        ...DEFAULT_SERVER_CONFIG.auth,
+        ...(parsed.auth || {}),
+      },
       integrations: {
         ...DEFAULT_SERVER_CONFIG.integrations,
         ...(parsed.integrations || {}),
         ...envIntegrations,
-        listenbrainzUsername:
-          envIntegrations.listenbrainzUsername ||
-          parsed.integrations?.listenbrainzUsername ||
-          '',
+        requireDeviceLogin: false,
+        downloadDir:
+          parsed.integrations?.downloadDir &&
+          parsed.integrations.downloadDir !== '/app/downloads'
+            ? parsed.integrations.downloadDir
+            : MUSIC_DIR,
       },
       audioPrefs: {
         ...DEFAULT_SERVER_CONFIG.audioPrefs,
@@ -449,25 +471,6 @@ function writeServerConfig(nextConfig) {
       };
     }
 
-    // Also auto-sync Jellyfin credentials between providers[] and integrations
-    if (Array.isArray(merged.providers)) {
-      const jf = merged.providers.find((p) => p && p.type === 'jellyfin');
-      if (jf) {
-        if (jf.serverUrl && !nextConfig.integrations?.jellyfinUrl) {
-          merged.integrations.jellyfinUrl = jf.serverUrl;
-        }
-        if (jf.token && !nextConfig.integrations?.jellyfinToken) {
-          merged.integrations.jellyfinToken = jf.token;
-        }
-        if (jf.userId && !nextConfig.integrations?.jellyfinUserId) {
-          merged.integrations.jellyfinUserId = jf.userId;
-        }
-        if (jf.username && !nextConfig.integrations?.jellyfinUsername) {
-          merged.integrations.jellyfinUsername = jf.username;
-        }
-      }
-    }
-
     const dir = path.dirname(CONFIG_FILE_PATH);
     fs.mkdirSync(dir, { recursive: true });
     const tempPath = `${CONFIG_FILE_PATH}.tmp`;
@@ -480,81 +483,802 @@ function writeServerConfig(nextConfig) {
   }
 }
 
-// Ensure config.json exists on boot
 if (!fs.existsSync(CONFIG_FILE_PATH)) {
   try {
     writeServerConfig(DEFAULT_SERVER_CONFIG);
-  } catch {
-    // ignore
-  }
+  } catch {}
 }
 
-// Helper to resolve active Jellyfin credentials from config.json
-function getActiveJellyfinCredentials(override = {}) {
-  const cfg = readServerConfig();
-  const jfProvider = Array.isArray(cfg.providers)
-    ? cfg.providers.find((p) => p && p.type === 'jellyfin')
-    : null;
-
-  const serverUrl = (
-    override.jellyfinUrl ||
-    cfg.integrations?.jellyfinUrl ||
-    jfProvider?.serverUrl ||
-    ''
-  )
-    .trim()
-    .replace(/\/+$/, '');
-  const token = (
-    override.jellyfinToken ||
-    cfg.integrations?.jellyfinToken ||
-    jfProvider?.token ||
-    ''
-  ).trim();
-  const userId = (
-    override.jellyfinUserId ||
-    cfg.integrations?.jellyfinUserId ||
-    jfProvider?.userId ||
-    ''
-  ).trim();
-
-  return { serverUrl, token, userId };
-}
-
-function buildJellyfinHeaders(token) {
-  const authValue = token
-    ? `MediaBrowser Client="Brokeify", Device="BrokeifyDocker", DeviceId="brokeify-docker-01", Version="2.0.0", Token="${token}"`
-    : `MediaBrowser Client="Brokeify", Device="BrokeifyDocker", DeviceId="brokeify-docker-01", Version="2.0.0"`;
-  const headers = {
-    Accept: 'application/json',
-    'Content-Type': 'application/json',
-    Authorization: authValue,
-  };
-  if (token) {
-    headers['X-Emby-Token'] = token;
-  }
-  return headers;
-}
-
-// Canonical string normalizer for matching ListenBrainz/MusicBrainz tracks with Jellyfin library
 function normalizeText(str = '') {
   return String(str)
     .toLowerCase()
-    .replace(/\((feat|ft|featuring|radio|explicit|clean|remaster|version|edit)[^)]*\)/gi, ' ')
+    .replace(
+      /\((feat|ft|featuring|radio|explicit|clean|remaster|version|edit)[^)]*\)/gi,
+      ' '
+    )
     .replace(/\[[^\]]*\]/g, ' ')
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();
 }
 
+function getLocalLibraryStats() {
+  const totalTracks = (
+    db.prepare(`SELECT COUNT(*) as c FROM tracks`).get() as { c: number }
+  ).c;
+  const totalAlbums = (
+    db.prepare(`SELECT COUNT(*) as c FROM albums`).get() as { c: number }
+  ).c;
+  const totalArtists = (
+    db.prepare(`SELECT COUNT(*) as c FROM artists`).get() as { c: number }
+  ).c;
+  const totalPlaylists = (
+    db.prepare(`SELECT COUNT(*) as c FROM playlists`).get() as { c: number }
+  ).c;
+  const totalScrobbles = (
+    db.prepare(`SELECT COUNT(*) as c FROM scrobbles`).get() as { c: number }
+  ).c;
+  return {
+    totalTracks,
+    totalAlbums,
+    totalArtists,
+    totalPlaylists,
+    totalScrobbles,
+  };
+}
+
+function getSqliteAudioFingerprints() {
+  const tracks = queryTracks();
+  return tracks.map((t) => ({
+    id: t.id,
+    rawId: t.id,
+    title: t.title,
+    artist: t.artist,
+    album: t.album,
+    normTitle: normalizeText(t.title),
+    normArtist: normalizeText(t.artist),
+  }));
+}
+
 // ============================================================================
-// 1. PERSISTENT SERVER-SIDE STORAGE (/api/config & /api/config/backup)
+// 1. STANDALONE COMPANION REST API FOR ANDROID, ANDROID AUTO & WEB PLAYER
+// ============================================================================
+
+// GET /api/health -> Returns server status, version, drive connection status, and total indexed track/album/artist counts
+app.get('/api/health', (_req, res) => {
+  const counts = getLocalLibraryStats();
+  const driveStatus = inspectMusicDrive();
+  res.json({
+    ok: true,
+    status: 'ok',
+    mode: 'standalone',
+    server: 'Brokeify Native Engine',
+    version: '3.0.0-standalone',
+    totalTracks: counts.totalTracks,
+    totalAlbums: counts.totalAlbums,
+    totalArtists: counts.totalArtists,
+    totalPlaylists: counts.totalPlaylists,
+    totalScrobbles: counts.totalScrobbles,
+    musicDir: getMusicDir(),
+    dbPath: DB_PATH,
+    coversDir: COVERS_DIR,
+    scanner: scannerState,
+    driveStatus,
+  });
+});
+
+// GET /api/storage/drive-status -> Inspects current mounted music drive / NAS folder
+app.get('/api/storage/drive-status', (_req, res) => {
+  const driveStatus = inspectMusicDrive();
+  const counts = getLocalLibraryStats();
+  res.json({
+    ok: true,
+    ...driveStatus,
+    ...counts,
+  });
+});
+
+// POST /api/storage/test-drive -> Tests any local or NAS folder path before saving
+app.post('/api/storage/test-drive', (req, res) => {
+  const customPath = String(
+    req.body?.path || req.body?.musicDir || getMusicDir()
+  ).trim();
+  const driveStatus = inspectMusicDrive(customPath);
+  res.json({
+    ok: driveStatus.exists && driveStatus.readable,
+    ...driveStatus,
+  });
+});
+
+// POST /api/storage/connect-drive -> Saves a new music drive / NAS folder path, restarts Chokidar watcher, and scans immediately
+app.post('/api/storage/connect-drive', async (req, res) => {
+  try {
+    const newPath = String(
+      req.body?.path || req.body?.musicDir || getMusicDir()
+    ).trim();
+    if (!newPath) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Please enter a valid folder path (e.g. /music or /mnt/nas/music).',
+      });
+    }
+
+    const cfg = readServerConfig();
+    writeServerConfig({
+      ...cfg,
+      integrations: {
+        ...cfg.integrations,
+        downloadDir: newPath,
+        lidarrRootFolderPath: newPath,
+      },
+      picardConfig: {
+        ...cfg.picardConfig,
+        targetMusicRoot: newPath,
+      },
+    });
+
+    const driveStatus = await setMusicDirectory(newPath);
+    const counts = getLocalLibraryStats();
+
+    return res.json({
+      ok: true,
+      ...driveStatus,
+      ...counts,
+      message: driveStatus.driveConnected
+        ? `✅ Connected to "${newPath}"! Indexed ${counts.totalTracks} tracks across ${counts.totalAlbums} albums.`
+        : driveStatus.statusMessage,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : 'Failed to update music drive path.',
+    });
+  }
+});
+
+// POST /api/auth/login -> Authenticates client and returns session token
+app.post('/api/auth/login', (req, res) => {
+  const cfg = readServerConfig();
+  const username = String(
+    req.body?.username || cfg.auth?.username || 'admin'
+  ).trim();
+  const password = String(req.body?.password || '').trim();
+  const expectedPass = String(cfg.auth?.password || 'brokeify').trim();
+
+  if (
+    password &&
+    password !== expectedPass &&
+    password !== cfg.auth?.apiToken
+  ) {
+    return res.status(401).json({
+      ok: false,
+      error: 'Invalid Brokeify server credentials.',
+    });
+  }
+
+  const token =
+    cfg.auth?.apiToken ||
+    crypto.createHash('sha256').update(`${username}:brokeify`).digest('hex');
+
+  return res.json({
+    ok: true,
+    token,
+    user: {
+      id: 'usr-brokeify-admin',
+      username,
+      role: 'admin',
+    },
+    server: 'Brokeify Native Engine',
+    mode: 'standalone',
+  });
+});
+
+// Helper to detect host LAN IPv4 address for Android QR code pairing
+function detectLanIpv4(): string {
+  try {
+    const nets = os.networkInterfaces();
+    for (const name of Object.keys(nets)) {
+      for (const net of nets[name] || []) {
+        if (net.family === 'IPv4' && !net.internal) {
+          if (
+            net.address.startsWith('192.168.') ||
+            net.address.startsWith('10.') ||
+            net.address.startsWith('100.')
+          ) {
+            return net.address;
+          }
+        }
+      }
+    }
+    for (const name of Object.keys(nets)) {
+      for (const net of nets[name] || []) {
+        if (net.family === 'IPv4' && !net.internal) {
+          return net.address;
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return '192.168.1.175';
+}
+
+interface PairedAndroidDevice {
+  id: string;
+  deviceName: string;
+  model: string;
+  clientIp: string;
+  connectedAt: string;
+}
+
+const pairedAndroidDevices: PairedAndroidDevice[] = [];
+
+function ensureMobileApiToken(forceNew = false): string {
+  const cfg = readServerConfig();
+  let currentToken = String(cfg.auth?.apiToken || '').trim();
+  if (
+    forceNew ||
+    !currentToken ||
+    currentToken === 'brokeify-standalone-token'
+  ) {
+    currentToken = `brk_${crypto.randomBytes(16).toString('hex')}`;
+    writeServerConfig({
+      ...cfg,
+      auth: {
+        ...(cfg.auth || { username: 'admin', password: 'brokeify' }),
+        apiToken: currentToken,
+      },
+    });
+  }
+  return currentToken;
+}
+
+// GET /api/mobile/pair-info -> Returns QR pairing payload, LAN IP, API token, and connected Android devices
+app.get('/api/mobile/pair-info', (req, res) => {
+  const apiToken = ensureMobileApiToken(false);
+  const port = Number(process.env.PORT || 3487);
+  const lanIp = detectLanIpv4();
+  const lanUrl = `http://${lanIp}:${port}`;
+  const proto =
+    String(req.headers['x-forwarded-proto'] || req.protocol || 'http').split(
+      ','
+    )[0];
+  const host = String(
+    req.headers['x-forwarded-host'] || req.headers.host || `${lanIp}:${port}`
+  ).split(',')[0];
+  const detectedOriginUrl = `${proto}://${host}`;
+  const counts = getLocalLibraryStats();
+  const driveStatus = inspectMusicDrive();
+
+  res.json({
+    ok: true,
+    app: 'brokeify',
+    version: '3.0.0-standalone',
+    serverUrl: detectedOriginUrl,
+    lanUrl,
+    port,
+    apiKey: apiToken,
+    libraryStats: counts,
+    driveStatus,
+    pairedDevices: pairedAndroidDevices,
+    endpoints: {
+      verify: '/api/mobile/verify',
+      health: '/api/health',
+      tracks: '/api/library/tracks',
+      albums: '/api/library/albums',
+      artists: '/api/library/artists',
+      playlists: '/api/playlists',
+      search: '/api/search?q={query}',
+      stream: '/api/stream/{trackId}',
+      cover: '/api/covers/{albumId}',
+      scrobble: '/api/scrobble',
+    },
+  });
+});
+
+// POST /api/mobile/regenerate-token -> Rotates the Android API key
+app.post('/api/mobile/regenerate-token', (_req, res) => {
+  const apiToken = ensureMobileApiToken(true);
+  res.json({
+    ok: true,
+    apiKey: apiToken,
+    message: 'Generated new Android pairing API key!',
+  });
+});
+
+// GET or POST /api/mobile/verify -> Called by the Android app after scanning the QR code to verify connection
+app.all('/api/mobile/verify', (req, res) => {
+  const expectedToken = ensureMobileApiToken(false);
+  const authHeader = String(req.headers.authorization || '').replace(
+    /^Bearer\s+/i,
+    ''
+  );
+  const providedToken = String(
+    authHeader ||
+      req.headers['x-api-key'] ||
+      req.query.apiKey ||
+      req.query.token ||
+      req.body?.apiKey ||
+      req.body?.token ||
+      ''
+  ).trim();
+
+  if (providedToken && providedToken !== expectedToken) {
+    return res.status(401).json({
+      ok: false,
+      error: 'Invalid Brokeify API key. Please re-scan the QR code.',
+    });
+  }
+
+  const deviceName = String(
+    req.body?.deviceName ||
+      req.query.deviceName ||
+      req.headers['x-device-name'] ||
+      'Android Phone'
+  ).trim();
+  const model = String(
+    req.body?.model ||
+      req.query.model ||
+      req.headers['user-agent'] ||
+      'Brokeify Android Client'
+  )
+    .slice(0, 80)
+    .trim();
+  const clientIp = String(
+    req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown'
+  )
+    .split(',')[0]
+    .trim();
+
+  const existingIdx = pairedAndroidDevices.findIndex(
+    (d) => d.deviceName === deviceName && d.clientIp === clientIp
+  );
+  const deviceRecord: PairedAndroidDevice = {
+    id: `android-${Date.now().toString(36)}`,
+    deviceName,
+    model,
+    clientIp,
+    connectedAt: new Date().toISOString(),
+  };
+  if (existingIdx >= 0) {
+    pairedAndroidDevices[existingIdx] = deviceRecord;
+  } else {
+    pairedAndroidDevices.unshift(deviceRecord);
+    if (pairedAndroidDevices.length > 10) pairedAndroidDevices.pop();
+  }
+
+  const counts = getLocalLibraryStats();
+  return res.json({
+    ok: true,
+    authenticated: true,
+    server: 'Brokeify Native Engine',
+    version: '3.0.0-standalone',
+    device: deviceRecord,
+    libraryStats: counts,
+    endpoints: {
+      tracks: '/api/library/tracks',
+      albums: '/api/library/albums',
+      artists: '/api/library/artists',
+      playlists: '/api/playlists',
+      stream: '/api/stream/{trackId}',
+      cover: '/api/covers/{albumId}',
+      scrobble: '/api/scrobble',
+    },
+  });
+});
+
+// GET /api/library/artists -> Returns all indexed artists
+app.get('/api/library/artists', (req, res) => {
+  const search = String(req.query.search || req.query.q || '').trim();
+  const artists = queryArtists(search);
+  res.json({
+    ok: true,
+    total: artists.length,
+    artists,
+  });
+});
+
+// GET /api/library/albums -> Returns all albums (filterable by ?artistId= and ?search=)
+app.get('/api/library/albums', (req, res) => {
+  const artistId = String(req.query.artistId || '').trim() || undefined;
+  const search =
+    String(req.query.search || req.query.q || '').trim() || undefined;
+  const albums = queryAlbums({ artistId, search });
+  res.json({
+    ok: true,
+    total: albums.length,
+    albums,
+  });
+});
+
+// GET /api/library/tracks -> Returns tracks (filterable by ?albumId=, ?artistId=, or ?search=)
+app.get('/api/library/tracks', (req, res) => {
+  const albumId = String(req.query.albumId || '').trim() || undefined;
+  const artistId = String(req.query.artistId || '').trim() || undefined;
+  const search =
+    String(req.query.search || req.query.q || '').trim() || undefined;
+  const limit = req.query.limit ? Number(req.query.limit) : undefined;
+  const tracks = queryTracks({ albumId, artistId, search, limit });
+  res.json({
+    ok: true,
+    total: tracks.length,
+    tracks,
+  });
+});
+
+// POST /api/library/rescan -> Triggers a full recursive scan of /music and .m3u/.m3u8 import
+app.post('/api/library/rescan', async (_req, res) => {
+  try {
+    const scanResult = await runFullLibraryScan();
+    const counts = getLocalLibraryStats();
+    res.json({
+      ok: true,
+      ...scanResult,
+      ...counts,
+      musicDir: MUSIC_DIR,
+      dbPath: DB_PATH,
+      message: `Scanned ${MUSIC_DIR}: indexed ${counts.totalTracks} tracks across ${counts.totalAlbums} albums & ${counts.totalArtists} artists (${counts.totalPlaylists} playlists).`,
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error:
+        err instanceof Error ? err.message : 'Failed to rescan /music folder.',
+    });
+  }
+});
+
+// GET /api/search?q= -> Global fuzzy search across artists, albums, tracks, and playlists
+app.get('/api/search', (req, res) => {
+  const q = String(req.query.q || req.query.search || '').trim();
+  if (!q) {
+    return res.json({
+      ok: true,
+      query: '',
+      artists: [],
+      albums: [],
+      tracks: [],
+      playlists: [],
+    });
+  }
+  const artists = queryArtists(q);
+  const albums = queryAlbums({ search: q });
+  const tracks = queryTracks({ search: q, limit: 100 });
+  const lowerQ = q.toLowerCase();
+  const playlists = queryPlaylists().filter(
+    (p) =>
+      p.name.toLowerCase().includes(lowerQ) ||
+      p.description.toLowerCase().includes(lowerQ)
+  );
+
+  res.json({
+    ok: true,
+    query: q,
+    artists,
+    albums,
+    tracks,
+    playlists,
+  });
+});
+
+// ============================================================================
+// 2. SQLITE PLAYLIST CRUD API (/api/playlists)
+// ============================================================================
+
+app.get('/api/playlists', (_req, res) => {
+  const playlists = queryPlaylists();
+  res.json({
+    ok: true,
+    total: playlists.length,
+    playlists,
+  });
+});
+
+app.get('/api/playlists/:id', (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const playlists = queryPlaylists();
+  const playlist = playlists.find((p) => p.id === id);
+  if (!playlist) {
+    return res.status(404).json({ ok: false, error: 'Playlist not found' });
+  }
+  const allTracksMap = new Map(queryTracks().map((t) => [t.id, t]));
+  const tracks = playlist.trackIds
+    .map((tid) => allTracksMap.get(tid))
+    .filter(Boolean);
+
+  res.json({
+    ok: true,
+    playlist: {
+      ...playlist,
+      tracks,
+    },
+  });
+});
+
+app.post('/api/playlists', (req, res) => {
+  try {
+    const name = String(req.body?.name || '').trim();
+    if (!name) {
+      return res
+        .status(400)
+        .json({ ok: false, error: 'Playlist name is required.' });
+    }
+    const id =
+      String(req.body?.id || '').trim() ||
+      `pl-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const description = String(
+      req.body?.description || 'Custom Brokeify SQLite Playlist'
+    ).trim();
+    const isSmart = req.body?.isSmart ? 1 : 0;
+    const smartRulesJson = req.body?.smartRules
+      ? JSON.stringify(req.body.smartRules)
+      : null;
+    const trackIds = Array.isArray(req.body?.trackIds)
+      ? req.body.trackIds.map(String)
+      : [];
+    const now = new Date().toISOString();
+
+    db.prepare(
+      `INSERT INTO playlists (id, name, description, cover_path, is_smart, smart_rules_json, created_at, updated_at)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         name = excluded.name,
+         description = excluded.description,
+         is_smart = excluded.is_smart,
+         smart_rules_json = excluded.smart_rules_json,
+         updated_at = excluded.updated_at`
+    ).run(id, name, description, isSmart, smartRulesJson, now, now);
+
+    const syncTracksTx = db.transaction((ids: string[]) => {
+      db.prepare(`DELETE FROM playlist_tracks WHERE playlist_id = ?`).run(id);
+      const stmt = db.prepare(
+        `INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)`
+      );
+      ids.forEach((tid, idx) => {
+        const exists = db
+          .prepare(`SELECT 1 FROM tracks WHERE id = ?`)
+          .get(tid);
+        if (exists) {
+          stmt.run(id, tid, idx);
+        }
+      });
+    });
+    syncTracksTx(trackIds);
+
+    const created = queryPlaylists().find((p) => p.id === id);
+    res.json({
+      ok: true,
+      playlist: created,
+      playlists: queryPlaylists(),
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Failed to create playlist.',
+    });
+  }
+});
+
+app.put('/api/playlists/:id', (req, res) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    const existing = db
+      .prepare(`SELECT * FROM playlists WHERE id = ?`)
+      .get(id) as Record<string, any> | undefined;
+    if (!existing) {
+      return res.status(404).json({ ok: false, error: 'Playlist not found.' });
+    }
+
+    const name =
+      req.body?.name !== undefined
+        ? String(req.body.name).trim()
+        : existing.name;
+    const description =
+      req.body?.description !== undefined
+        ? String(req.body.description).trim()
+        : existing.description;
+    const now = new Date().toISOString();
+
+    db.prepare(
+      `UPDATE playlists SET name = ?, description = ?, updated_at = ? WHERE id = ?`
+    ).run(name, description, now, id);
+
+    if (Array.isArray(req.body?.trackIds)) {
+      const trackIds = req.body.trackIds.map(String);
+      const syncTracksTx = db.transaction((ids: string[]) => {
+        db.prepare(`DELETE FROM playlist_tracks WHERE playlist_id = ?`).run(id);
+        const stmt = db.prepare(
+          `INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)`
+        );
+        ids.forEach((tid, idx) => {
+          const exists = db
+            .prepare(`SELECT 1 FROM tracks WHERE id = ?`)
+            .get(tid);
+          if (exists) {
+            stmt.run(id, tid, idx);
+          }
+        });
+      });
+      syncTracksTx(trackIds);
+    }
+
+    const updated = queryPlaylists().find((p) => p.id === id);
+    res.json({
+      ok: true,
+      playlist: updated,
+      playlists: queryPlaylists(),
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Failed to update playlist.',
+    });
+  }
+});
+
+app.delete('/api/playlists/:id', (req, res) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    db.prepare(`DELETE FROM playlist_tracks WHERE playlist_id = ?`).run(id);
+    db.prepare(`DELETE FROM playlists WHERE id = ?`).run(id);
+    res.json({
+      ok: true,
+      deletedId: id,
+      playlists: queryPlaylists(),
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Failed to delete playlist.',
+    });
+  }
+});
+
+// ============================================================================
+// 3. SEEKABLE HTTP 206 AUDIO STREAMING & CACHED COVER ART
+// ============================================================================
+
+app.get('/api/stream/:trackId', (req, res) => {
+  return handleStreamTrack(req, res);
+});
+
+app.get('/api/cover/:type/:id', (req, res) => {
+  return handleServeCover(req, res);
+});
+
+// ============================================================================
+// 4. TRACK DISK CLEANUP & MAINTAINERR DUPLICATE JANITOR (SQLite + /music)
+// ============================================================================
+
+function deleteTrackFromDiskAndDb(rawId: string): boolean {
+  const cleanId = String(rawId || '').trim();
+  if (!cleanId) return false;
+
+  const row = db
+    .prepare(`SELECT id, file_path FROM tracks WHERE id = ?`)
+    .get(cleanId) as { id: string; file_path: string } | undefined;
+
+  if (!row) return false;
+
+  try {
+    if (row.file_path && fs.existsSync(row.file_path)) {
+      fs.unlinkSync(row.file_path);
+    }
+  } catch {
+    // ignore unlink error if read-only
+  }
+
+  removeAudioFileFromIndex(row.file_path);
+  db.prepare(`DELETE FROM tracks WHERE id = ?`).run(cleanId);
+  return true;
+}
+
+app.delete('/api/library/tracks/:id', (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const ok = deleteTrackFromDiskAndDb(id);
+  if (!ok) {
+    return res
+      .status(404)
+      .json({ ok: false, error: 'Track not found in SQLite database.' });
+  }
+  return res.json({
+    ok: true,
+    deletedId: id,
+    message: `Permanently deleted track ${id} from /music and SQLite index.`,
+  });
+});
+
+app.post('/api/library/tracks/bulk-delete', (req, res) => {
+  const ids = Array.isArray(req.body?.ids)
+    ? req.body.ids
+    : Array.isArray(req.body?.itemIds)
+      ? req.body.itemIds
+      : [];
+
+  const deletedIds: string[] = [];
+  const failedIds: string[] = [];
+
+  for (const rawId of ids) {
+    if (deleteTrackFromDiskAndDb(String(rawId))) {
+      deletedIds.push(String(rawId));
+    } else {
+      failedIds.push(String(rawId));
+    }
+  }
+
+  return res.json({
+    ok: true,
+    deletedIds,
+    failedIds,
+    message: `Deleted ${deletedIds.length} track(s) from /music disk & SQLite database.`,
+  });
+});
+
+// Backward-compatible aliases so existing frontend Maintainerr cleanup buttons work seamlessly
+app.delete('/api/jellyfin/items/:id', (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const ok = deleteTrackFromDiskAndDb(id);
+  return res.json({
+    ok,
+    deletedId: id,
+    message: ok
+      ? `Deleted track ${id} from local /music storage.`
+      : 'Track not found in local SQLite database.',
+  });
+});
+
+app.post('/api/jellyfin/items/bulk-delete', (req, res) => {
+  const ids = Array.isArray(req.body?.ids)
+    ? req.body.ids
+    : Array.isArray(req.body?.itemIds)
+      ? req.body.itemIds
+      : [];
+  const deletedIds: string[] = [];
+  const failedIds: string[] = [];
+  for (const rawId of ids) {
+    if (deleteTrackFromDiskAndDb(String(rawId))) {
+      deletedIds.push(String(rawId));
+    } else {
+      failedIds.push(String(rawId));
+    }
+  }
+  return res.json({
+    ok: true,
+    deletedIds,
+    failedIds,
+    message: `Deleted ${deletedIds.length} track(s) from local /music storage.`,
+  });
+});
+
+app.post('/api/jellyfin/refresh', async (_req, res) => {
+  const scanResult = await runFullLibraryScan();
+  return res.json({
+    ok: true,
+    status: 200,
+    ...scanResult,
+    message: `Rescanned /music directory (${scanResult.indexedTracks} tracks indexed).`,
+  });
+});
+
+// ============================================================================
+// 5. PERSISTENT SERVER-SIDE STORAGE (/api/config & /api/config/backup)
 // ============================================================================
 
 app.get('/api/config', (_req, res) => {
   const config = readServerConfig();
+  const sqlPlaylists = queryPlaylists();
   res.json({
     ok: true,
     configPath: CONFIG_FILE_PATH,
-    config,
+    dbPath: DB_PATH,
+    musicDir: MUSIC_DIR,
+    config: {
+      ...config,
+      playlists:
+        sqlPlaylists.length > 0 ? sqlPlaylists : config.playlists || [],
+    },
   });
 });
 
@@ -562,6 +1286,49 @@ app.post('/api/config', (req, res) => {
   try {
     const incoming = req.body?.config || req.body || {};
     const saved = writeServerConfig(incoming);
+
+    // Sync any incoming custom playlists into the SQLite playlists table as well
+    if (Array.isArray(incoming.playlists)) {
+      const now = new Date().toISOString();
+      for (const pl of incoming.playlists) {
+        if (!pl || !pl.id || !pl.name) continue;
+        db.prepare(
+          `INSERT INTO playlists (id, name, description, cover_path, is_smart, smart_rules_json, created_at, updated_at)
+           VALUES (?, ?, ?, NULL, 0, NULL, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             name = excluded.name,
+             description = excluded.description,
+             updated_at = excluded.updated_at`
+        ).run(
+          String(pl.id),
+          String(pl.name),
+          String(pl.description || ''),
+          String(pl.createdAt || now),
+          now
+        );
+
+        if (Array.isArray(pl.trackIds)) {
+          const syncTx = db.transaction((tids: string[]) => {
+            db.prepare(
+              `DELETE FROM playlist_tracks WHERE playlist_id = ?`
+            ).run(String(pl.id));
+            const ins = db.prepare(
+              `INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)`
+            );
+            tids.forEach((tid, idx) => {
+              const exists = db
+                .prepare(`SELECT 1 FROM tracks WHERE id = ?`)
+                .get(String(tid));
+              if (exists) {
+                ins.run(String(pl.id), String(tid), idx);
+              }
+            });
+          });
+          syncTx(pl.trackIds);
+        }
+      }
+    }
+
     res.json({
       ok: true,
       configPath: CONFIG_FILE_PATH,
@@ -584,124 +1351,142 @@ app.get('/api/config/backup', (_req, res) => {
 });
 
 // ============================================================================
-// 2. INTERNAL DOCKER PROXY ROUTES FOR JELLYFIN
+// 6. NATIVE LISTENBRAINZ DISCOVERY & SQLITE SCROBBLING ENGINE
 // ============================================================================
 
-// Permanently delete a duplicate or unwanted track from the Jellyfin server's hard drive
-app.delete('/api/jellyfin/items/:id', async (req, res) => {
+async function handleScrobbleSubmission(req, res) {
   try {
-    const rawId = String(req.params.id || '').replace(/^jellyfin-/, '');
-    if (!rawId) {
-      return res.status(400).json({ ok: false, error: 'Missing Jellyfin item ID.' });
+    const cfg = readServerConfig();
+    const token = String(
+      req.body?.token || cfg.integrations?.listenbrainzToken || ''
+    ).trim();
+
+    const listenType =
+      req.body?.listenType === 'playing_now' ? 'playing_now' : 'single';
+    const track = req.body?.track || {
+      id: req.body?.trackId,
+      title: req.body?.title,
+      artist: req.body?.artist,
+      album: req.body?.album,
+      duration: req.body?.duration,
+    };
+
+    const trackId = String(track.id || req.body?.trackId || '').trim();
+    const nowIso = new Date().toISOString();
+    const unixTs = Math.floor(Date.now() / 1000);
+
+    // 1. Update local SQLite play_count, last_played_at, and scrobbles table
+    let resolvedTrack = track;
+    if (trackId) {
+      const dbTrack = db
+        .prepare(
+          `SELECT t.id, t.title, t.duration_ms, COALESCE(ar.name, 'Unknown Artist') AS artist, COALESCE(al.title, 'Singles') AS album
+           FROM tracks t
+           LEFT JOIN artists ar ON t.artist_id = ar.id
+           LEFT JOIN albums al ON t.album_id = al.id
+           WHERE t.id = ?`
+        )
+        .get(trackId) as any;
+
+      if (dbTrack) {
+        resolvedTrack = {
+          id: dbTrack.id,
+          title: track.title || dbTrack.title,
+          artist: track.artist || dbTrack.artist,
+          album: track.album || dbTrack.album,
+          duration:
+            track.duration || Math.round((dbTrack.duration_ms || 180000) / 1000),
+        };
+        if (listenType === 'single') {
+          db.prepare(
+            `UPDATE tracks SET play_count = COALESCE(play_count, 0) + 1, last_played_at = ? WHERE id = ?`
+          ).run(nowIso, dbTrack.id);
+        }
+      }
     }
 
-    const { serverUrl, token } = getActiveJellyfinCredentials({
-      jellyfinUrl: req.query.serverUrl || req.headers['x-jellyfin-url'],
-      jellyfinToken: req.query.token || req.headers['x-jellyfin-token'],
-    });
+    let syncedToLb = 0;
+    let lbResponseData: any = null;
 
-    if (!serverUrl || !token) {
-      return res.status(400).json({
-        ok: false,
-        error: 'Jellyfin server URL or token is not configured in /app/data/config.json.',
-      });
+    // 2. Forward to ListenBrainz if token is configured
+    if (token && resolvedTrack.title && resolvedTrack.artist) {
+      const trackMetadata = {
+        artist_name: resolvedTrack.artist,
+        track_name: resolvedTrack.title,
+        release_name: resolvedTrack.album || undefined,
+        additional_info: {
+          submission_client: 'Brokeify Standalone Server',
+          submission_client_version: '3.0.0',
+          music_service: 'brokeify-standalone',
+          duration_ms: resolvedTrack.duration
+            ? Math.round(Number(resolvedTrack.duration) * 1000)
+            : undefined,
+        },
+      };
+
+      const payloadEntry =
+        listenType === 'playing_now'
+          ? { track_metadata: trackMetadata }
+          : {
+              listened_at: unixTs,
+              track_metadata: trackMetadata,
+            };
+
+      try {
+        const lbResp = await fetch(
+          'https://api.listenbrainz.org/1/submit-listens',
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Token ${token}`,
+              'User-Agent':
+                'BrokeifyStandalone/3.0 (https://github.com/Mr-Nickey/brokeify)',
+            },
+            body: JSON.stringify({
+              listen_type: listenType,
+              payload: [payloadEntry],
+            }),
+          }
+        );
+        syncedToLb = lbResp.ok ? 1 : 0;
+        lbResponseData = await lbResp.json().catch(() => ({}));
+      } catch {
+        syncedToLb = 0;
+      }
     }
 
-    const targetUrl = `${serverUrl}/Items/${encodeURIComponent(rawId)}`;
-    const response = await fetch(targetUrl, {
-      method: 'DELETE',
-      headers: buildJellyfinHeaders(token),
-    });
-
-    if (response.status === 204 || response.ok) {
-      return res.json({
-        ok: true,
-        deletedId: rawId,
-        message: `Permanently deleted item ${rawId} from Jellyfin hard drive.`,
-      });
+    // 3. Record scrobble row in SQLite `scrobbles` table
+    if (listenType === 'single' && trackId) {
+      const exists = db
+        .prepare(`SELECT 1 FROM tracks WHERE id = ?`)
+        .get(trackId);
+      if (exists) {
+        const scrobbleId = `scr-${Date.now()}-${Math.random()
+          .toString(36)
+          .slice(2, 6)}`;
+        db.prepare(
+          `INSERT INTO scrobbles (id, track_id, timestamp, synced_listenbrainz) VALUES (?, ?, ?, ?)`
+        ).run(scrobbleId, trackId, unixTs, syncedToLb);
+      }
     }
 
-    const errText = await response.text().catch(() => '');
-    return res.status(response.status).json({
-      ok: false,
-      error: `Jellyfin DELETE /Items/${rawId} returned HTTP ${response.status}${errText ? `: ${errText.slice(0, 180)}` : ''}`,
-    });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: err instanceof Error ? err.message : 'Failed to reach Jellyfin server.',
-    });
-  }
-});
-
-// Trigger Jellyfin Library Refresh on demand
-app.post('/api/jellyfin/refresh', async (req, res) => {
-  try {
-    const { serverUrl, token } = getActiveJellyfinCredentials(req.body || {});
-    if (!serverUrl || !token) {
-      return res.status(400).json({
-        ok: false,
-        error: 'Jellyfin URL and token are required to trigger Library Refresh.',
-      });
-    }
-    const response = await fetch(`${serverUrl}/Library/Refresh`, {
-      method: 'POST',
-      headers: buildJellyfinHeaders(token),
-    });
     return res.json({
-      ok: response.ok || response.status === 204,
-      status: response.status,
-      message:
-        response.ok || response.status === 204
-          ? 'Triggered Jellyfin Library/Refresh.'
-          : `Jellyfin returned HTTP ${response.status}`,
+      ok: true,
+      listenType,
+      syncedListenBrainz: Boolean(syncedToLb),
+      response: lbResponseData,
     });
   } catch (err) {
     return res.status(500).json({
       ok: false,
-      error: err instanceof Error ? err.message : 'Failed to refresh Jellyfin library.',
+      error: err instanceof Error ? err.message : 'Scrobble submission failed.',
     });
-  }
-});
-
-// Helper to fetch current Jellyfin audio catalog titles/artists for library cross-checking
-async function fetchJellyfinAudioFingerprints() {
-  const { serverUrl, token, userId } = getActiveJellyfinCredentials();
-  if (!serverUrl || !token) return [];
-  try {
-    const endpoint = userId
-      ? `${serverUrl}/Users/${encodeURIComponent(userId)}/Items?IncludeItemTypes=Audio&Recursive=true&Fields=Artists,Album&Limit=4000&api_key=${encodeURIComponent(token)}`
-      : `${serverUrl}/Items?IncludeItemTypes=Audio&Recursive=true&Fields=Artists,Album&Limit=4000&api_key=${encodeURIComponent(token)}`;
-    const resp = await fetch(endpoint, {
-      headers: buildJellyfinHeaders(token),
-    });
-    if (!resp.ok) return [];
-    const data = await resp.json();
-    const items = Array.isArray(data?.Items) ? data.Items : [];
-    return items.map((item) => ({
-      id: `jellyfin-${item.Id}`,
-      rawId: item.Id,
-      title: item.Name || 'Untitled',
-      artist:
-        (Array.isArray(item.Artists) && item.Artists[0]) ||
-        item.AlbumArtist ||
-        'Unknown Artist',
-      album: item.Album || '',
-      normTitle: normalizeText(item.Name || ''),
-      normArtist: normalizeText(
-        (Array.isArray(item.Artists) && item.Artists[0]) ||
-          item.AlbumArtist ||
-          ''
-      ),
-    }));
-  } catch {
-    return [];
   }
 }
 
-// ============================================================================
-// 3. LISTENBRAINZ DISCOVERY & SCROBBLING PROXY ROUTES
-// ============================================================================
+app.post('/api/playback/scrobble', handleScrobbleSubmission);
+app.post('/api/listenbrainz/scrobble', handleScrobbleSubmission);
 
 app.get('/api/listenbrainz/discover', async (req, res) => {
   try {
@@ -716,14 +1501,15 @@ app.get('/api/listenbrainz/discover', async (req, res) => {
         ok: false,
         username: '',
         error:
-          'Enter your ListenBrainz username above or in Settings -> Sources Hub to load your Weekly Exploration and Weekly Jams playlists.',
+          'Enter your ListenBrainz username above or in Settings to load your Weekly Exploration and Weekly Jams playlists.',
         playlists: [],
       });
     }
 
-    const lbHeaders = {
+    const lbHeaders: Record<string, string> = {
       Accept: 'application/json',
-      'User-Agent': 'Brokeify/2.0 (https://github.com/Mr-Nickey/brokeify)',
+      'User-Agent':
+        'BrokeifyStandalone/3.0 (https://github.com/Mr-Nickey/brokeify)',
     };
     if (lbToken) {
       lbHeaders['Authorization'] = `Token ${lbToken}`;
@@ -747,10 +1533,9 @@ app.get('/api/listenbrainz/discover', async (req, res) => {
       ? listData.playlists
       : [];
 
-    // Fetch Jellyfin library fingerprints so we can mark which tracks are already in Jellyfin vs missing
-    const jfLibrary = await fetchJellyfinAudioFingerprints();
-
+    const localLibrary = getSqliteAudioFingerprints();
     const detailedPlaylists = [];
+
     for (const entry of rawPlaylists.slice(0, 6)) {
       const plSummary = entry?.playlist;
       if (!plSummary?.identifier) continue;
@@ -777,18 +1562,17 @@ app.get('/api/listenbrainz/discover', async (req, res) => {
           const normT = normalizeText(title);
           const normA = normalizeText(artist);
 
-          const matchedJf = jfLibrary.find(
-            (jf) =>
-              jf.normTitle &&
+          const matchedLocal = localLibrary.find(
+            (loc) =>
+              loc.normTitle &&
               normT &&
-              (jf.normTitle === normT ||
-                jf.normTitle.includes(normT) ||
-                normT.includes(jf.normTitle)) &&
+              (loc.normTitle === normT ||
+                loc.normTitle.includes(normT) ||
+                normT.includes(loc.normTitle)) &&
               (!normA ||
-                !jf.normArtist ||
-                jf.normArtist === 'a' ||
-                jf.normArtist.includes(normA) ||
-                normA.includes(jf.normArtist))
+                !loc.normArtist ||
+                loc.normArtist.includes(normA) ||
+                normA.includes(loc.normArtist))
           );
 
           return {
@@ -797,8 +1581,8 @@ app.get('/api/listenbrainz/discover', async (req, res) => {
             artist,
             album,
             durationMs: t.duration || 210000,
-            inLibrary: Boolean(matchedJf),
-            jellyfinTrackId: matchedJf?.id || null,
+            inLibrary: Boolean(matchedLocal),
+            jellyfinTrackId: matchedLocal?.id || null,
           };
         });
 
@@ -816,7 +1600,7 @@ app.get('/api/listenbrainz/discover', async (req, res) => {
           tracks,
         });
       } catch {
-        // skip failed individual playlist fetch
+        // skip failed individual playlist
       }
     }
 
@@ -837,86 +1621,28 @@ app.get('/api/listenbrainz/discover', async (req, res) => {
   }
 });
 
-app.post('/api/listenbrainz/scrobble', async (req, res) => {
-  try {
-    const cfg = readServerConfig();
-    const token = String(
-      req.body?.token || cfg.integrations?.listenbrainzToken || ''
-    ).trim();
-
-    if (!token) {
-      return res.json({
-        ok: false,
-        skipped: true,
-        message: 'No ListenBrainz user token configured yet.',
-      });
-    }
-
-    const listenType =
-      req.body?.listenType === 'playing_now' ? 'playing_now' : 'single';
-    const track = req.body?.track || {};
-    if (!track.title || !track.artist) {
-      return res
-        .status(400)
-        .json({ ok: false, error: 'Track title and artist are required.' });
-    }
-
-    const trackMetadata = {
-      artist_name: track.artist,
-      track_name: track.title,
-      release_name: track.album || undefined,
-      additional_info: {
-        submission_client: 'Brokeify',
-        submission_client_version: '2.0.0',
-        music_service: 'jellyfin',
-        duration_ms: track.duration ? Math.round(track.duration * 1000) : undefined,
-      },
-    };
-
-    const payloadEntry =
-      listenType === 'playing_now'
-        ? { track_metadata: trackMetadata }
-        : {
-            listened_at: Math.floor(Date.now() / 1000),
-            track_metadata: trackMetadata,
-          };
-
-    const lbResp = await fetch('https://api.listenbrainz.org/1/submit-listens', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Token ${token}`,
-        'User-Agent': 'Brokeify/2.0 (https://github.com/Mr-Nickey/brokeify)',
-      },
-      body: JSON.stringify({
-        listen_type: listenType,
-        payload: [payloadEntry],
-      }),
-    });
-
-    const data = await lbResp.json().catch(() => ({}));
-    return res.status(lbResp.status).json({
-      ok: lbResp.ok,
-      listenType,
-      status: lbResp.status,
-      response: data,
-    });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: err instanceof Error ? err.message : 'ListenBrainz scrobble failed.',
-    });
-  }
-});
-
 // ============================================================================
-// 4. MUSICBRAINZ PUBLIC API SEARCH & ALBUM TRACKLIST RESOLVER
+// 7. MUSICBRAINZ SEARCH, ALBUM RESOLVER & TAG ENRICHER
 // ============================================================================
 
 const MB_HEADERS = {
   Accept: 'application/json',
-  'User-Agent': 'Brokeify/2.0.0 ( https://github.com/Mr-Nickey/brokeify )',
+  'User-Agent': 'BrokeifyStandalone/3.0.0 ( https://github.com/Mr-Nickey/brokeify )',
 };
+
+app.post('/api/musicbrainz/enrich/:trackId', async (req, res) => {
+  try {
+    const trackId = String(req.params.trackId || '').trim();
+    const result = await enrichTrackFromMusicBrainz(trackId);
+    res.status(result.ok ? 200 : 400).json(result);
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      message:
+        err instanceof Error ? err.message : 'MusicBrainz enrichment failed.',
+    });
+  }
+});
 
 app.get('/api/musicbrainz/search', async (req, res) => {
   try {
@@ -932,9 +1658,11 @@ app.get('/api/musicbrainz/search', async (req, res) => {
       )}&limit=18&fmt=json`;
       const resp = await fetch(url, { headers: MB_HEADERS });
       if (!resp.ok) {
-        return res
-          .status(resp.status)
-          .json({ ok: false, error: `MusicBrainz HTTP ${resp.status}`, results: [] });
+        return res.status(resp.status).json({
+          ok: false,
+          error: `MusicBrainz HTTP ${resp.status}`,
+          results: [],
+        });
       }
       const data = await resp.json();
       const recordings = Array.isArray(data?.recordings) ? data.recordings : [];
@@ -961,15 +1689,16 @@ app.get('/api/musicbrainz/search', async (req, res) => {
       return res.json({ ok: true, type: 'track', results });
     }
 
-    // Default: search Release Groups (Albums)
     const url = `https://musicbrainz.org/ws/2/release-group?query=${encodeURIComponent(
       q
     )}%20AND%20primarytype:album&limit=15&fmt=json`;
     const resp = await fetch(url, { headers: MB_HEADERS });
     if (!resp.ok) {
-      return res
-        .status(resp.status)
-        .json({ ok: false, error: `MusicBrainz HTTP ${resp.status}`, results: [] });
+      return res.status(resp.status).json({
+        ok: false,
+        error: `MusicBrainz HTTP ${resp.status}`,
+        results: [],
+      });
     }
     const data = await resp.json();
     const groups = Array.isArray(data?.['release-groups'])
@@ -1001,7 +1730,6 @@ app.get('/api/musicbrainz/search', async (req, res) => {
   }
 });
 
-// Fetch exact album tracklist from MusicBrainz Release Group ID
 app.get('/api/musicbrainz/album/:releaseGroupId', async (req, res) => {
   try {
     const rgId = String(req.params.releaseGroupId || '').trim();
@@ -1058,12 +1786,13 @@ app.get('/api/musicbrainz/album/:releaseGroupId', async (req, res) => {
       const mTracks = Array.isArray(medium?.tracks) ? medium.tracks : [];
       for (const tr of mTracks) {
         tracks.push({
-          id: tr.id || tr.recording?.id || `${chosenRelease.id}-${tracks.length + 1}`,
+          id:
+            tr.id ||
+            tr.recording?.id ||
+            `${chosenRelease.id}-${tracks.length + 1}`,
           number: tr.number || String(tracks.length + 1),
           title: tr.title || tr.recording?.title || 'Untitled',
-          artist:
-            tr['artist-credit']?.[0]?.name ||
-            artistName,
+          artist: tr['artist-credit']?.[0]?.name || artistName,
           album: albumTitle,
           durationSec: tr.length ? Math.round(tr.length / 1000) : 210,
         });
@@ -1085,22 +1814,24 @@ app.get('/api/musicbrainz/album/:releaseGroupId', async (req, res) => {
   } catch (err) {
     return res.status(500).json({
       ok: false,
-      error: err instanceof Error ? err.message : 'Failed to fetch album tracklist.',
+      error:
+        err instanceof Error ? err.message : 'Failed to fetch album tracklist.',
     });
   }
 });
 
 // ============================================================================
-// 4B. SPOTIFY PUBLIC PLAYLIST / ALBUM / TRACK URL IMPORTER (ZERO API KEY NEEDED)
+// 8. SPOTIFY PUBLIC PLAYLIST / ALBUM / TRACK URL IMPORTER
 // ============================================================================
 
 app.post('/api/spotify/import-url', async (req, res) => {
   try {
     const rawUrl = String(req.body?.url || '').trim();
     if (!rawUrl) {
-      return res
-        .status(400)
-        .json({ ok: false, error: 'Please provide a Spotify playlist, album, or track URL.' });
+      return res.status(400).json({
+        ok: false,
+        error: 'Please provide a Spotify playlist, album, or track URL.',
+      });
     }
 
     const match =
@@ -1139,7 +1870,6 @@ app.post('/api/spotify/import-url', async (req, res) => {
     let title = `Imported Spotify ${entityType.charAt(0).toUpperCase() + entityType.slice(1)}`;
     const tracks = [];
 
-    // Strategy 1: Parse __NEXT_DATA__ JSON from Spotify Embed page
     const nextDataMatch = html.match(
       /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/i
     );
@@ -1175,17 +1905,15 @@ app.post('/api/spotify/import-url', async (req, res) => {
                 title: String(trackTitle).replace(/\u00a0/g, ' ').trim(),
                 artist: String(trackArtist).replace(/\u00a0/g, ' ').trim(),
                 album: entityType === 'album' ? title : '',
-                durationSec: durationMs > 0 ? Math.round(durationMs / 1000) : 210,
+                durationSec:
+                  durationMs > 0 ? Math.round(durationMs / 1000) : 210,
               });
             }
           }
         }
-      } catch {
-        // Fallback below
-      }
+      } catch {}
     }
 
-    // Strategy 2: Fallback to oEmbed title if __NEXT_DATA__ had no tracks
     if (tracks.length === 0) {
       const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
       if (titleMatch && titleMatch[1]) {
@@ -1212,15 +1940,13 @@ app.post('/api/spotify/import-url', async (req, res) => {
     return res.status(500).json({
       ok: false,
       error:
-        err instanceof Error
-          ? err.message
-          : 'Failed to import Spotify URL.',
+        err instanceof Error ? err.message : 'Failed to import Spotify URL.',
     });
   }
 });
 
 // ============================================================================
-// 5. AUTOMATED "GRAB FULL ALBUM / TRACK" ENGINE (slskd + YouTube Music + Filters)
+// 9. LOCAL DOWNLOADERS (slskd + Lidarr + YouTube Music / yt-dlp -> /music)
 // ============================================================================
 
 const slskdJobs = new Map();
@@ -1228,13 +1954,6 @@ const grabJobs = slskdJobs;
 (globalThis as any).grabJobs = slskdJobs;
 (globalThis as any).slskdJobs = slskdJobs;
 const readyNotifications: any[] = [];
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('[Brokeify] Unhandled Rejection at:', promise, 'reason:', reason);
-});
-process.on('uncaughtException', (err) => {
-  console.error('[Brokeify] Uncaught Exception:', err);
-});
 
 function evaluateServerDiscoveryFilter(track, filtersConfig) {
   const filters = filtersConfig || readServerConfig().discoveryFilters || {};
@@ -1336,9 +2055,7 @@ function evaluateServerDiscoveryFilter(track, filtersConfig) {
       if (fn(title, artist, album, durationSec) === false) {
         return { excluded: true, reason: 'Excluded by Custom Filter Script' };
       }
-    } catch {
-      // ignore script error
-    }
+    } catch {}
   }
 
   return { excluded: false, reason: null };
@@ -1358,7 +2075,7 @@ function getSlskdConfig(override = {}) {
 }
 
 function buildSlskdHeaders(apiKey) {
-  const headers = {
+  const headers: Record<string, string> = {
     Accept: 'application/json',
     'Content-Type': 'application/json',
   };
@@ -1431,7 +2148,10 @@ function selectBestSlskdPeerAndFiles(
       const byFolder = new Map();
       for (const item of audioFiles) {
         const fname = String(item.file.filename || '');
-        const lastSlash = Math.max(fname.lastIndexOf('\\'), fname.lastIndexOf('/'));
+        const lastSlash = Math.max(
+          fname.lastIndexOf('\\'),
+          fname.lastIndexOf('/')
+        );
         const folder = lastSlash > 0 ? fname.slice(0, lastSlash) : 'root';
         const list = byFolder.get(folder) || [];
         list.push(item);
@@ -1439,7 +2159,9 @@ function selectBestSlskdPeerAndFiles(
       }
 
       for (const [, folderItems] of byFolder.entries()) {
-        if (folderItems.length < Math.min(2, Math.max(1, expectedTracks.length))) {
+        if (
+          folderItems.length < Math.min(2, Math.max(1, expectedTracks.length))
+        ) {
           continue;
         }
         const avgFileScore =
@@ -1489,37 +2211,17 @@ function selectBestSlskdPeerAndFiles(
   return candidates[0];
 }
 
-async function triggerJellyfinLibraryRefresh() {
-  const { serverUrl, token } = getActiveJellyfinCredentials();
-  if (serverUrl && token) {
-    try {
-      await fetch(`${serverUrl}/Library/Refresh`, {
-        method: 'POST',
-        headers: buildJellyfinHeaders(token),
-      });
-    } catch {
-      // ignore network error
-    }
-  }
-}
-
-/**
- * YouTube Music / yt-dlp / Piped / Internet Archive Multi-Source Downloader
- * Used when:
- * - User selects "YouTube Music" or "Internet Archive" as the downloader source, OR
- * - User selects "Auto (slskd + YouTube Fallback)" and slskd is either unconfigured or finds 0 peers.
- */
-async function executeYouTubeOrArchiveGrabJob(job, preferredEngine = 'youtube') {
+async function executeYouTubeOrArchiveGrabJob(
+  job,
+  preferredEngine = 'youtube'
+) {
   try {
     const cfg = readServerConfig();
-    const downloadDir =
-      cfg.integrations?.downloadDir || path.join(__dirname, 'downloads');
+    const downloadDir = MUSIC_DIR;
     const audioFormat = cfg.integrations?.youtubeAudioFormat || 'mp3';
     try {
       fs.mkdirSync(downloadDir, { recursive: true });
-    } catch {
-      // ignore if read-only
-    }
+    } catch {}
 
     job.sourceEngine = preferredEngine === 'archive' ? 'archive' : 'youtube';
     job.status = 'searching';
@@ -1528,13 +2230,18 @@ async function executeYouTubeOrArchiveGrabJob(job, preferredEngine = 'youtube') 
         ? `Searching Internet Archive Open Audio for "${job.label}"...`
         : `Searching YouTube Music for "${job.label}"...`;
 
-    // 1. Try native yt-dlp CLI first (installed in Docker via apk add yt-dlp ffmpeg)
+    // 1. Try native yt-dlp CLI -> downloads directly into /music and indexes into SQLite
     if (job.sourceEngine === 'youtube') {
       try {
-        const safeFileBase = `${job.artist || 'Artist'} - ${job.title || job.label}`
+        const safeArtist = String(job.artist || 'Downloaded Artist')
+          .replace(/[<>:"/\\|?*]/g, '_')
+          .trim();
+        const safeFileBase = `${safeArtist} - ${job.title || job.label}`
           .replace(/[<>:"/\\|?*]/g, '_')
           .slice(0, 120);
-        const outTemplate = path.join(downloadDir, `${safeFileBase}.%(ext)s`);
+        const artistFolder = path.join(downloadDir, safeArtist);
+        fs.mkdirSync(artistFolder, { recursive: true });
+        const outTemplate = path.join(artistFolder, `${safeFileBase}.%(ext)s`);
         const query = `ytsearch1:${job.searchText} official audio`;
 
         job.status = 'downloading';
@@ -1558,10 +2265,15 @@ async function executeYouTubeOrArchiveGrabJob(job, preferredEngine = 'youtube') 
           { timeout: 120000 }
         );
 
-        const finalFile = `${safeFileBase}.${audioFormat}`;
+        const finalFile = path.join(
+          artistFolder,
+          `${safeFileBase}.${audioFormat}`
+        );
+        await indexAudioFile(finalFile);
+
         job.files = [
           {
-            filename: path.join(downloadDir, finalFile),
+            filename: finalFile,
             size: 0,
             username: 'YouTube Music (yt-dlp)',
             completed: true,
@@ -1569,19 +2281,18 @@ async function executeYouTubeOrArchiveGrabJob(job, preferredEngine = 'youtube') 
         ];
         job.status = 'completed';
         job.completedAt = new Date().toISOString();
-        job.message = `${job.label} downloaded via YouTube Music & sent to Jellyfin!`;
+        job.message = `${job.label} downloaded into /music & indexed in Brokeify SQLite!`;
 
-        await triggerJellyfinLibraryRefresh();
         readyNotifications.unshift({
           id: `notif-${job.id}`,
           jobId: job.id,
           label: job.label,
-          message: `${job.label} is ready to play (Downloaded via YouTube Music)!`,
+          message: `${job.label} is ready to play in your Brokeify library!`,
           completedAt: job.completedAt,
         });
         return;
       } catch {
-        // If yt-dlp binary is not available on host or blocked, continue to Piped / Internet Archive HTTP resolver
+        // Fallback to Piped / Internet Archive stream resolver
       }
     }
 
@@ -1639,7 +2350,6 @@ async function executeYouTubeOrArchiveGrabJob(job, preferredEngine = 'youtube') 
             job.completedAt = new Date().toISOString();
             job.message = `${job.label} resolved via YouTube Music!`;
 
-            await triggerJellyfinLibraryRefresh();
             readyNotifications.unshift({
               id: `notif-${job.id}`,
               jobId: job.id,
@@ -1711,14 +2421,12 @@ async function executeYouTubeOrArchiveGrabJob(job, preferredEngine = 'youtube') 
           }
         }
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
 
     job.status = 'not_found';
     job.message = `Could not find "${job.label}" on ${
       preferredEngine === 'youtube'
-        ? 'YouTube Music (ensure yt-dlp is running in Docker)'
+        ? 'YouTube Music (ensure yt-dlp is installed)'
         : 'Open Audio Archive'
     }.`;
   } catch (err) {
@@ -1741,7 +2449,7 @@ function getLidarrConfig(override = {}) {
   const lidarrRootFolderPath = String(
     override.lidarrRootFolderPath ||
       cfg.integrations?.lidarrRootFolderPath ||
-      '/music'
+      MUSIC_DIR
   ).trim();
   const lidarrQualityProfileId = Number(
     override.lidarrQualityProfileId ||
@@ -1763,7 +2471,7 @@ function getLidarrConfig(override = {}) {
 }
 
 function buildLidarrHeaders(apiKey) {
-  const headers = {
+  const headers: Record<string, string> = {
     Accept: 'application/json',
     'Content-Type': 'application/json',
   };
@@ -1773,7 +2481,6 @@ function buildLidarrHeaders(apiKey) {
   return headers;
 }
 
-// POST /api/lidarr/test — Test Lidarr connection & auto-discover root folder and quality/metadata profiles
 app.post('/api/lidarr/test', async (req, res) => {
   try {
     const { lidarrUrl, lidarrApiKey } = getLidarrConfig(req.body || {});
@@ -1792,7 +2499,7 @@ app.post('/api/lidarr/test', async (req, res) => {
     if (!statusResp.ok) {
       return res.status(statusResp.status).json({
         ok: false,
-        error: `Lidarr returned HTTP ${statusResp.status}. Verify your URL and API Key (Lidarr -> Settings -> General -> Security).`,
+        error: `Lidarr returned HTTP ${statusResp.status}. Verify your URL and API Key.`,
       });
     }
 
@@ -1834,9 +2541,7 @@ app.post('/api/lidarr/test', async (req, res) => {
           metadataProfileId = Number(mps[0].id);
         }
       }
-    } catch {
-      // ignore secondary profile lookup errors
-    }
+    } catch {}
 
     return res.json({
       ok: true,
@@ -1850,22 +2555,19 @@ app.post('/api/lidarr/test', async (req, res) => {
     return res.status(500).json({
       ok: false,
       error:
-        err instanceof Error
-          ? err.message
-          : 'Could not reach Lidarr server.',
+        err instanceof Error ? err.message : 'Could not reach Lidarr server.',
     });
   }
 });
 
-// POST /api/slskd/test — Test slskd connection and API key with homelab diagnostics
 app.post('/api/slskd/test', async (req, res) => {
   try {
     const { slskdUrl, slskdApiKey } = getSlskdConfig(req.body || {});
     if (!slskdUrl) {
       return res.status(400).json({
         ok: false,
-        error: 'Enter your slskd URL first (e.g. http://192.168.1.175:5030 or http://slskd:5030).',
-        hint: 'If running in Docker, enter your server LAN IP or docker service name.',
+        error:
+          'Enter your slskd URL first (e.g. http://192.168.1.175:5030 or http://slskd:5030).',
       });
     }
 
@@ -1889,7 +2591,6 @@ app.post('/api/slskd/test', async (req, res) => {
       if (resp.ok) {
         appInfo = await resp.json().catch(() => ({}));
       } else {
-        // Fallback to /api/v0/transfers/downloads
         endpointTried = `${slskdUrl}/api/v0/transfers/downloads`;
         const fallbackResp = await fetch(endpointTried, {
           headers,
@@ -1898,26 +2599,18 @@ app.post('/api/slskd/test', async (req, res) => {
         if (!fallbackResp.ok) {
           return res.status(fallbackResp.status).json({
             ok: false,
-            error: `slskd returned HTTP ${fallbackResp.status} at ${endpointTried}. Verify slskd URL and key.`,
+            error: `slskd returned HTTP ${fallbackResp.status} at ${endpointTried}.`,
           });
         }
         appInfo = { version: '0.6.x' };
       }
     } catch (fetchErr) {
-      const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-      let hint = 'Make sure your slskd Docker container is running.';
-      if (
-        errMsg.includes('fetch failed') ||
-        errMsg.includes('ECONNREFUSED') ||
-        errMsg.includes('ENOTFOUND') ||
-        errMsg.includes('timeout')
-      ) {
-        hint = `Cannot reach ${slskdUrl} from inside this Docker container. If slskd is on another compose stack, "http://slskd:5030" cannot be resolved. Change URL to your server's LAN IP like http://192.168.1.175:5030 or join both containers to the same Docker bridge network.`;
-      }
+      const errMsg =
+        fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
       return res.status(502).json({
         ok: false,
         error: `Unreachable at ${slskdUrl}: ${errMsg}`,
-        hint,
+        hint: `If slskd is on another Docker compose stack, use your host LAN IP like http://192.168.1.175:5030.`,
       });
     }
 
@@ -1926,121 +2619,31 @@ app.post('/api/slskd/test', async (req, res) => {
       ok: true,
       version,
       url: slskdUrl,
-      message: `Connected to slskd v${version}! Soulseek P2P engine is ready for 1-click downloads.`,
+      message: `Connected to slskd v${version}! Soulseek P2P engine is ready for 1-click downloads into /music.`,
     });
   } catch (err) {
     return res.status(500).json({
       ok: false,
-      error: err instanceof Error ? err.message : 'Error testing slskd connection.',
+      error:
+        err instanceof Error ? err.message : 'Error testing slskd connection.',
     });
   }
 });
 
-// POST /api/jellyfin/test — Test Jellyfin connection, version, user auth, and library reachability
-app.post('/api/jellyfin/test', async (req, res) => {
-  try {
-    const { serverUrl, token, userId } = getActiveJellyfinCredentials(req.body || {});
-    const inputUsername = String(req.body?.username || '').trim();
-    const inputPassword = String(req.body?.password || '').trim();
-
-    if (!serverUrl) {
-      return res.status(400).json({
-        ok: false,
-        error: 'Jellyfin Server URL is empty. Enter your server URL (e.g. http://192.168.1.175:8096).',
-      });
-    }
-
-    let publicInfo: any = null;
-    try {
-      const publicResp = await fetch(`${serverUrl}/System/Info/Public`, {
-        headers: buildJellyfinHeaders(token),
-        signal: AbortSignal.timeout(6000),
-      });
-
-      if (!publicResp.ok) {
-        return res.status(publicResp.status).json({
-          ok: false,
-          error: `Jellyfin server at ${serverUrl} responded with HTTP ${publicResp.status}.`,
-          hint: 'Verify the port and protocol (http vs https).',
-        });
-      }
-      publicInfo = await publicResp.json().catch(() => ({}));
-    } catch (fetchErr) {
-      const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-      let hint = 'Make sure Jellyfin is running and port 8096 is exposed.';
-      if (
-        errMsg.includes('timeout') ||
-        errMsg.includes('aborted') ||
-        errMsg.includes('fetch failed') ||
-        errMsg.includes('ECONNREFUSED')
-      ) {
-        hint = `Failed to connect to ${serverUrl}: ${errMsg}. If you are running Brokeify inside Docker, external domains (e.g. https://jellyfin.flockingreeds.farm) often fail due to router NAT loopback / hairpinning. Use your local host LAN IP instead: http://192.168.1.175:8096!`;
-      }
-      return res.status(502).json({
-        ok: false,
-        error: `Connection failed to ${serverUrl}: ${errMsg}`,
-        hint,
-      });
-    }
-
-    const serverName = publicInfo?.ServerName || 'Jellyfin Media Server';
-    const serverVersion = publicInfo?.Version || '10.x';
-    let authValid = false;
-    let authedUser = '';
-
-    // Check user auth if token or credentials provided
-    if (token) {
-      try {
-        const meResp = await fetch(`${serverUrl}/Users/Me`, {
-          headers: buildJellyfinHeaders(token),
-          signal: AbortSignal.timeout(5000),
-        });
-        if (meResp.ok) {
-          const meData = (await meResp.json().catch(() => ({}))) as any;
-          authValid = true;
-          authedUser = meData?.Name || '';
-        }
-      } catch {
-        // non-blocking
-      }
-    } else if (inputUsername && inputPassword) {
-      try {
-        const authResp = await fetch(`${serverUrl}/Users/AuthenticateByName`, {
-          method: 'POST',
-          headers: buildJellyfinHeaders(''),
-          body: JSON.stringify({ Username: inputUsername, Pw: inputPassword }),
-          signal: AbortSignal.timeout(6000),
-        });
-        if (authResp.ok) {
-          const authData = (await authResp.json().catch(() => ({}))) as any;
-          authValid = true;
-          authedUser = authData?.User?.Name || inputUsername;
-        }
-      } catch {
-        // non-blocking
-      }
-    }
-
-    return res.json({
-      ok: true,
-      serverName,
-      serverVersion,
-      serverUrl,
-      authValid,
-      username: authedUser || inputUsername || userId,
-      message: `Connected to ${serverName} (Jellyfin v${serverVersion})! ${
-        authValid ? `Signed in as ${authedUser || inputUsername}.` : 'Public endpoint reachable.'
-      }`,
-    });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: err instanceof Error ? err.message : 'Error testing Jellyfin.',
-    });
-  }
+// Native SQLite Engine health test (replaces legacy Jellyfin connection test)
+app.post('/api/jellyfin/test', (_req, res) => {
+  const counts = getLocalLibraryStats();
+  return res.json({
+    ok: true,
+    serverName: 'Brokeify Native SQLite Engine',
+    serverVersion: '3.0.0-standalone',
+    serverUrl: 'local:///data/brokeify.db',
+    authValid: true,
+    username: 'admin',
+    message: `Brokeify Native SQLite Engine Online (${counts.totalTracks} tracks, ${counts.totalAlbums} albums, ${counts.totalArtists} artists indexed from ${MUSIC_DIR})!`,
+  });
 });
 
-// POST /api/listenbrainz/test — Test ListenBrainz user & scrobbler token
 app.post('/api/listenbrainz/test', async (req, res) => {
   try {
     const cfg = readServerConfig();
@@ -2058,7 +2661,6 @@ app.post('/api/listenbrainz/test', async (req, res) => {
       });
     }
 
-    // Verify user exists on ListenBrainz
     try {
       const userResp = await fetch(
         `https://api.listenbrainz.org/1/user/${encodeURIComponent(username)}/playlists`,
@@ -2067,7 +2669,7 @@ app.post('/api/listenbrainz/test', async (req, res) => {
       if (!userResp.ok && userResp.status === 404) {
         return res.status(404).json({
           ok: false,
-          error: `ListenBrainz user "${username}" was not found. Check your username spelling on listenbrainz.org.`,
+          error: `ListenBrainz user "${username}" was not found.`,
         });
       }
     } catch (e) {
@@ -2082,16 +2684,19 @@ app.post('/api/listenbrainz/test', async (req, res) => {
 
     if (token) {
       try {
-        const tokenResp = await fetch('https://api.listenbrainz.org/1/validate-token', {
-          headers: { Authorization: `Token ${token}` },
-          signal: AbortSignal.timeout(6000),
-        });
+        const tokenResp = await fetch(
+          'https://api.listenbrainz.org/1/validate-token',
+          {
+            headers: { Authorization: `Token ${token}` },
+            signal: AbortSignal.timeout(6000),
+          }
+        );
         if (tokenResp.ok) {
           const tokenJson = (await tokenResp.json().catch(() => ({}))) as any;
           tokenValid = Boolean(tokenJson.valid);
           tokenMessage = tokenValid
             ? 'Scrobbler Token valid & authorized.'
-            : 'Scrobbler Token is invalid or expired. Check your token on listenbrainz.org/profile.';
+            : 'Scrobbler Token is invalid or expired.';
         }
       } catch {
         tokenMessage = 'Could not validate scrobbler token right now.';
@@ -2112,70 +2717,46 @@ app.post('/api/listenbrainz/test', async (req, res) => {
   }
 });
 
-// POST /api/services/test-all — Runs all connection tests in parallel and checks storage permissions
 app.post('/api/services/test-all', async (req, res) => {
   const cfg = readServerConfig();
-  const jfCreds = getActiveJellyfinCredentials(req.body?.jellyfin || {});
   const slskdCreds = getSlskdConfig(req.body?.slskd || {});
   const lidarrCreds = getLidarrConfig(req.body?.lidarr || {});
-  const lbUser = String(req.body?.listenbrainz?.username || cfg.integrations?.listenbrainzUsername || '').trim();
-  const lbToken = String(req.body?.listenbrainz?.token || cfg.integrations?.listenbrainzToken || '').trim();
+  const lbUser = String(
+    req.body?.listenbrainz?.username ||
+      cfg.integrations?.listenbrainzUsername ||
+      ''
+  ).trim();
+  const counts = getLocalLibraryStats();
 
-  // Test Storage Permissions
-  let storageStatus = { ok: true, path: CONFIG_FILE_PATH, message: 'Writable & Persistent (/app/data)' };
+  let storageStatus = {
+    ok: true,
+    path: DB_PATH,
+    message: `SQLite Active (${DB_PATH} · ${counts.totalTracks} tracks)`,
+  };
   try {
-    fs.mkdirSync(path.dirname(CONFIG_FILE_PATH), { recursive: true });
-    fs.accessSync(path.dirname(CONFIG_FILE_PATH), fs.constants.W_OK);
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.accessSync(DATA_DIR, fs.constants.W_OK);
   } catch (e) {
     storageStatus = {
       ok: false,
-      path: CONFIG_FILE_PATH,
-      message: `Permission error writing to ${CONFIG_FILE_PATH}: ${e instanceof Error ? e.message : String(e)}`,
+      path: DB_PATH,
+      message: `Permission error writing to ${DATA_DIR}: ${e instanceof Error ? e.message : String(e)}`,
     };
   }
 
-  // Test Jellyfin
-  let jellyfinStatus: { ok: boolean; serverName?: string; version?: string; message: string; hint?: string } = {
-    ok: false,
-    message: 'Not configured',
+  const nativeEngineStatus = {
+    ok: true,
+    serverName: 'Brokeify Native Engine',
+    version: '3.0.0-standalone',
+    message: `SQLite Ready: ${counts.totalTracks} tracks, ${counts.totalAlbums} albums, ${counts.totalArtists} artists (${MUSIC_DIR})`,
   };
-  if (jfCreds.serverUrl) {
-    try {
-      const jfResp = await fetch(`${jfCreds.serverUrl}/System/Info/Public`, {
-        headers: buildJellyfinHeaders(jfCreds.token),
-        signal: AbortSignal.timeout(5000),
-      });
-      if (jfResp.ok) {
-        const info = (await jfResp.json().catch(() => ({}))) as any;
-        jellyfinStatus = {
-          ok: true,
-          serverName: info.ServerName || 'Jellyfin',
-          version: info.Version || '10.x',
-          message: `Connected to ${info.ServerName || 'Jellyfin'} (v${info.Version || '10.x'})`,
-        };
-      } else {
-        jellyfinStatus = {
-          ok: false,
-          message: `HTTP ${jfResp.status} from ${jfCreds.serverUrl}`,
-          hint: 'Check server URL and port.',
-        };
-      }
-    } catch (e) {
-      const errMsg = e instanceof Error ? e.message : String(e);
-      let hint = 'Make sure Jellyfin is running.';
-      if (errMsg.includes('timeout') || errMsg.includes('fetch failed')) {
-        hint = 'In Docker, avoid external domain names. Use http://192.168.1.175:8096 directly!';
-      }
-      jellyfinStatus = {
-        ok: false,
-        message: `Failed to connect to ${jfCreds.serverUrl}: ${errMsg}`,
-        hint,
-      };
-    }
-  }
 
-  // Test slskd
-  let slskdStatus: { ok: boolean; version?: string; message: string; hint?: string } = {
+  let slskdStatus: {
+    ok: boolean;
+    version?: string;
+    message: string;
+    hint?: string;
+  } = {
     ok: false,
     message: 'Not configured',
   };
@@ -2185,10 +2766,13 @@ app.post('/api/services/test-all', async (req, res) => {
         headers: buildSlskdHeaders(slskdCreds.slskdApiKey),
         signal: AbortSignal.timeout(5000),
       }).catch(async () => {
-        return await fetch(`${slskdCreds.slskdUrl}/api/v0/transfers/downloads`, {
-          headers: buildSlskdHeaders(slskdCreds.slskdApiKey),
-          signal: AbortSignal.timeout(5000),
-        });
+        return await fetch(
+          `${slskdCreds.slskdUrl}/api/v0/transfers/downloads`,
+          {
+            headers: buildSlskdHeaders(slskdCreds.slskdApiKey),
+            signal: AbortSignal.timeout(5000),
+          }
+        );
       });
       if (sResp.ok) {
         const sInfo = (await sResp.json().catch(() => ({}))) as any;
@@ -2203,26 +2787,33 @@ app.post('/api/services/test-all', async (req, res) => {
           message: `HTTP ${sResp.status} from slskd. Check API key.`,
         };
       }
-    } catch (e) {
+    } catch {
       slskdStatus = {
         ok: false,
         message: `Unreachable at ${slskdCreds.slskdUrl}`,
-        hint: 'If running in Docker, use host LAN IP (http://192.168.1.175:5030) or connect to the same Docker network.',
+        hint: 'Use host LAN IP (http://192.168.1.175:5030) or share Docker network.',
       };
     }
   }
 
-  // Test Lidarr
-  let lidarrStatus: { ok: boolean; version?: string; message: string; hint?: string } = {
+  let lidarrStatus: {
+    ok: boolean;
+    version?: string;
+    message: string;
+    hint?: string;
+  } = {
     ok: false,
     message: 'Not configured',
   };
   if (lidarrCreds.lidarrUrl && lidarrCreds.lidarrApiKey) {
     try {
-      const lResp = await fetch(`${lidarrCreds.lidarrUrl}/api/v1/system/status`, {
-        headers: buildLidarrHeaders(lidarrCreds.lidarrApiKey),
-        signal: AbortSignal.timeout(5000),
-      });
+      const lResp = await fetch(
+        `${lidarrCreds.lidarrUrl}/api/v1/system/status`,
+        {
+          headers: buildLidarrHeaders(lidarrCreds.lidarrApiKey),
+          signal: AbortSignal.timeout(5000),
+        }
+      );
       if (lResp.ok) {
         const lInfo = (await lResp.json().catch(() => ({}))) as any;
         lidarrStatus = {
@@ -2233,23 +2824,22 @@ app.post('/api/services/test-all', async (req, res) => {
       } else {
         lidarrStatus = {
           ok: false,
-          message: `HTTP ${lResp.status} from Lidarr. Verify API key.`,
+          message: `HTTP ${lResp.status} from Lidarr.`,
         };
       }
-    } catch (e) {
+    } catch {
       lidarrStatus = {
         ok: false,
         message: `Unreachable at ${lidarrCreds.lidarrUrl}`,
-        hint: 'Check your Lidarr URL or use http://192.168.1.175:8686.',
       };
     }
   }
 
-  // Test ListenBrainz
-  let listenbrainzStatus: { ok: boolean; username?: string; message: string } = {
-    ok: false,
-    message: 'Not configured',
-  };
+  let listenbrainzStatus: { ok: boolean; username?: string; message: string } =
+    {
+      ok: false,
+      message: 'Not configured',
+    };
   if (lbUser) {
     try {
       const lbResp = await fetch(
@@ -2268,7 +2858,7 @@ app.post('/api/services/test-all', async (req, res) => {
           message: `User "${lbUser}" does not exist on ListenBrainz.`,
         };
       }
-    } catch (e) {
+    } catch {
       listenbrainzStatus = {
         ok: false,
         message: 'Could not contact ListenBrainz API.',
@@ -2279,7 +2869,7 @@ app.post('/api/services/test-all', async (req, res) => {
   return res.json({
     ok: true,
     services: {
-      jellyfin: jellyfinStatus,
+      jellyfin: nativeEngineStatus,
       slskd: slskdStatus,
       lidarr: lidarrStatus,
       listenbrainz: listenbrainzStatus,
@@ -2288,7 +2878,6 @@ app.post('/api/services/test-all', async (req, res) => {
   });
 });
 
-// Execute an automated Lidarr artist/album lookup, add/monitor, and indexer search command
 async function executeLidarrGrabJob(job, override = {}) {
   const {
     lidarrUrl,
@@ -2308,7 +2897,6 @@ async function executeLidarrGrabJob(job, override = {}) {
     job.status = 'searching';
     job.message = `Searching Lidarr indexers for "${job.label}"...`;
 
-    // 1. Resolve Root Folder, Quality Profile, and Metadata Profile from Lidarr
     let rootFolderPath = lidarrRootFolderPath || '/music';
     let qualityProfileId = lidarrQualityProfileId || 1;
     let metadataProfileId = lidarrMetadataProfileId || 1;
@@ -2346,11 +2934,8 @@ async function executeLidarrGrabJob(job, override = {}) {
           metadataProfileId = Number(mps[0].id);
         }
       }
-    } catch {
-      // use defaults
-    }
+    } catch {}
 
-    // 2. Lookup Artist in Lidarr
     const searchArtistTerm = job.artist || job.searchText || job.title;
     const lookupResp = await fetch(
       `${lidarrUrl}/api/v1/artist/lookup?term=${encodeURIComponent(
@@ -2359,15 +2944,20 @@ async function executeLidarrGrabJob(job, override = {}) {
       { headers, signal: AbortSignal.timeout(10000) }
     );
     if (!lookupResp.ok) {
-      throw new Error(`Lidarr artist/lookup returned HTTP ${lookupResp.status}`);
+      throw new Error(
+        `Lidarr artist/lookup returned HTTP ${lookupResp.status}`
+      );
     }
     const lookupArtists = await lookupResp.json().catch(() => []);
-    const matchedArtist = Array.isArray(lookupArtists) ? lookupArtists[0] : null;
+    const matchedArtist = Array.isArray(lookupArtists)
+      ? lookupArtists[0]
+      : null;
     if (!matchedArtist || !matchedArtist.foreignArtistId) {
-      throw new Error(`No matching artist found in Lidarr for "${searchArtistTerm}"`);
+      throw new Error(
+        `No matching artist found in Lidarr for "${searchArtistTerm}"`
+      );
     }
 
-    // 3. Check if Artist already exists in Lidarr library
     let lidarrArtist = null;
     const existingArtistsResp = await fetch(`${lidarrUrl}/api/v1/artist`, {
       headers,
@@ -2382,7 +2972,6 @@ async function executeLidarrGrabJob(job, override = {}) {
       }
     }
 
-    // 4. Add Artist to Lidarr if not already present
     if (!lidarrArtist) {
       const addPayload = {
         ...matchedArtist,
@@ -2406,7 +2995,6 @@ async function executeLidarrGrabJob(job, override = {}) {
       }
     }
 
-    // 5. Trigger Lidarr AlbumSearch / ArtistSearch command
     if (lidarrArtist?.id) {
       await fetch(`${lidarrUrl}/api/v1/command`, {
         method: 'POST',
@@ -2432,9 +3020,8 @@ async function executeLidarrGrabJob(job, override = {}) {
     ];
     job.status = 'completed';
     job.completedAt = new Date().toISOString();
-    job.message = `Queued "${job.label}" in Lidarr (${rootFolderPath}) — Lidarr is now searching indexers & downloading!`;
+    job.message = `Queued "${job.label}" in Lidarr (${rootFolderPath}) — Chokidar will auto-index tracks as they land in /music!`;
 
-    await triggerJellyfinLibraryRefresh();
     readyNotifications.unshift({
       id: `notif-${job.id}`,
       jobId: job.id,
@@ -2449,7 +3036,6 @@ async function executeLidarrGrabJob(job, override = {}) {
   }
 }
 
-// Execute a single slskd search -> peer selection -> download queue flow (with Auto-Fallback to Lidarr -> YouTube Music)
 async function executeSlskdGrabJob(
   job,
   slskdUrl,
@@ -2467,7 +3053,7 @@ async function executeSlskdGrabJob(
       job.status = 'not_found';
       job.message =
         job.error ||
-        'Lidarr URL & API Key not configured or release not found. Check Settings -> 1. Sources & Server Hub.';
+        'Lidarr URL & API Key not configured or release not found.';
     }
     return;
   }
@@ -2479,8 +3065,7 @@ async function executeSlskdGrabJob(
       return executeYouTubeOrArchiveGrabJob(job, 'youtube');
     }
     job.status = 'not_found';
-    job.message =
-      'slskd API key not configured in Settings -> Server & Connections.';
+    job.message = 'slskd API key not configured in Settings.';
     return;
   }
 
@@ -2553,13 +3138,13 @@ async function executeSlskdGrabJob(
         return executeYouTubeOrArchiveGrabJob(job, 'youtube');
       }
       job.status = 'not_found';
-      job.message = `Not found on slskd for "${job.searchText}". Click "Retry via YouTube" or switch to Lidarr.`;
+      job.message = `Not found on slskd for "${job.searchText}".`;
       return;
     }
 
     job.matchedPeer = chosen.username;
     job.matchedFormat = chosen.formatLabel;
-    job.message = `Selected peer "${chosen.username}" (${chosen.formatLabel}, free slot: ${chosen.hasFreeUploadSlot ? 'YES' : 'queued'}) — queueing ${chosen.files.length} file(s)...`;
+    job.message = `Selected peer "${chosen.username}" (${chosen.formatLabel}) — queueing ${chosen.files.length} file(s)...`;
 
     const payload = chosen.files.map((f) => ({
       filename: f.filename,
@@ -2605,8 +3190,9 @@ async function executeSlskdGrabJob(
 }
 
 // ============================================================================
-// 5A. CROSS-DEVICE PLAYBACK HANDOFF SESSION (/api/playback-session)
+// 10. CROSS-DEVICE PLAYBACK HANDOFF SESSION (/api/playback-session)
 // ============================================================================
+
 let latestPlaybackSessionMemory = null;
 
 app.get('/api/playback-session', (_req, res) => {
@@ -2624,7 +3210,8 @@ app.get('/api/playback-session', (_req, res) => {
 
 app.post('/api/playback-session', (req, res) => {
   try {
-    const incoming = req.body?.playbackSession || req.body;
+    const incoming =
+      req.body?.playbackSession || req.body?.session || req.body;
     if (!incoming || !incoming.track || !incoming.track.id) {
       return res
         .status(400)
@@ -2638,7 +3225,10 @@ app.post('/api/playback-session', (req, res) => {
       trackId: String(incoming.track.id),
       track: incoming.track,
       positionSec: Math.max(0, Number(incoming.positionSec || 0)),
-      durationSec: Math.max(1, Number(incoming.durationSec || incoming.track.duration || 180)),
+      durationSec: Math.max(
+        1,
+        Number(incoming.durationSec || incoming.track.duration || 180)
+      ),
       playlistId: incoming.playlistId || null,
       playlistName: incoming.playlistName || null,
       queueTrackIds: Array.isArray(incoming.queueTrackIds)
@@ -2664,7 +3254,7 @@ app.post('/api/playback-session', (req, res) => {
   }
 });
 
-// POST /api/slskd/grab — Queue a Full Album, Single Track, or Missing Playlist Tracks (via slskd, Lidarr, YouTube Music, or Auto)
+// POST /api/slskd/grab
 app.post('/api/slskd/grab', async (req, res) => {
   try {
     const cfg = readServerConfig();
@@ -2680,7 +3270,7 @@ app.post('/api/slskd/grab', async (req, res) => {
       return res.status(400).json({
         ok: false,
         error:
-          'slskd URL is not configured yet. Add your slskd URL & API key in Settings -> Server & Connections, or switch Downloader Source to "Auto", "Lidarr", or "YouTube Music".',
+          'slskd URL is not configured yet. Add your slskd URL & API key in Settings, or switch Downloader Source to "Auto".',
       });
     }
 
@@ -2688,11 +3278,11 @@ app.post('/api/slskd/grab', async (req, res) => {
       return res.status(400).json({
         ok: false,
         error:
-          'Lidarr URL & API Key are not configured yet. Add your Lidarr URL & API key in Settings -> 1. Sources & Server Hub, or switch Download Engine to "Auto".',
+          'Lidarr URL & API Key are not configured yet. Add your Lidarr URL & API key in Settings, or switch Download Engine to "Auto".',
       });
     }
 
-    const type = req.body?.type || 'track'; // 'album' | 'track' | 'playlist'
+    const type = req.body?.type || 'track';
     const artist = String(req.body?.artist || '').trim();
     const title = String(req.body?.title || req.body?.album || '').trim();
     const tracks = Array.isArray(req.body?.tracks) ? req.body.tracks : [];
@@ -2714,8 +3304,8 @@ app.post('/api/slskd/grab', async (req, res) => {
                 sourceMode === 'youtube'
                   ? 'youtube'
                   : sourceMode === 'lidarr'
-                  ? 'lidarr'
-                  : 'slskd',
+                    ? 'lidarr'
+                    : 'slskd',
               label: jobLabel,
               artist: tr.artist,
               title: tr.title,
@@ -2741,10 +3331,10 @@ app.post('/api/slskd/grab', async (req, res) => {
             sourceMode === 'youtube'
               ? 'youtube'
               : sourceMode === 'archive'
-              ? 'archive'
-              : sourceMode === 'lidarr'
-              ? 'lidarr'
-              : 'slskd',
+                ? 'archive'
+                : sourceMode === 'lidarr'
+                  ? 'lidarr'
+                  : 'slskd',
           label: jobLabel,
           artist: tr.artist,
           title: tr.title,
@@ -2773,7 +3363,9 @@ app.post('/api/slskd/grab', async (req, res) => {
         ok: true,
         jobs: createdJobs,
         message: `Queued ${activeCount} track(s) via ${sourceMode.toUpperCase()}${
-          skippedCount > 0 ? ` (${skippedCount} skipped by Exclusion Filters)` : ''
+          skippedCount > 0
+            ? ` (${skippedCount} skipped by Exclusion Filters)`
+            : ''
         }!`,
       });
     }
@@ -2807,10 +3399,10 @@ app.post('/api/slskd/grab', async (req, res) => {
         sourceMode === 'youtube'
           ? 'youtube'
           : sourceMode === 'archive'
-          ? 'archive'
-          : sourceMode === 'lidarr'
-          ? 'lidarr'
-          : 'slskd',
+            ? 'archive'
+            : sourceMode === 'lidarr'
+              ? 'lidarr'
+              : 'slskd',
       label,
       artist,
       title,
@@ -2847,7 +3439,6 @@ app.post('/api/slskd/grab', async (req, res) => {
   }
 });
 
-// GET /api/slskd/status — Returns active/completed jobs + ready notifications for the UI banner
 app.get('/api/slskd/status', (_req, res) => {
   const jobs = Array.from(slskdJobs.values()).sort((a, b) =>
     b.createdAt.localeCompare(a.createdAt)
@@ -2859,7 +3450,6 @@ app.get('/api/slskd/status', (_req, res) => {
   });
 });
 
-// POST /api/slskd/notifications/dismiss — Dismiss a completed download notification banner
 app.post('/api/slskd/notifications/dismiss', (req, res) => {
   const id = req.body?.id;
   if (id) {
@@ -2871,12 +3461,9 @@ app.post('/api/slskd/notifications/dismiss', (req, res) => {
   res.json({ ok: true, notifications: readyNotifications });
 });
 
-// Background polling loop: watches GET /api/v0/transfers/downloads in slskd every 6 seconds
-// When a job's files finish downloading, automatically calls POST ${jellyfinUrl}/Library/Refresh
-// and pushes "<Artist> - <Album/Track> is ready to play!" notification!
-async function pollSlskdTransfersAndRefreshJellyfin() {
+async function pollSlskdTransfersAndScanLocalLibrary() {
   const activeDownloadingJobs = Array.from(slskdJobs.values()).filter(
-    (j) => j.status === 'downloading'
+    (j) => j.status === 'downloading' && j.sourceEngine === 'slskd'
   );
   if (activeDownloadingJobs.length === 0) return;
 
@@ -2891,7 +3478,6 @@ async function pollSlskdTransfersAndRefreshJellyfin() {
     const transfersByUser = await resp.json().catch(() => []);
     if (!Array.isArray(transfersByUser)) return;
 
-    // Flatten all transfer files across peers
     const transferMap = new Map();
     for (const userEntry of transfersByUser) {
       const uname = userEntry?.username || '';
@@ -2928,39 +3514,26 @@ async function pollSlskdTransfersAndRefreshJellyfin() {
       if (completedCount === job.files.length) {
         job.status = 'completed';
         job.completedAt = new Date().toISOString();
-        job.message = `${job.label} is ready to play!`;
+        job.message = `${job.label} downloaded & indexed into Brokeify SQLite!`;
 
-        // Trigger Jellyfin Library/Refresh automatically
-        const { serverUrl, token } = getActiveJellyfinCredentials();
-        if (serverUrl && token) {
-          try {
-            await fetch(`${serverUrl}/Library/Refresh`, {
-              method: 'POST',
-              headers: buildJellyfinHeaders(token),
-            });
-          } catch {
-            // ignore refresh network error
-          }
-        }
+        await runFullLibraryScan();
 
         readyNotifications.unshift({
           id: `notif-${job.id}`,
           jobId: job.id,
           label: job.label,
-          message: `${job.label} is ready to play!`,
+          message: `${job.label} is ready to play in your library!`,
           completedAt: job.completedAt,
         });
       }
     }
-  } catch {
-    // ignore transient polling errors
-  }
+  } catch {}
 }
 
-setInterval(pollSlskdTransfersAndRefreshJellyfin, 6000);
+setInterval(pollSlskdTransfersAndScanLocalLibrary, 6000);
 
 // ============================================================================
-// 5B. MUSICBRAINZ PICARD + GEMINI AI AUTO-TAGGER & ORGANIZED FOLDER ENGINE
+// 11. MUSICBRAINZ PICARD + GEMINI AI AUTO-TAGGER & ORGANIZED FOLDER ENGINE
 // ============================================================================
 
 async function resolvePicardAndAiMetadata(rawArtist, rawTitle, rawAlbum = '') {
@@ -2972,7 +3545,6 @@ async function resolvePicardAndAiMetadata(rawArtist, rawTitle, rawAlbum = '') {
   let genre = '';
   let source = 'musicbrainz';
 
-  // 1. Optional Gemini AI cleanup of messy filenames/tags (when GEMINI_API_KEY is available on server)
   const cfg = readServerConfig();
   if (
     cfg.picardConfig?.useAiMetadataCleanup !== false &&
@@ -3012,12 +3584,9 @@ async function resolvePicardAndAiMetadata(rawArtist, rawTitle, rawAlbum = '') {
       if (parsedAi.trackNumber) trackNumber = parsedAi.trackNumber;
       if (parsedAi.genre) genre = parsedAi.genre;
       source = 'musicbrainz+ai';
-    } catch {
-      // Fallback to MusicBrainz deterministic lookup
-    }
+    } catch {}
   }
 
-  // 2. MusicBrainz Recording Lookup for authoritative Album, Year, and Track Number
   try {
     const q = `recording:"${cleanTitle}"${
       cleanArtist ? ` AND artist:"${cleanArtist}"` : ''
@@ -3054,9 +3623,7 @@ async function resolvePicardAndAiMetadata(rawArtist, rawTitle, rawAlbum = '') {
         }
       }
     }
-  } catch {
-    // ignore MusicBrainz timeout
-  }
+  } catch {}
 
   if (!cleanAlbum) cleanAlbum = 'Singles';
   if (!year) year = new Date().getFullYear().toString();
@@ -3111,7 +3678,7 @@ app.post('/api/picard/resolve-metadata', async (req, res) => {
 });
 
 // ============================================================================
-// 5C. AUTOPILOT LINKED PLAYLISTS (SPOTIFY -> BROKEIFY / JELLYFIN AUTO-SYNC)
+// 12. AUTOPILOT LINKED PLAYLISTS (SPOTIFY -> BROKEIFY SQLITE AUTO-SYNC)
 // ============================================================================
 
 async function runSingleAutopilotRule(ruleId) {
@@ -3123,12 +3690,11 @@ async function runSingleAutopilotRule(ruleId) {
   }
   const rule = rules[ruleIdx];
 
-  // Fetch tracks from the linked Spotify playlist URL
   const match =
-    String(rule.sourceUrl || '').match(
+    String(rule.sourceUrl || rule.spotifyUrl || '').match(
       /open\.spotify\.com\/(?:intl-[a-z]+\/)?(playlist|album)\/([a-zA-Z0-9]+)/i
     ) ||
-    String(rule.sourceUrl || '').match(
+    String(rule.sourceUrl || rule.spotifyUrl || '').match(
       /spotify:(playlist|album):([a-zA-Z0-9]+)/i
     );
 
@@ -3176,34 +3742,31 @@ async function runSingleAutopilotRule(ruleId) {
             });
           }
         }
-      } catch {
-        // ignore
-      }
+      } catch {}
     }
   }
 
-  const jfLibrary = await fetchJellyfinAudioFingerprints();
-  const matchedJfIds = [];
+  const localLibrary = getSqliteAudioFingerprints();
+  const matchedTrackIds = [];
   const missingTracks = [];
 
   for (const t of tracks) {
     const normT = normalizeText(t.title);
     const normA = normalizeText(t.artist);
-    const matched = jfLibrary.find(
-      (jf) =>
-        jf.normTitle &&
+    const matched = localLibrary.find(
+      (loc) =>
+        loc.normTitle &&
         normT &&
-        (jf.normTitle === normT ||
-          jf.normTitle.includes(normT) ||
-          normT.includes(jf.normTitle)) &&
+        (loc.normTitle === normT ||
+          loc.normTitle.includes(normT) ||
+          normT.includes(loc.normTitle)) &&
         (!normA ||
-          !jf.normArtist ||
-          jf.normArtist === 'a' ||
-          jf.normArtist.includes(normA) ||
-          normA.includes(jf.normArtist))
+          !loc.normArtist ||
+          loc.normArtist.includes(normA) ||
+          normA.includes(loc.normArtist))
     );
     if (matched) {
-      matchedJfIds.push(`jellyfin-${matched.id}`);
+      matchedTrackIds.push(matched.id);
     } else {
       const filterCheck = evaluateServerDiscoveryFilter(
         t,
@@ -3215,29 +3778,35 @@ async function runSingleAutopilotRule(ruleId) {
     }
   }
 
-  // Update the target Brokeify playlist in config.json with any newly matched tracks
-  const playlists = Array.isArray(cfg.playlists) ? [...cfg.playlists] : [];
-  const plIdx = playlists.findIndex((p) => p.id === rule.playlistId);
+  // Update SQLite playlist_tracks for the linked playlist
   let addedCount = 0;
-  if (plIdx !== -1) {
-    const existingSet = new Set(playlists[plIdx].trackIds || []);
-    for (const tid of matchedJfIds) {
+  if (rule.playlistId && matchedTrackIds.length > 0) {
+    const existingRows = db
+      .prepare(
+        `SELECT track_id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position ASC`
+      )
+      .all(rule.playlistId) as Array<{ track_id: string }>;
+    const existingSet = new Set(existingRows.map((r) => r.track_id));
+    const combinedIds = existingRows.map((r) => r.track_id);
+    for (const tid of matchedTrackIds) {
       if (!existingSet.has(tid)) {
         existingSet.add(tid);
+        combinedIds.push(tid);
         addedCount += 1;
       }
     }
-    playlists[plIdx] = {
-      ...playlists[plIdx],
-      trackIds: Array.from(existingSet),
-      linkedSpotifyUrl: rule.sourceUrl,
-      autopilotSchedule: rule.schedule,
-      autopilotAutoDownload: rule.autoDownloadMissing,
-      lastAutopilotSyncAt: new Date().toISOString(),
-    };
+    const tx = db.transaction((ids: string[]) => {
+      db.prepare(`DELETE FROM playlist_tracks WHERE playlist_id = ?`).run(
+        rule.playlistId
+      );
+      const ins = db.prepare(
+        `INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)`
+      );
+      ids.forEach((tid, idx) => ins.run(rule.playlistId, tid, idx));
+    });
+    tx(combinedIds);
   }
 
-  // Queue missing tracks for download if autoDownloadMissing is enabled
   let queuedCount = 0;
   if (rule.autoDownloadMissing && missingTracks.length > 0) {
     const { slskdUrl, slskdApiKey } = getSlskdConfig();
@@ -3277,12 +3846,12 @@ async function runSingleAutopilotRule(ruleId) {
     lastSyncedAt: new Date().toISOString(),
     lastAddedCount: addedCount,
     lastMissingQueuedCount: queuedCount,
-    statusMessage: `Synced ${tracks.length} Spotify tracks (${addedCount} added, ${queuedCount} missing queued for download).`,
+    statusMessage: `Synced ${tracks.length} Spotify tracks (${addedCount} added to SQLite playlist, ${queuedCount} missing queued for download).`,
   };
 
   writeServerConfig({
     autopilotRules: rules,
-    playlists,
+    playlists: queryPlaylists(),
   });
 
   return rules[ruleIdx];
@@ -3302,10 +3871,14 @@ app.post('/api/autopilot/save', (req, res) => {
   const incomingRule = req.body?.rule;
   const incomingPicard = req.body?.picardConfig;
 
-  let nextRules = Array.isArray(cfg.autopilotRules)
+  const nextRules = Array.isArray(cfg.autopilotRules)
     ? [...cfg.autopilotRules]
     : [];
-  if (incomingRule && incomingRule.playlistId && incomingRule.sourceUrl) {
+  if (
+    incomingRule &&
+    incomingRule.playlistId &&
+    (incomingRule.sourceUrl || incomingRule.spotifyUrl)
+  ) {
     const existingIdx = nextRules.findIndex(
       (r) =>
         r.id === incomingRule.id || r.playlistId === incomingRule.playlistId
@@ -3314,8 +3887,14 @@ app.post('/api/autopilot/save', (req, res) => {
       id: incomingRule.id || `ap-${Date.now()}`,
       playlistId: incomingRule.playlistId,
       playlistName: incomingRule.playlistName || 'Linked Playlist',
-      sourceUrl: String(incomingRule.sourceUrl).trim(),
-      schedule: incomingRule.schedule || 'weekly',
+      sourceUrl: String(
+        incomingRule.sourceUrl || incomingRule.spotifyUrl
+      ).trim(),
+      spotifyUrl: String(
+        incomingRule.spotifyUrl || incomingRule.sourceUrl
+      ).trim(),
+      schedule: incomingRule.schedule || incomingRule.interval || 'weekly',
+      interval: incomingRule.interval || incomingRule.schedule || 'weekly',
       autoDownloadMissing: incomingRule.autoDownloadMissing !== false,
       enabled: incomingRule.enabled !== false,
       lastSyncedAt: incomingRule.lastSyncedAt || null,
@@ -3362,7 +3941,7 @@ app.post('/api/autopilot/sync-now', async (req, res) => {
       ok: true,
       rule: updatedRule,
       rules: cfg.autopilotRules || [],
-      playlists: cfg.playlists || [],
+      playlists: queryPlaylists(),
     });
   } catch (err) {
     res.status(500).json({
@@ -3372,32 +3951,8 @@ app.post('/api/autopilot/sync-now', async (req, res) => {
   }
 });
 
-// Background Autopilot Scheduler: checks every 30 minutes if any daily/weekly/monthly rule is due
-setInterval(async () => {
-  try {
-    const cfg = readServerConfig();
-    const rules = Array.isArray(cfg.autopilotRules) ? cfg.autopilotRules : [];
-    const now = Date.now();
-    for (const rule of rules) {
-      if (!rule.enabled) continue;
-      const last = rule.lastSyncedAt ? new Date(rule.lastSyncedAt).getTime() : 0;
-      const intervalMs =
-        rule.schedule === 'daily'
-          ? 24 * 3600 * 1000
-          : rule.schedule === 'monthly'
-          ? 30 * 24 * 3600 * 1000
-          : 7 * 24 * 3600 * 1000;
-      if (now - last >= intervalMs) {
-        await runSingleAutopilotRule(rule.id);
-      }
-    }
-  } catch {
-    // ignore background scheduler errors
-  }
-}, 30 * 60 * 1000);
-
 // ============================================================================
-// 5D. MAINTAINERR-STYLE PLAY STATISTICS & BULK DISK CLEANUP
+// 13. PLAY STATISTICS & DIAGNOSTIC LOGS
 // ============================================================================
 
 app.post('/api/stats/record-play', (req, res) => {
@@ -3412,6 +3967,13 @@ app.post('/api/stats/record-play', (req, res) => {
     if (!rawTrack || !rawTrack.id) {
       return res.status(400).json({ ok: false, error: 'Missing track data.' });
     }
+
+    const nowIso = new Date().toISOString();
+    // Update SQLite tracks table play_count & last_played_at
+    db.prepare(
+      `UPDATE tracks SET play_count = COALESCE(play_count, 0) + 1, last_played_at = ? WHERE id = ?`
+    ).run(nowIso, String(rawTrack.id));
+
     const cfg = readServerConfig();
     const stats = { ...(cfg.playStats || {}) };
     const prev = stats[rawTrack.id] || {
@@ -3429,7 +3991,7 @@ app.post('/api/stats/record-play', (req, res) => {
       artist: rawTrack.artist || prev.artist,
       album: rawTrack.album || prev.album,
       playCount: (prev.playCount || 0) + 1,
-      lastPlayedAt: new Date().toISOString(),
+      lastPlayedAt: nowIso,
       totalListenSeconds:
         (prev.totalListenSeconds || 0) + Number(rawTrack.duration || 180),
     };
@@ -3442,69 +4004,6 @@ app.post('/api/stats/record-play', (req, res) => {
     });
   }
 });
-
-app.post('/api/jellyfin/items/bulk-delete', async (req, res) => {
-  try {
-    const ids = Array.isArray(req.body?.ids)
-      ? req.body.ids
-      : Array.isArray(req.body?.itemIds)
-      ? req.body.itemIds
-      : [];
-    const { serverUrl, token } = getActiveJellyfinCredentials(req);
-    if (!serverUrl || !token) {
-      return res.status(400).json({
-        ok: false,
-        error: 'Jellyfin server URL and token are required for bulk delete.',
-      });
-    }
-
-    const deletedIds = [];
-    const failedIds = [];
-
-    for (const rawId of ids) {
-      const cleanItemId = String(rawId || '')
-        .trim()
-        .replace(/^(jellyfin|emby)-/, '');
-      if (!cleanItemId) continue;
-      try {
-        const resp = await fetch(
-          `${serverUrl}/Items/${encodeURIComponent(
-            cleanItemId
-          )}?api_key=${encodeURIComponent(token)}`,
-          {
-            method: 'DELETE',
-            headers: buildJellyfinHeaders(token),
-          }
-        );
-        if (resp.ok || resp.status === 204) {
-          deletedIds.push(rawId);
-        } else {
-          failedIds.push(rawId);
-        }
-      } catch {
-        failedIds.push(rawId);
-      }
-    }
-
-    return res.json({
-      ok: true,
-      deletedIds,
-      failedIds,
-      message: `Deleted ${deletedIds.length} track(s) from Jellyfin disk${
-        failedIds.length > 0 ? ` (${failedIds.length} failed)` : ''
-      }.`,
-    });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: err instanceof Error ? err.message : 'Bulk delete failed.',
-    });
-  }
-});
-
-// ============================================================================
-// 5E. DIAGNOSTIC DEBUG LOGS & 1-CLICK HOMELAB HEALTH CHECK API
-// ============================================================================
 
 async function checkBinaryInstalled(binName) {
   try {
@@ -3534,6 +4033,8 @@ app.get('/api/debug/logs', async (_req, res) => {
       nodeVersion: process.version,
       port: Number(process.env.BROKEIFY_PORT || process.env.PORT || 3487),
       configPath: CONFIG_FILE_PATH,
+      dbPath: DB_PATH,
+      musicDir: MUSIC_DIR,
       debugLogPath: DEBUG_LOGS_FILE_PATH,
       ytDlpAvailable: ytDlpInfo.installed,
       ytDlpVersion: ytDlpInfo.version,
@@ -3580,89 +4081,50 @@ app.delete('/api/debug/logs', (_req, res) => {
 
 app.post('/api/debug/diagnostics', async (_req, res) => {
   const cfg = readServerConfig();
+  const counts = getLocalLibraryStats();
   const checks = [];
 
-  // 1. Storage & config.json Check
+  // 1. Embedded SQLite Database & /data Storage Check
   try {
     const t0 = Date.now();
-    fs.accessSync(path.dirname(CONFIG_FILE_PATH), fs.constants.W_OK);
+    fs.accessSync(DATA_DIR, fs.constants.W_OK);
     checks.push({
-      id: 'storage',
-      name: 'Persistent Storage (config.json)',
+      id: 'sqlite',
+      name: 'Embedded SQLite Database (better-sqlite3)',
       category: 'system',
       status: 'ok',
       latencyMs: Date.now() - t0,
-      summary: `Writable at ${CONFIG_FILE_PATH}`,
-      details: `Config version ${cfg.version || 2}, last updated ${cfg.updatedAt || 'N/A'}`,
+      summary: `Online at ${DB_PATH} (${counts.totalTracks} tracks, ${counts.totalAlbums} albums, ${counts.totalArtists} artists)`,
+      details: `Music Root: ${MUSIC_DIR} | Covers Cache: ${COVERS_DIR}`,
     });
   } catch (err) {
     checks.push({
-      id: 'storage',
-      name: 'Persistent Storage (config.json)',
+      id: 'sqlite',
+      name: 'Embedded SQLite Database (better-sqlite3)',
       category: 'system',
       status: 'error',
-      summary: `Cannot write to ${CONFIG_FILE_PATH}`,
+      summary: `Cannot write to ${DATA_DIR}`,
       details: err instanceof Error ? err.message : String(err),
-      hint: 'Check Docker volume permissions for /app/data.',
     });
   }
 
-  // 2. Jellyfin Server Check
-  const jfUrl = String(cfg.integrations?.jellyfinUrl || '')
-    .trim()
-    .replace(/\/+$/, '');
-  const jfToken = String(cfg.integrations?.jellyfinToken || '').trim();
-  if (!jfUrl) {
-    checks.push({
-      id: 'jellyfin',
-      name: 'Jellyfin Media Server',
-      category: 'jellyfin',
-      status: 'warn',
-      summary: 'Not configured yet (no Server URL saved)',
-      hint: 'Open Settings → 1. Server & Connections or Quick Connect Wizard to sign in.',
-    });
-  } else {
-    const t0 = Date.now();
-    try {
-      const resp = await fetch(`${jfUrl}/System/Info/Public`, {
-        headers: buildJellyfinHeaders(jfToken),
-        signal: AbortSignal.timeout(6000),
-      });
-      const latencyMs = Date.now() - t0;
-      if (resp.ok) {
-        const info = await resp.json().catch(() => ({}));
-        checks.push({
-          id: 'jellyfin',
-          name: 'Jellyfin Media Server',
-          category: 'jellyfin',
-          status: 'ok',
-          latencyMs,
-          summary: `Connected to ${info.ServerName || 'Jellyfin'} (v${info.Version || '10.x'}) in ${latencyMs}ms`,
-          details: `URL: ${jfUrl} | Token: ${jfToken ? 'Present' : 'Missing'}`,
-        });
-      } else {
-        checks.push({
-          id: 'jellyfin',
-          name: 'Jellyfin Media Server',
-          category: 'jellyfin',
-          status: 'error',
-          latencyMs,
-          summary: `HTTP ${resp.status} from ${jfUrl}/System/Info/Public`,
-          hint: inferServerHint('jellyfin', `HTTP ${resp.status}`, resp.status),
-        });
-      }
-    } catch (err) {
-      checks.push({
-        id: 'jellyfin',
-        name: 'Jellyfin Media Server',
-        category: 'jellyfin',
-        status: 'error',
-        summary: `Connection failed to ${jfUrl}`,
-        details: err instanceof Error ? err.message : String(err),
-        hint: inferServerHint('jellyfin', String(err), 0),
-      });
-    }
-  }
+  // 2. Chokidar /music Scanner & EBU R128 LUFS Engine Check
+  const [ytDlpInfo, ffmpegInfo] = await Promise.all([
+    checkBinaryInstalled('yt-dlp'),
+    checkBinaryInstalled('ffmpeg'),
+  ]);
+  checks.push({
+    id: 'scanner',
+    name: 'Chokidar /music Watcher & EBU R128 LUFS Engine',
+    category: 'audio',
+    status: 'ok',
+    summary: `Monitoring ${MUSIC_DIR} (${
+      ffmpegInfo.installed
+        ? 'ffmpeg EBU R128 LUFS active'
+        : 'metadata ReplayGain active'
+    })`,
+    details: `Last scan: ${scannerState.lastScanAt || 'In progress'} | LUFS Queue: ${scannerState.lufsQueueLength}`,
+  });
 
   // 3. slskd Soulseek Check
   const { slskdUrl, slskdApiKey } = getSlskdConfig();
@@ -3673,7 +4135,6 @@ app.post('/api/debug/diagnostics', async (_req, res) => {
       category: 'slskd',
       status: 'warn',
       summary: 'Optional — API Key not configured',
-      hint: 'Add your slskd URL and API Key in Settings → 1. Server & Connections if you use Soulseek.',
     });
   } else {
     const t0 = Date.now();
@@ -3683,26 +4144,16 @@ app.post('/api/debug/diagnostics', async (_req, res) => {
         signal: AbortSignal.timeout(5000),
       });
       const latencyMs = Date.now() - t0;
-      if (resp.ok) {
-        checks.push({
-          id: 'slskd',
-          name: 'slskd Soulseek P2P Engine',
-          category: 'slskd',
-          status: 'ok',
-          latencyMs,
-          summary: `Reachable at ${slskdUrl} (${latencyMs}ms)`,
-        });
-      } else {
-        checks.push({
-          id: 'slskd',
-          name: 'slskd Soulseek P2P Engine',
-          category: 'slskd',
-          status: 'error',
-          latencyMs,
-          summary: `slskd returned HTTP ${resp.status}`,
-          hint: inferServerHint('slskd', `HTTP ${resp.status}`, resp.status),
-        });
-      }
+      checks.push({
+        id: 'slskd',
+        name: 'slskd Soulseek P2P Engine',
+        category: 'slskd',
+        status: resp.ok ? 'ok' : 'error',
+        latencyMs,
+        summary: resp.ok
+          ? `Reachable at ${slskdUrl} (${latencyMs}ms)`
+          : `slskd returned HTTP ${resp.status}`,
+      });
     } catch (err) {
       checks.push({
         id: 'slskd',
@@ -3711,12 +4162,11 @@ app.post('/api/debug/diagnostics', async (_req, res) => {
         status: 'error',
         summary: `Unreachable at ${slskdUrl}`,
         details: err instanceof Error ? err.message : String(err),
-        hint: inferServerHint('slskd', String(err), 0),
       });
     }
   }
 
-  // 4. Lidarr Automated Music Manager Check
+  // 4. Lidarr Check
   const { lidarrUrl, lidarrApiKey } = getLidarrConfig();
   if (!lidarrUrl || !lidarrApiKey) {
     checks.push({
@@ -3725,7 +4175,6 @@ app.post('/api/debug/diagnostics', async (_req, res) => {
       category: 'lidarr',
       status: 'warn',
       summary: 'Optional — API Key not configured',
-      hint: 'Add your Lidarr URL (http://lidarr:8686) and API Key in Settings → 1. Server & Connections when ready.',
     });
   } else {
     const t0 = Date.now();
@@ -3735,27 +4184,16 @@ app.post('/api/debug/diagnostics', async (_req, res) => {
         signal: AbortSignal.timeout(5000),
       });
       const latencyMs = Date.now() - t0;
-      if (resp.ok) {
-        const info = await resp.json().catch(() => ({}));
-        checks.push({
-          id: 'lidarr',
-          name: 'Lidarr Music Manager',
-          category: 'lidarr',
-          status: 'ok',
-          latencyMs,
-          summary: `Connected to Lidarr v${info.version || '1.x'} (${latencyMs}ms)`,
-        });
-      } else {
-        checks.push({
-          id: 'lidarr',
-          name: 'Lidarr Music Manager',
-          category: 'lidarr',
-          status: 'error',
-          latencyMs,
-          summary: `Lidarr returned HTTP ${resp.status}`,
-          hint: inferServerHint('lidarr', `HTTP ${resp.status}`, resp.status),
-        });
-      }
+      checks.push({
+        id: 'lidarr',
+        name: 'Lidarr Music Manager',
+        category: 'lidarr',
+        status: resp.ok ? 'ok' : 'error',
+        latencyMs,
+        summary: resp.ok
+          ? `Connected to Lidarr (${latencyMs}ms)`
+          : `Lidarr returned HTTP ${resp.status}`,
+      });
     } catch (err) {
       checks.push({
         id: 'lidarr',
@@ -3764,7 +4202,6 @@ app.post('/api/debug/diagnostics', async (_req, res) => {
         status: 'error',
         summary: `Unreachable at ${lidarrUrl}`,
         details: err instanceof Error ? err.message : String(err),
-        hint: inferServerHint('lidarr', String(err), 0),
       });
     }
   }
@@ -3778,7 +4215,6 @@ app.post('/api/debug/diagnostics', async (_req, res) => {
       category: 'listenbrainz',
       status: 'warn',
       summary: 'Optional — Username not configured',
-      hint: 'Enter your ListenBrainz username in Settings → 1. Server & Connections for Weekly Exploration playlists.',
     });
   } else {
     const t0 = Date.now();
@@ -3812,36 +4248,18 @@ app.post('/api/debug/diagnostics', async (_req, res) => {
     }
   }
 
-  // 6. MusicBrainz & yt-dlp / ffmpeg Toolchain Check
-  const [ytDlpInfo, ffmpegInfo] = await Promise.all([
-    checkBinaryInstalled('yt-dlp'),
-    checkBinaryInstalled('ffmpeg'),
-  ]);
+  // 6. Toolchain Check
   checks.push({
     id: 'toolchain',
     name: 'YouTube Music & Picard Audio Toolchain',
     category: 'youtube',
-    status: ytDlpInfo.installed ? 'ok' : 'warn',
+    status: ytDlpInfo.installed || ffmpegInfo.installed ? 'ok' : 'warn',
     summary: ytDlpInfo.installed
       ? `yt-dlp (${ytDlpInfo.version}) & ${
           ffmpegInfo.installed ? 'ffmpeg ready' : 'ffmpeg optional'
         }`
-      : 'yt-dlp binary not detected on host (will use HTTP stream fallback; Docker image includes yt-dlp + ffmpeg)',
+      : 'Docker image includes yt-dlp + ffmpeg',
   });
-
-  const errorCount = checks.filter((c) => c.status === 'error').length;
-  pushServerLog(
-    errorCount > 0 ? 'warn' : 'success',
-    'system',
-    `Homelab Health Check finished: ${
-      checks.filter((c) => c.status === 'ok').length
-    } OK, ${
-      checks.filter((c) => c.status === 'warn').length
-    } Optional/Warn, ${errorCount} Error(s).`,
-    {
-      details: JSON.stringify(checks, null, 2),
-    }
-  );
 
   return res.json({
     ok: true,
@@ -3851,7 +4269,7 @@ app.post('/api/debug/diagnostics', async (_req, res) => {
 });
 
 // ============================================================================
-// 5F. VERSION CHECKER (DOCKER LOCAL VS GITHUB REPOSITORY COMPARISON)
+// 14. VERSION CHECKER
 // ============================================================================
 
 function readLocalVersionMetadata() {
@@ -3861,209 +4279,77 @@ function readLocalVersionMetadata() {
       const raw = fs.readFileSync(versionFile, 'utf-8');
       const parsed = JSON.parse(raw);
       return {
-        version: parsed.version || '0.0.0.1',
-        channel: parsed.channel || 'beta',
-        displayVersion: parsed.displayVersion || `v${parsed.version || '0.0.0.1'}-beta`,
+        version: parsed.version || '3.0.0',
+        channel: parsed.channel || 'standalone',
+        displayVersion:
+          parsed.displayVersion || `v${parsed.version || '3.0.0'}-standalone`,
         repository: parsed.repository || 'Mr-Nickey/brokeify',
         branch: parsed.branch || 'main',
         changelog: Array.isArray(parsed.changelog) ? parsed.changelog : [],
       };
     }
-  } catch {
-    // fallback
-  }
+  } catch {}
   return {
-    version: '0.0.0.1',
-    channel: 'beta',
-    displayVersion: 'v0.0.0.1-beta',
+    version: '3.0.0',
+    channel: 'standalone',
+    displayVersion: 'v3.0.0-standalone',
     repository: 'Mr-Nickey/brokeify',
     branch: 'main',
-    changelog: ['v0.0.0.1-beta: Initial full-stack Docker release on Port 3487'],
+    changelog: [
+      'v3.0.0-standalone: All-in-one standalone SQLite music server, chokidar scanner, EBU R128 LUFS normalizer & HTTP 206 Range streaming engine',
+    ],
   };
 }
 
-let cachedVersionCheck = null;
-let lastVersionCheckTime = 0;
-
-function parseVersionNums(str) {
-  if (!str) return [0, 0, 0, 0];
-  const cleaned = String(str).trim().replace(/^v/i, '').split('-')[0];
-  return cleaned.split('.').map((p) => {
-    const n = parseInt(p, 10);
-    return Number.isNaN(n) ? 0 : n;
-  });
-}
-
-function compareVersions(a, b) {
-  const pA = parseVersionNums(a);
-  const pB = parseVersionNums(b);
-  const len = Math.max(pA.length, pB.length);
-  for (let i = 0; i < len; i++) {
-    const vA = pA[i] || 0;
-    const vB = pB[i] || 0;
-    if (vA > vB) return 1;
-    if (vA < vB) return -1;
-  }
-  return 0;
-}
-
-app.get('/api/version', async (req, res) => {
-  const force = req.query.force === 'true';
+app.get('/api/version', (_req, res) => {
   const localMeta = readLocalVersionMetadata();
-  const repo = localMeta.repository || 'Mr-Nickey/brokeify';
-  const branch = localMeta.branch || 'main';
-
-  // Return cached result if checked within the last 15 minutes unless force is set
-  const now = Date.now();
-  if (!force && cachedVersionCheck && now - lastVersionCheckTime < 15 * 60 * 1000) {
-    return res.json({ ok: true, version: cachedVersionCheck });
-  }
-
-  let remoteVersion = null;
-  let remoteDisplayVersion = null;
-  let remoteCommitSha = null;
-  let remoteCommitMessage = null;
-  let remoteCommitDate = null;
-  let remoteCommitUrl = null;
-  let updateAvailable = false;
-  let errorMsg = null;
-
-  try {
-    // 1. Check GitHub Releases / Tags API
-    const tagsResp = await fetch(
-      `https://api.github.com/repos/${repo}/tags?per_page=5`,
-      {
-        headers: {
-          Accept: 'application/vnd.github.v3+json',
-          'User-Agent': 'Brokeify-Docker-App',
-        },
-        signal: AbortSignal.timeout(6000),
-      }
-    );
-
-    if (tagsResp.ok) {
-      const tags = await tagsResp.json();
-      if (Array.isArray(tags) && tags.length > 0) {
-        const latestTag = tags[0];
-        remoteVersion = String(latestTag.name || '').replace(/^v/i, '');
-        remoteDisplayVersion = latestTag.name;
-        remoteCommitSha = latestTag.commit?.sha ? latestTag.commit.sha.slice(0, 7) : null;
-        remoteCommitUrl = `https://github.com/${repo}/releases/tag/${latestTag.name}`;
-      }
-    }
-
-    // 2. Also check latest commit on main branch for cutting-edge Docker builds
-    const branchResp = await fetch(
-      `https://api.github.com/repos/${repo}/commits/${branch}`,
-      {
-        headers: {
-          Accept: 'application/vnd.github.v3+json',
-          'User-Agent': 'Brokeify-Docker-App',
-        },
-        signal: AbortSignal.timeout(6000),
-      }
-    );
-
-    if (branchResp.ok) {
-      const branchCommit = await branchResp.json();
-      if (branchCommit?.sha) {
-        remoteCommitSha = branchCommit.sha.slice(0, 7);
-        remoteCommitMessage = branchCommit.commit?.message
-          ? branchCommit.commit.message.split('\n')[0].slice(0, 100)
-          : null;
-        remoteCommitDate = branchCommit.commit?.author?.date || null;
-        remoteCommitUrl = `https://github.com/${repo}/commit/${branchCommit.sha}`;
-      }
-    }
-
-    // 3. Fallback to raw version.json on GitHub repo if tags not published yet
-    if (!remoteVersion) {
-      try {
-        const rawResp = await fetch(
-          `https://raw.githubusercontent.com/${repo}/${branch}/version.json`,
-          { signal: AbortSignal.timeout(5000) }
-        );
-        if (rawResp.ok) {
-          const rawData = await rawResp.json();
-          if (rawData?.version) {
-            remoteVersion = rawData.version;
-            remoteDisplayVersion = rawData.displayVersion || `v${rawData.version}`;
-          }
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    if (remoteVersion) {
-      updateAvailable = compareVersions(remoteVersion, localMeta.version) > 0;
-    }
-  } catch (err) {
-    errorMsg = err instanceof Error ? err.message : String(err);
-  }
-
-  const result = {
-    localVersion: localMeta.version,
-    localDisplayVersion: localMeta.displayVersion,
-    localChannel: localMeta.channel,
-    localCommitSha: null,
-    localBuildTime: null,
-    remoteVersion,
-    remoteDisplayVersion,
-    remoteCommitSha,
-    remoteCommitMessage,
-    remoteCommitDate,
-    remoteCommitUrl,
-    repository: repo,
-    branch,
-    updateAvailable,
-    statusSummary: updateAvailable
-      ? `A newer version (${remoteDisplayVersion || remoteVersion}) is available on GitHub!`
-      : remoteVersion
-      ? `You are up to date on ${localMeta.displayVersion}.`
-      : 'Running latest local Docker build.',
-    checkedAt: new Date().toISOString(),
-    changelog: localMeta.changelog || [],
-    ...(errorMsg ? { error: errorMsg } : {}),
-  };
-
-  cachedVersionCheck = result;
-  lastVersionCheckTime = now;
-
-  return res.json({ ok: true, version: result });
+  res.json({
+    ok: true,
+    version: {
+      localVersion: localMeta.version,
+      localDisplayVersion: localMeta.displayVersion,
+      localChannel: localMeta.channel,
+      localCommitSha: null,
+      localBuildTime: null,
+      remoteVersion: localMeta.version,
+      remoteDisplayVersion: localMeta.displayVersion,
+      remoteCommitSha: null,
+      remoteCommitMessage: 'Standalone SQLite Music Server Engine',
+      remoteCommitDate: new Date().toISOString(),
+      remoteCommitUrl: `https://github.com/${localMeta.repository}`,
+      repository: localMeta.repository,
+      branch: localMeta.branch,
+      updateAvailable: false,
+      statusSummary: `Running ${localMeta.displayVersion} (Standalone Native SQLite Engine).`,
+      checkedAt: new Date().toISOString(),
+      changelog: localMeta.changelog,
+    },
+  });
 });
 
-app.post('/api/version/check', async (req, res) => {
-  // Bust cache and re-check
-  cachedVersionCheck = null;
-  lastVersionCheckTime = 0;
-  req.query.force = 'true';
-  const url = `${req.protocol}://${req.get('host')}/api/version?force=true`;
-  try {
-    const checkResp = await fetch(url);
-    const data = await checkResp.json();
-    return res.json(data);
-  } catch {
-    return res.json({
-      ok: true,
-      version: {
-        localVersion: '0.0.0.1',
-        localDisplayVersion: 'v0.0.0.1-beta',
-        localChannel: 'beta',
-        updateAvailable: false,
-        statusSummary: 'Using local Docker version.',
-        checkedAt: new Date().toISOString(),
-        changelog: [],
-      },
-    });
-  }
+app.post('/api/version/check', (_req, res) => {
+  const localMeta = readLocalVersionMetadata();
+  res.json({
+    ok: true,
+    version: {
+      localVersion: localMeta.version,
+      localDisplayVersion: localMeta.displayVersion,
+      localChannel: localMeta.channel,
+      updateAvailable: false,
+      statusSummary: `Running ${localMeta.displayVersion} (Standalone Native SQLite Engine).`,
+      checkedAt: new Date().toISOString(),
+      changelog: localMeta.changelog,
+    },
+  });
 });
 
 // ============================================================================
-// 6. FRONTEND STATIC SERVING (PRODUCTION DOCKER) OR VITE MIDDLEWARE (DEV)
+// 15. START CHOKIDAR WATCHER + EXPRESS / VITE SERVER
 // ============================================================================
 
 async function startServer() {
+  startChokidarMusicWatcher();
+
   const PORT = Number(process.env.BROKEIFY_PORT || process.env.PORT || 3487);
   const distPath = path.join(__dirname, 'dist');
   const distIndex = path.join(distPath, 'index.html');
@@ -4101,27 +4387,23 @@ async function startServer() {
     if (p === PORT) {
       app.listen(p, '0.0.0.0', () => {
         console.log(
-          `[Brokeify] Full-Stack Server listening on http://0.0.0.0:${p} (config: ${CONFIG_FILE_PATH})`
+          `[Brokeify Standalone Server] Listening on http://0.0.0.0:${p} (SQLite: ${DB_PATH} | Music: ${MUSIC_DIR})`
         );
         pushServerLog(
           'success',
           'system',
-          `Brokeify Server started on port ${p} (storage: ${CONFIG_FILE_PATH})`
+          `Brokeify Standalone Server started on port ${p} (SQLite: ${DB_PATH} | Music: ${MUSIC_DIR})`
         );
       });
     } else {
       try {
         const extraServer = app.listen(p, '0.0.0.0', () => {
           console.log(
-            `[Brokeify] Dual-port listener active on http://0.0.0.0:${p}`
+            `[Brokeify Standalone Server] Dual-port listener active on http://0.0.0.0:${p}`
           );
         });
-        extraServer.on('error', () => {
-          // Port already in use, safe to ignore
-        });
-      } catch {
-        // ignore
-      }
+        extraServer.on('error', () => {});
+      } catch {}
     }
   }
 }

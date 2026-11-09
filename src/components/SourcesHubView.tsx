@@ -160,6 +160,128 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
   }>({ count: 0, totalSizeBytes: 0 });
   const [isClearingArtwork, setIsClearingArtwork] = useState<boolean>(false);
 
+  const [sqliteHealth, setSqliteHealth] = useState<{
+    totalTracks: number;
+    totalAlbums: number;
+    totalArtists: number;
+    totalPlaylists: number;
+    musicDir: string;
+    dbPath: string;
+    lufsAnalyzedCount?: number;
+    lufsQueueCount?: number;
+    driveConnected?: boolean;
+    audioFileCount?: number;
+    topLevelFolders?: string[];
+  } | null>(null);
+  const [isRescanningLibrary, setIsRescanningLibrary] =
+    useState<boolean>(false);
+  const [drivePathInput, setDrivePathInput] = useState<string>('/music');
+  const [isTestingDrivePath, setIsTestingDrivePath] = useState<boolean>(false);
+  const [driveTestFeedback, setDriveTestFeedback] = useState<{
+    ok: boolean;
+    message: string;
+  } | null>(null);
+
+  const refreshSqliteHealth = async () => {
+    try {
+      const r = await fetch('/api/health');
+      if (r.ok) {
+        const d = await r.json();
+        const mDir = String(d.musicDir || '/music');
+        setSqliteHealth({
+          totalTracks: Number(d.totalTracks || 0),
+          totalAlbums: Number(d.totalAlbums || 0),
+          totalArtists: Number(d.totalArtists || 0),
+          totalPlaylists: Number(d.totalPlaylists || 0),
+          musicDir: mDir,
+          dbPath: String(d.dbPath || '/data/brokeify.db'),
+          lufsAnalyzedCount: d.scanner?.lufsAnalyzedCount,
+          lufsQueueCount: d.scanner?.lufsQueueCount,
+          driveConnected: d.driveStatus?.driveConnected,
+          audioFileCount: d.driveStatus?.audioFileCount,
+          topLevelFolders: d.driveStatus?.topLevelFolders,
+        });
+        setDrivePathInput(mDir);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleTestDriveInSettings = async () => {
+    setIsTestingDrivePath(true);
+    setDriveTestFeedback(null);
+    try {
+      const resp = await fetch('/api/storage/test-drive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: drivePathInput.trim() || '/music' }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      const ds = data.driveStatus;
+      if (ds && ds.exists && ds.readable) {
+        setDriveTestFeedback({
+          ok: ds.audioFileCount > 0,
+          message:
+            ds.audioFileCount > 0
+              ? `✅ Folder "${ds.musicDir}" is readable (${ds.audioFileCount} audio files, ${ds.playlistFileCount} playlists found).`
+              : `⚠️ Folder "${ds.musicDir}" exists and is readable, but contains 0 audio files. Check your Docker Compose volume mount!`,
+        });
+      } else {
+        setDriveTestFeedback({
+          ok: false,
+          message:
+            data.message ||
+            `🚨 Folder "${drivePathInput}" does not exist or is not readable inside the container.`,
+        });
+      }
+    } catch {
+      setDriveTestFeedback({
+        ok: false,
+        message: 'Network error testing music drive path.',
+      });
+    } finally {
+      setIsTestingDrivePath(false);
+    }
+  };
+
+  const handleRescanMusicFolder = async () => {
+    setIsRescanningLibrary(true);
+    setDriveTestFeedback(null);
+    try {
+      const resp = await fetch('/api/storage/connect-drive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: drivePathInput.trim() || '/music' }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      await refreshSqliteHealth();
+      const { updatedConfig, tracks, playlists } =
+        await MusicProviderManager.fetchLocalSqliteLibrary(providers[0]);
+      onUpdateProviders(
+        providers.map((p) =>
+          p.id === updatedConfig.id || p.type === 'built-in' ? updatedConfig : p
+        )
+      );
+      if (tracks.length > 0) {
+        onMergeRemoteTracks(tracks, updatedConfig.name);
+      }
+      if (playlists.length > 0) {
+        onMergeRemotePlaylists(playlists);
+      }
+      const feedbackMsg =
+        data?.message ||
+        `Scanned ${drivePathInput}: ${tracks.length} tracks & ${playlists.length} playlists indexed!`;
+      setDriveTestFeedback({
+        ok: tracks.length > 0,
+        message: feedbackMsg,
+      });
+      showSavedCard('top', feedbackMsg);
+    } finally {
+      setIsRescanningLibrary(false);
+    }
+  };
+
   const refreshArtworkStats = async () => {
     try {
       const stats = await getArtworkCacheStats();
@@ -171,6 +293,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
 
   React.useEffect(() => {
     refreshArtworkStats();
+    refreshSqliteHealth();
   }, []);
 
   const jellyfinProvider =
@@ -531,18 +654,21 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
         );
         onMergeRemoteTracks(tracks, 'Internet Archive');
       } else {
-        const msg =
-          '✅ Connected! Loaded 8 built-in synthwave & car-test tracks';
-        const updated: ProviderConfig = {
-          ...provider,
-          enabled: true,
-          status: 'connected',
-          lastMessage: msg,
-          diagnosticLog: msg,
-        };
+        const {
+          updatedConfig,
+          tracks,
+          playlists: syncedPlaylists,
+        } = await MusicProviderManager.fetchLocalSqliteLibrary(provider);
         onUpdateProviders(
-          providers.map((p) => (p.id === provider.id ? updated : p))
+          providers.map((p) => (p.id === provider.id ? updatedConfig : p))
         );
+        if (tracks.length > 0) {
+          onMergeRemoteTracks(tracks, provider.name);
+        }
+        if (syncedPlaylists.length > 0) {
+          onMergeRemotePlaylists(syncedPlaylists);
+        }
+        await refreshSqliteHealth();
       }
     } finally {
       setTestingId(null);
@@ -938,7 +1064,200 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
       {/* GitHub Repository Version & Update Checker */}
       <VersionChecker />
 
-      {/* Section 0: Persistent Docker Server Storage (/app/data/config.json) + Per-Device Jellyfin Login + slskd, Lidarr, YouTube Music & ListenBrainz Keys */}
+      {/* Standalone SQLite Music Engine (/data/brokeify.db) + Chokidar /music Scanner + Android Auto REST API */}
+      <section
+        aria-label="Brokeify Standalone SQLite Engine & Android Auto REST API"
+        data-testid="standalone-sqlite-engine-section"
+        className="rounded-2xl border border-[#00ff66]/50 bg-zinc-900/70 p-5 sm:p-6 space-y-5"
+      >
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-zinc-800/80 pb-4">
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2.5">
+              <HardDrive className="w-5 h-5 text-[#00ff66] shrink-0" />
+              <h2 className="text-lg font-bold text-white tracking-tight font-mono">
+                Brokeify Native SQLite Engine ({sqliteHealth?.dbPath || '/data/brokeify.db'}) &amp; Chokidar{' '}
+                <code className="text-[#00ff66]">{sqliteHealth?.musicDir || '/music'}</code> Watcher
+              </h2>
+            </div>
+            <p className="text-xs sm:text-sm text-zinc-300 leading-relaxed max-w-3xl">
+              Brokeify runs as a completely standalone, all-in-one self-hosted
+              music server with <strong>zero built-in demo tracks</strong>. It
+              watches your mounted drive or NAS folder in real time for FLAC,
+              MP3, OGG, OPUS, M4A, WAV, AAC, and{' '}
+              <code className="text-white">.m3u/.m3u8</code> playlists, caches
+              embedded artwork to <code className="text-white">/data/covers/</code>,
+              calculates EBU R128 <code className="text-[#00ff66]">-14 LUFS</code>{' '}
+              car-stereo normalization via <code className="text-white">ffmpeg</code>,
+              and serves both this web player and your custom Android app over
+              HTTP 206 Range streams.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+            <PWAInstallButton />
+
+            {onOpenOnboardingModal && (
+              <button
+                type="button"
+                onClick={onOpenOnboardingModal}
+                data-testid="open-drive-setup-guide-btn"
+                className="inline-flex items-center gap-2 rounded-xl border border-amber-500/50 bg-amber-500/15 hover:bg-amber-500/25 px-3.5 py-2 text-xs font-mono font-bold text-amber-300 transition-colors whitespace-nowrap min-h-[40px]"
+              >
+                <Terminal className="w-4 h-4" />
+                <span>Docker Compose &amp; NAS Guide</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              disabled={isRescanningLibrary}
+              onClick={handleRescanMusicFolder}
+              data-testid="rescan-music-folder-btn"
+              className="inline-flex items-center gap-2 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-4 py-2 text-xs font-mono font-bold text-zinc-950 transition-colors whitespace-nowrap min-h-[40px]"
+            >
+              {isRescanningLibrary ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <RefreshCw className="w-4 h-4" />
+              )}
+              <span>Rescan Music Drive Now</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Live Music Drive / NAS Folder Path Configuration & Tester */}
+        <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-4 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <label
+              htmlFor="settings-music-drive-input"
+              className="text-xs font-mono font-bold uppercase text-[#00ff66] flex items-center gap-2"
+            >
+              <HardDrive className="w-4 h-4" />
+              <span>Mounted Music Drive / Local or NAS Folder Path</span>
+            </label>
+            <span className="text-[11px] font-mono text-zinc-400">
+              {sqliteHealth?.driveConnected
+                ? `✅ Connected (${sqliteHealth.audioFileCount ?? sqliteHealth.totalTracks} audio files)`
+                : '🚨 No audio files detected in current folder'}
+            </span>
+          </div>
+
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
+            <input
+              id="settings-music-drive-input"
+              type="text"
+              value={drivePathInput}
+              onChange={(e) => setDrivePathInput(e.target.value)}
+              placeholder="/music or /mnt/nas/music"
+              data-testid="settings-music-drive-input"
+              className="flex-1 rounded-xl border border-zinc-800 bg-zinc-900 px-3.5 py-2 text-xs sm:text-sm font-mono text-white focus:border-[#00ff66] focus:outline-none"
+            />
+
+            <button
+              type="button"
+              onClick={handleTestDriveInSettings}
+              disabled={isTestingDrivePath}
+              data-testid="settings-test-drive-btn"
+              className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-[#00ff66]/50 bg-[#00ff66]/15 hover:bg-[#00ff66]/25 px-3.5 py-2 text-xs font-mono font-bold text-[#00ff66] transition-colors whitespace-nowrap min-h-[38px]"
+            >
+              {isTestingDrivePath ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <RefreshCw className="w-3.5 h-3.5" />
+              )}
+              <span>Test Drive Path</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleRescanMusicFolder}
+              disabled={isRescanningLibrary}
+              data-testid="settings-connect-drive-btn"
+              className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-4 py-2 text-xs font-mono font-bold text-zinc-950 transition-colors whitespace-nowrap min-h-[38px]"
+            >
+              {isRescanningLibrary ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Save className="w-3.5 h-3.5" />
+              )}
+              <span>Save &amp; Scan Drive</span>
+            </button>
+          </div>
+
+          {driveTestFeedback && (
+            <div
+              className={`rounded-lg border px-3 py-2 text-xs font-mono flex items-center gap-2 ${
+                driveTestFeedback.ok
+                  ? 'border-emerald-500/40 bg-emerald-950/30 text-emerald-300'
+                  : 'border-rose-500/40 bg-rose-950/30 text-rose-300'
+              }`}
+            >
+              {driveTestFeedback.ok ? (
+                <CheckCircle2 className="w-4 h-4 text-[#00ff66] shrink-0" />
+              ) : (
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+              )}
+              <span>{driveTestFeedback.message}</span>
+            </div>
+          )}
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 font-mono text-xs">
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-3">
+            <span className="text-[10px] uppercase text-zinc-400 block">
+              SQLite Tracks
+            </span>
+            <strong className="text-base text-[#00ff66]">
+              {sqliteHealth?.totalTracks ?? 0}
+            </strong>
+          </div>
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-3">
+            <span className="text-[10px] uppercase text-zinc-400 block">
+              Albums Indexed
+            </span>
+            <strong className="text-base text-white">
+              {sqliteHealth?.totalAlbums ?? 0}
+            </strong>
+          </div>
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-3">
+            <span className="text-[10px] uppercase text-zinc-400 block">
+              Artists Indexed
+            </span>
+            <strong className="text-base text-white">
+              {sqliteHealth?.totalArtists ?? 0}
+            </strong>
+          </div>
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-3">
+            <span className="text-[10px] uppercase text-zinc-400 block">
+              SQLite Playlists
+            </span>
+            <strong className="text-base text-purple-300">
+              {sqliteHealth?.totalPlaylists ?? 0}
+            </strong>
+          </div>
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-3">
+            <span className="text-[10px] uppercase text-zinc-400 block">
+              EBU R128 (-14 LUFS)
+            </span>
+            <strong className="text-xs text-emerald-300">
+              {sqliteHealth?.lufsAnalyzedCount ?? 0} analyzed
+              {sqliteHealth?.lufsQueueCount
+                ? ` (${sqliteHealth.lufsQueueCount} queued)`
+                : ''}
+            </strong>
+          </div>
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-3">
+            <span className="text-[10px] uppercase text-zinc-400 block">
+              Android QR API
+            </span>
+            <strong className="text-xs text-cyan-300">
+              HTTP 206 Range Ready
+            </strong>
+          </div>
+        </div>
+      </section>
+
+      {/* Section 0: Persistent Docker Server Storage (/app/data/config.json) + slskd, Lidarr, YouTube Music & ListenBrainz Keys */}
       {serverIntegrations && onUpdateServerIntegrations && (
         <section
           aria-labelledby="docker-config-heading"
@@ -961,13 +1280,11 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                 Your <code className="text-white">slskd</code>,{' '}
                 <code className="text-white">Lidarr</code>,{' '}
                 <code className="text-white">ListenBrainz</code>, custom themes,
-                playlists, and live playback position are saved on your server
-                in <code className="text-[#00ff66]">{serverConfigPath}</code>{' '}
-                (port <code className="text-[#00ff66]">3487</code>) AND mirrored
-                to your Jellyfin profile. When you open your domain on any new
-                device (phone, Chromecast, TV, or car stereo), you simply log
-                into Jellyfin once and all your keys &amp; live playback
-                position load automatically — zero re-typing!
+                playlists, and live playback position are saved persistently on
+                your Docker server in{' '}
+                <code className="text-[#00ff66]">{serverConfigPath}</code> and{' '}
+                <code className="text-[#00ff66]">/data/brokeify.db</code> (port{' '}
+                <code className="text-[#00ff66]">3487</code>).
               </p>
             </div>
 
@@ -1018,7 +1335,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
             </div>
           </div>
 
-          {/* Homelab Live Health Matrix (Jellyfin, slskd, Lidarr, ListenBrainz, Storage) */}
+          {/* Homelab Live Health Matrix (Music Drive, slskd, Lidarr, ListenBrainz, Storage) */}
           <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-4 space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800/80 pb-2.5">
               <span className="text-xs font-mono font-bold uppercase tracking-wider text-zinc-300 flex items-center gap-2">
@@ -1034,45 +1351,37 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5">
-              {/* Jellyfin status */}
+              {/* Music Drive status */}
               <div
                 className={`p-3 rounded-xl border flex flex-col justify-between gap-1.5 ${
-                  jellyfinTestStatus?.ok
+                  (sqliteHealth?.totalTracks ?? 0) > 0
                     ? 'border-emerald-500/40 bg-emerald-950/20 text-emerald-300'
-                    : jellyfinTestStatus && !jellyfinTestStatus.ok
-                      ? 'border-rose-500/60 bg-rose-950/30 text-rose-300'
-                      : jellyfinProvider?.status === 'connected'
-                        ? 'border-emerald-500/30 bg-emerald-950/15 text-emerald-300'
-                        : 'border-zinc-800 bg-zinc-900/60 text-zinc-300'
+                    : 'border-rose-500/60 bg-rose-950/30 text-rose-300'
                 }`}
               >
                 <div className="flex items-center justify-between gap-1">
                   <span className="text-[11px] font-mono font-bold uppercase text-zinc-300">
-                    Jellyfin Server
+                    Music Drive ({sqliteHealth?.musicDir || '/music'})
                   </span>
-                  {jellyfinTestStatus?.ok ||
-                  jellyfinProvider?.status === 'connected' ? (
+                  {(sqliteHealth?.totalTracks ?? 0) > 0 ? (
                     <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                  ) : jellyfinTestStatus && !jellyfinTestStatus.ok ? (
-                    <AlertCircle className="w-3.5 h-3.5 text-rose-400 animate-pulse" />
                   ) : (
-                    <Radio className="w-3.5 h-3.5 text-zinc-500" />
+                    <AlertCircle className="w-3.5 h-3.5 text-rose-400 animate-pulse" />
                   )}
                 </div>
                 <p className="text-[11px] font-mono truncate">
-                  {jellyfinTestStatus?.message ||
-                    (jellyfinProvider?.status === 'connected'
-                      ? 'Connected (Active Session)'
-                      : 'Untested (Click Test)')}
+                  {(sqliteHealth?.totalTracks ?? 0) > 0
+                    ? `${sqliteHealth?.totalTracks} tracks indexed`
+                    : '0 audio files found'}
                 </p>
                 <button
                   type="button"
-                  disabled={isTestingJellyfin}
-                  onClick={() => handleTestJellyfin(jellyfinProvider)}
-                  data-testid="matrix-test-jellyfin-btn"
+                  disabled={isTestingDrivePath}
+                  onClick={handleTestDriveInSettings}
+                  data-testid="matrix-test-drive-btn"
                   className="mt-1 text-[10px] font-mono font-bold text-[#00ff66] hover:underline text-left"
                 >
-                  {isTestingJellyfin ? 'Testing...' : 'Test Connection →'}
+                  {isTestingDrivePath ? 'Testing...' : 'Test Drive Path →'}
                 </button>
               </div>
 
@@ -1231,99 +1540,31 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
               </div>
             </div>
 
-            {/* LOUD WARNING BANNER THAT YELLS AT USER IF JELLYFIN OR SLSKD HAS FAILED */}
-            {((jellyfinTestStatus && !jellyfinTestStatus.ok) ||
-              (slskdTestStatus && !slskdTestStatus.ok)) && (
+            {/* LOUD WARNING BANNER IF SLSKD FAILED */}
+            {slskdTestStatus && !slskdTestStatus.ok && (
               <div
                 role="alert"
                 className="rounded-xl border-2 border-rose-500 bg-rose-950/90 p-4 space-y-2.5 animate-pulse shadow-xl"
               >
                 <div className="flex items-center gap-2.5 text-rose-200 font-mono font-bold text-sm uppercase">
                   <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0" />
-                  <span>🚨 CONNECTION ALERT: HOMELAB SERVICES UNREACHABLE!</span>
+                  <span>🚨 CONNECTION ALERT: SLSKD UNREACHABLE!</span>
                 </div>
                 <div className="text-xs font-mono text-white space-y-1.5">
-                  {jellyfinTestStatus && !jellyfinTestStatus.ok && (
-                    <div>
-                      <p>
-                        • <strong className="text-rose-300">Jellyfin Media Server:</strong>{' '}
-                        {jellyfinTestStatus.message}
+                  <div>
+                    <p>
+                      • <strong className="text-rose-300">slskd Soulseek Engine:</strong>{' '}
+                      {slskdTestStatus.message}
+                    </p>
+                    {slskdTestStatus.hint && (
+                      <p className="text-amber-300 font-semibold bg-black/50 p-2 rounded border border-amber-500/30 mt-1">
+                        💡 {slskdTestStatus.hint}
                       </p>
-                      {jellyfinTestStatus.hint && (
-                        <p className="text-amber-300 font-semibold bg-black/50 p-2 rounded border border-amber-500/30 mt-1">
-                          💡 {jellyfinTestStatus.hint}
-                        </p>
-                      )}
-                    </div>
-                  )}
-                  {slskdTestStatus && !slskdTestStatus.ok && (
-                    <div>
-                      <p>
-                        • <strong className="text-rose-300">slskd Soulseek Engine:</strong>{' '}
-                        {slskdTestStatus.message}
-                      </p>
-                      {slskdTestStatus.hint && (
-                        <p className="text-amber-300 font-semibold bg-black/50 p-2 rounded border border-amber-500/30 mt-1">
-                          💡 {slskdTestStatus.hint}
-                        </p>
-                      )}
-                    </div>
-                  )}
+                    )}
+                  </div>
                 </div>
               </div>
             )}
-          </div>
-
-          {/* Per-Device Jellyfin Login Security + Instant Profile Sync Banner */}
-          <div className="rounded-xl border border-emerald-500/30 bg-zinc-950/90 p-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
-            <div className="space-y-1">
-              <div className="flex items-center gap-2">
-                <Lock className="w-4 h-4 text-[#00ff66] shrink-0" />
-                <span className="text-xs font-mono font-bold uppercase text-white">
-                  Per-Device Jellyfin Login Gate &amp; Cross-Device Handoff
-                </span>
-              </div>
-              <p className="text-xs text-zinc-400 leading-relaxed max-w-2xl">
-                Requires each new device on your domain to sign into your
-                Jellyfin account first (via Password or 6-Digit TV Quick
-                Connect). Once signed in, that device automatically gets all
-                your saved <code className="text-zinc-200">slskd</code>,{' '}
-                <code className="text-zinc-200">Lidarr</code>, and{' '}
-                <code className="text-zinc-200">ListenBrainz</code> keys plus
-                live pause/play handoff between your Phone and Chromecast/TV.
-              </p>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-3 shrink-0">
-              <SlidingToggle
-                checked={serverIntegrations.requireDeviceLogin !== false}
-                onChange={(nextChecked) =>
-                  onUpdateServerIntegrations({
-                    ...serverIntegrations,
-                    requireDeviceLogin: nextChecked,
-                  })
-                }
-                label={
-                  serverIntegrations.requireDeviceLogin !== false
-                    ? 'Require Login on New Devices: ON'
-                    : 'Require Login on New Devices: OFF'
-                }
-                ariaLabel="Require Jellyfin Login on Each New Device"
-                testId="toggle-require-device-login"
-              />
-
-              {onLockDeviceForLogin && (
-                <button
-                  type="button"
-                  onClick={onLockDeviceForLogin}
-                  data-testid="lock-this-device-btn"
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-900 hover:border-amber-400/50 hover:text-amber-300 px-3 py-2 text-xs font-mono font-bold text-zinc-300 transition-colors min-h-[38px]"
-                >
-                  <Lock className="w-3.5 h-3.5" />
-                  <span>Lock This Device</span>
-                </button>
-              )}
-            </div>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1827,159 +2068,89 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
         </section>
       )}
 
-      {/* Section 1: Active Music Sources (Only active connectors are shown; others stay hidden until activated) */}
+      {/* Section 1: Native Android App & Android Auto Camera QR Code Pairing */}
       <section
-        aria-labelledby="active-connectors-heading"
-        className="space-y-4"
+        aria-labelledby="android-qr-companion-heading"
+        data-testid="android-qr-companion-section"
+        className="rounded-2xl border border-[#00ff66]/40 bg-zinc-900/40 p-5 sm:p-6 space-y-4"
       >
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-zinc-800/80 pb-4">
-          <div>
-            <h2
-              id="active-connectors-heading"
-              className="text-xl font-bold text-white tracking-tight"
-            >
-              Active Music Sources ({activeProviders.length} Enabled)
-            </h2>
-            <p className="text-sm text-zinc-400 mt-0.5">
-              Sign in with Quick Connect or your Username &amp; Password.
-              Additional sources stay tucked away until you activate them.
-            </p>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
-            {onOpenOnboardingModal && (
-              <button
-                type="button"
-                onClick={onOpenOnboardingModal}
-                data-testid="sources-open-onboarding-btn"
-                className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 px-4 py-2 text-xs font-bold text-zinc-950 transition-colors whitespace-nowrap shrink-0 min-h-[38px]"
-              >
-                <Zap className="w-3.5 h-3.5" />
-                <span>Quick Connect / Login</span>
-              </button>
-            )}
-
-            {hiddenProviders.length > 0 && (
-              <button
-                type="button"
-                onClick={() => setShowAddSourcePicker(!showAddSourcePicker)}
-                data-testid="toggle-add-sources-picker"
-                className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-900 hover:border-emerald-500/50 hover:text-white px-3.5 py-2 text-xs font-semibold text-zinc-200 transition-colors whitespace-nowrap shrink-0 min-h-[38px]"
-              >
-                <Plus className="w-3.5 h-3.5 text-emerald-400" />
-                <span>
-                  {showAddSourcePicker
-                    ? 'Hide Extra Sources'
-                    : `Activate Another Source (${hiddenProviders.length})`}
-                </span>
-              </button>
-            )}
-          </div>
-        </div>
-
-        {/* Compact Pop-Out Picker for Hidden Connectors */}
-        {showAddSourcePicker && hiddenProviders.length > 0 && (
-          <div
-            data-testid="hidden-sources-picker"
-            className="rounded-2xl border border-emerald-500/30 bg-zinc-900/60 p-4 space-y-2.5"
-          >
-            <div className="text-xs font-semibold text-zinc-300">
-              Select a music source to activate its connector card:
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              {hiddenProviders.map((hp) => (
-                <button
-                  key={hp.id}
-                  type="button"
-                  onClick={() => handleActivateHiddenSource(hp.id)}
-                  data-testid={`activate-source-${hp.type}`}
-                  className="inline-flex items-center gap-2 rounded-xl border border-zinc-700 bg-zinc-950 hover:border-emerald-500 hover:bg-emerald-500/15 px-3.5 py-2 text-xs font-bold text-white transition-all"
-                >
-                  <Plus className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>{hp.name}</span>
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {activeProviders.length === 0 ? (
-          <div className="rounded-2xl border border-zinc-800/80 bg-zinc-900/30 p-8 text-center space-y-3">
-            <p className="text-sm text-zinc-300 font-semibold">
-              No music sources are currently active.
-            </p>
-            <div className="flex flex-wrap items-center justify-center gap-2">
-              {hiddenProviders.map((hp) => (
-                <button
-                  key={hp.id}
-                  type="button"
-                  onClick={() => handleActivateHiddenSource(hp.id)}
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 px-3.5 py-2 text-xs font-bold text-zinc-950 transition-colors"
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                  <span>Activate {hp.name}</span>
-                </button>
-              ))}
-            </div>
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {activeProviders.map((prov) => renderConnectorCard(prov))}
-          </div>
-        )}
-      </section>
-
-      {/* Section 2: Zero-Logout Persistence & Jellyfin Cloud Settings Sync */}
-      <section
-        aria-labelledby="cloud-sync-heading"
-        className="rounded-2xl border border-zinc-800/90 bg-zinc-900/40 p-6 space-y-5"
-      >
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-zinc-800/80 pb-4">
           <div className="space-y-1">
             <div className="flex items-center gap-2.5">
-              <Lock className="w-5 h-5 text-emerald-400 shrink-0" />
+              <Smartphone className="w-5 h-5 text-[#00ff66] shrink-0" />
               <h2
-                id="cloud-sync-heading"
-                className="text-lg font-bold text-white tracking-tight"
+                id="android-qr-companion-heading"
+                className="text-lg font-bold text-white tracking-tight font-mono"
               >
-                Zero-Logout Persistence &amp; Jellyfin Cloud Settings Sync
+                Native Android App &amp; Android Auto Camera QR Pairing
               </h2>
             </div>
             <p className="text-xs text-zinc-400">
-              Automatically backs up and restores your EQ presets, Car Mode
-              leveler, extra server configs, and playlists via Jellyfin&apos;s
-              native DisplayPreferences endpoint.
+              Click the button on the right to open the QR Code Popup. Scan it
+              with the camera inside your custom Android app to pair your phone
+              with this Docker container and stream music on the go.
             </p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
-            <button
-              type="button"
-              onClick={() => onPullCloudSettings()}
-              disabled={cloudSyncStatus.state === 'syncing'}
-              className="inline-flex items-center gap-2 rounded-xl border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 px-3.5 py-2 text-xs font-semibold text-white transition-colors whitespace-nowrap shrink-0 min-h-[40px]"
-            >
-              <CloudDownload className="w-4 h-4 text-emerald-400" />
-              <span>Pull &amp; Restore from Jellyfin</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={onPushCloudSettings}
-              disabled={cloudSyncStatus.state === 'syncing'}
-              className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 px-4 py-2 text-xs font-bold text-zinc-950 transition-colors whitespace-nowrap shrink-0 min-h-[40px]"
-            >
-              <CloudUpload className="w-4 h-4" />
-              <span>Push Settings to Jellyfin</span>
-            </button>
+          <div className="shrink-0">
+            <PWAInstallButton />
           </div>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs font-mono">
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4 space-y-1.5">
+            <span className="text-[#00ff66] font-bold block">
+              1. Camera QR Scan Handshake
+            </span>
+            <p className="text-zinc-400 text-[11px] leading-relaxed">
+              Your Android camera scans a single JSON payload containing{' '}
+              <code className="text-white">url</code>,{' '}
+              <code className="text-white">lanUrl</code>, and{' '}
+              <code className="text-white">apiKey</code>, then calls{' '}
+              <code className="text-[#00ff66]">POST /api/mobile/verify</code> to
+              confirm pairing.
+            </p>
+          </div>
+
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4 space-y-1.5">
+            <span className="text-purple-300 font-bold block">
+              2. Library &amp; Playlist Sync API
+            </span>
+            <p className="text-zinc-400 text-[11px] leading-relaxed">
+              Fetch indexed songs from{' '}
+              <code className="text-white">GET /api/library/tracks</code>,
+              albums from <code className="text-white">GET /api/library/albums</code>,
+              and playlists from{' '}
+              <code className="text-white">GET /api/playlists</code> (including{' '}
+              <code className="text-[#00ff66]">loudnessLufs</code> for ExoPlayer
+              volume leveling).
+            </p>
+          </div>
+
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4 space-y-1.5">
+            <span className="text-sky-300 font-bold block">
+              3. HTTP 206 Range Audio &amp; Covers
+            </span>
+            <p className="text-zinc-400 text-[11px] leading-relaxed">
+              Stream lossless FLAC/MP3 with instant seeking via{' '}
+              <code className="text-white">GET /api/stream/:trackId</code> and
+              cached album covers via{' '}
+              <code className="text-white">GET /api/covers/:albumId</code>.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      {/* Section 2: Disk-Backed Artwork Cache & Browser Storage Persistence */}
+      <section
+        aria-labelledby="artwork-cache-heading"
+        className="rounded-2xl border border-zinc-800/90 bg-zinc-900/40 p-5 sm:p-6 space-y-4"
+      >
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
           <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/60 p-4 space-y-1">
             <div className="font-semibold text-white flex items-center gap-1.5">
               <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>Android Chrome Storage Lock</span>
+              <span>Persistent Browser Storage Lock</span>
             </div>
             <p
               className="text-zinc-400 font-mono"
@@ -1989,38 +2160,6 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
             </p>
           </div>
 
-          <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/60 p-4 space-y-1">
-            <div className="font-semibold text-white flex items-center gap-1.5">
-              <Lock className="w-4 h-4 text-purple-400 shrink-0" />
-              <span>Zero-Logout Auth Token Guard</span>
-            </div>
-            <p className="text-zinc-400">
-              Saved Jellyfin, Navidrome, Emby &amp; Plex tokens are never
-              cleared on network timeout or offline errors.
-            </p>
-          </div>
-
-          <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/60 p-4 space-y-1">
-            <div className="font-semibold text-white flex items-center gap-1.5">
-              <Cloud className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>Jellyfin DisplayPreferences Sync</span>
-            </div>
-            <p
-              className="text-emerald-400 font-mono truncate"
-              title={jellyfinDisplayPrefsEndpoint}
-              data-testid="jellyfin-cloud-sync-endpoint"
-            >
-              {jellyfinDisplayPrefsEndpoint}
-            </p>
-            <p
-              className="text-zinc-400"
-              data-testid="cloud-sync-status-message"
-            >
-              {cloudSyncStatus.message}
-            </p>
-          </div>
-
-          {/* 4. Disk-Backed Album Artwork Cache (brokeify-artwork-cache) */}
           <div
             data-testid="artwork-cache-status-card"
             className="rounded-xl border border-zinc-800/80 bg-zinc-950/60 p-4 space-y-2 flex flex-col justify-between"
@@ -2067,131 +2206,6 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
               <span>Purge Artwork Cache</span>
             </button>
           </div>
-        </div>
-      </section>
-
-      {/* Section 2B: Android Pixel & Mobile PWA Installation */}
-      <section
-        aria-labelledby="pwa-mobile-install-heading"
-        data-testid="pwa-mobile-install-section"
-        className="rounded-2xl border border-emerald-500/40 bg-zinc-900/40 p-5 sm:p-6 space-y-4"
-      >
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-zinc-800/80 pb-4">
-          <div className="space-y-1">
-            <div className="flex items-center gap-2.5">
-              <Smartphone className="w-5 h-5 text-[#00ff66] shrink-0" />
-              <h2
-                id="pwa-mobile-install-heading"
-                className="text-lg font-bold text-white tracking-tight"
-              >
-                Pixel Phone &amp; Mobile WebAPK Installation
-              </h2>
-            </div>
-            <p className="text-xs text-zinc-400">
-              Install Brokeify directly to your Android Pixel phone as a standalone fullscreen app with offline caching and lock-screen playback.
-            </p>
-          </div>
-
-          <div className="shrink-0">
-            <PWAInstallButton />
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs font-mono">
-          <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4 space-y-1.5">
-            <span className="text-[#00ff66] font-bold block">1. 1-Tap Home Screen</span>
-            <p className="text-zinc-400 text-[11px] leading-relaxed">
-              In Chrome on your Pixel phone, tap the button above or tap Chrome menu (⋮) &rarr; &ldquo;Install app&rdquo;. Android builds a signed native WebAPK with the emerald icon in your App Drawer.
-            </p>
-          </div>
-
-          <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4 space-y-1.5">
-            <span className="text-purple-300 font-bold block">2. Lock-Screen &amp; Car Mode</span>
-            <p className="text-zinc-400 text-[11px] leading-relaxed">
-              Standalone mode hides browser tabs and address bars. Connects cleanly to your car stereo with high-contrast oversized buttons and Android Auto Bluetooth metadata.
-            </p>
-          </div>
-
-          <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4 space-y-1.5">
-            <span className="text-sky-300 font-bold block">3. Multi-Gigabyte Offline Vault</span>
-            <p className="text-zinc-400 text-[11px] leading-relaxed">
-              Android grants Brokeify persistent storage permissions (<code className="text-[#00ff66]">navigator.storage.persist()</code>) to store entire offline playlists and cached album art on your Pixel&apos;s internal SSD.
-            </p>
-          </div>
-        </div>
-      </section>
-
-      {/* Section 3: Tucked-Away Account & Session Controls (Safe 2-Step Sign Out at Bottom) */}
-      <section
-        aria-labelledby="account-session-heading"
-        data-testid="account-session-footer"
-        className="rounded-2xl border border-zinc-800/80 bg-zinc-950/60 p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4"
-      >
-        <div className="space-y-1">
-          <h3
-            id="account-session-heading"
-            className="text-sm font-bold text-zinc-200 flex items-center gap-2"
-          >
-            <LogOut className="w-4 h-4 text-zinc-400 shrink-0" />
-            <span>Account &amp; Session Management</span>
-          </h3>
-          <p className="text-xs text-zinc-400">
-            Need to switch accounts or reset your server login? Sign out safely below (requires 2-tap confirmation so you never hit it by accident).
-          </p>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2 shrink-0">
-          {activeProviders
-            .filter((p) =>
-              ['jellyfin', 'emby', 'navidrome', 'plex'].includes(p.type)
-            )
-            .map((prov) => {
-              const isConfirming = confirmingLogoutType === prov.type;
-              return isConfirming ? (
-                <div
-                  key={`logout-confirm-${prov.id}`}
-                  className="inline-flex items-center gap-2 rounded-xl border border-rose-500/50 bg-rose-950/40 p-1.5"
-                >
-                  <span className="text-xs font-semibold text-rose-200 px-2">
-                    Sign out of {prov.name}?
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setConfirmingLogoutType(null);
-                      if (onLogoutProvider) {
-                        onLogoutProvider(prov.type);
-                      } else {
-                        handleClearSecret(prov);
-                      }
-                    }}
-                    data-testid={`confirm-logout-provider-${prov.type}`}
-                    className="rounded-lg bg-rose-500 hover:bg-rose-400 px-3 py-1.5 text-xs font-bold text-white transition-colors"
-                  >
-                    Yes, Log Out
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setConfirmingLogoutType(null)}
-                    data-testid={`cancel-logout-provider-${prov.type}`}
-                    className="rounded-lg bg-zinc-800 hover:bg-zinc-700 px-2.5 py-1.5 text-xs font-semibold text-zinc-300 transition-colors"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              ) : (
-                <button
-                  key={`logout-btn-${prov.id}`}
-                  type="button"
-                  onClick={() => setConfirmingLogoutType(prov.type)}
-                  data-testid={`logout-provider-${prov.type}`}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-800 bg-zinc-900 hover:border-rose-500/40 hover:text-rose-300 px-3.5 py-2 text-xs font-semibold text-zinc-400 transition-colors min-h-[38px]"
-                >
-                  <LogOut className="w-3.5 h-3.5" />
-                  <span>Log Out of {prov.name}</span>
-                </button>
-              );
-            })}
         </div>
       </section>
     </div>

@@ -159,11 +159,11 @@ function formatDuration(sec: number): string {
 }
 
 const SOURCE_LABELS: Record<ProviderType, string> = {
-  jellyfin: 'Jellyfin',
+  jellyfin: 'Brokeify Native Engine',
   emby: 'Emby',
   navidrome: 'Navidrome',
   plex: 'Plex',
-  'built-in': 'Built-In Demo Tracks',
+  'built-in': 'Local /music Library (SQLite)',
   'radio-browser': 'Radio-Browser',
   'internet-archive': 'Internet Archive',
 };
@@ -350,45 +350,32 @@ export default function App() {
   const hasLoadedServerConfigRef = useRef<boolean>(false);
   const scrobbledTrackIdsRef = useRef<Set<string>>(new Set());
 
-  // Sync Jellyfin library helper
-  const syncJellyfinProvider = (jfProv: ProviderConfig) => {
-    if (
-      !jfProv ||
-      !jfProv.enabled ||
-      !jfProv.serverUrl?.trim() ||
-      (!jfProv.token?.trim() && !jfProv.password?.trim())
-    ) {
-      return;
-    }
-    MusicProviderManager.fetchJellyfinMusic(jfProv)
+  // Sync Brokeify Standalone SQLite Library helper
+  const syncJellyfinProvider = (prov?: ProviderConfig) => {
+    MusicProviderManager.fetchLocalSqliteLibrary(prov)
       .then(({ updatedConfig, tracks, playlists: syncedPlaylists }) => {
-        if (updatedConfig.status === 'connected') {
+        setProviders((prev) => {
+          const next = prev.map((p) =>
+            p.id === updatedConfig.id || p.type === 'built-in'
+              ? updatedConfig
+              : p
+          );
+          MusicProviderManager.saveProviders(next);
+          return next;
+        });
+
+        if (tracks.length > 0) {
           try {
             localStorage.setItem(DEVICE_VERIFIED_STORAGE_KEY, 'true');
           } catch {
             // ignore
           }
-          setProviders((prev) => {
-            const next = prev.map((p) => {
-              if (p.id === updatedConfig.id) return updatedConfig;
-              if (tracks.length > 0 && p.type === 'built-in') {
-                return { ...p, enabled: false };
-              }
-              return p;
-            });
-            MusicProviderManager.saveProviders(next);
-            return next;
+          setRemoteTracks((prev) => {
+            const nonLocal = prev.filter((t) => t.source !== 'built-in');
+            const updated = [...tracks, ...nonLocal];
+            MusicProviderManager.saveCachedRemoteTracks(updated);
+            return updated;
           });
-          if (tracks.length > 0) {
-            setRemoteTracks((prev) => {
-              const map = new Map<string, Track>();
-              for (const t of prev) map.set(t.id, t);
-              for (const t of tracks) map.set(t.id, t);
-              const updated = Array.from(map.values());
-              MusicProviderManager.saveCachedRemoteTracks(updated);
-              return updated;
-            });
-          }
           if (syncedPlaylists.length > 0) {
             setPlaylists((prev) => {
               const customNames =
@@ -418,21 +405,38 @@ export default function App() {
               return prevPin;
             });
           }
-        } else if (updatedConfig.status === 'error') {
+        } else {
+          // Zero audio files indexed in /music -> clear any stale tracks and open the Music Drive & Docker Compose Setup Overlay
+          setRemoteTracks((prev) => {
+            const nonLocal = prev.filter((t) => t.source !== 'built-in');
+            MusicProviderManager.saveCachedRemoteTracks(nonLocal);
+            return nonLocal;
+          });
+          setPlaylists((prev) => {
+            const nonBuiltIn = prev.filter(
+              (p) => p.id !== 'pl-all-local-tracks' && p.source !== 'built-in'
+            );
+            MusicProviderManager.savePlaylists(nonBuiltIn);
+            return nonBuiltIn;
+          });
+          setIsOnboardingOpen(true);
+        }
+
+        if (updatedConfig.status === 'error') {
           logDebugEvent(
             'error',
-            'jellyfin',
-            updatedConfig.lastMessage || 'Jellyfin sync failed',
+            'system',
+            updatedConfig.lastMessage || 'Local SQLite sync failed',
             {
-              endpoint: updatedConfig.serverUrl,
+              endpoint: '/api/library/tracks',
               details: updatedConfig.diagnosticLog,
             }
           );
         }
       })
       .catch((err) => {
-        logDebugError('jellyfin', 'Failed to sync Jellyfin library', err, {
-          endpoint: jfProv.serverUrl,
+        logDebugError('system', 'Failed to sync local SQLite library', err, {
+          endpoint: '/api/library/tracks',
         });
       });
   };
@@ -545,59 +549,9 @@ export default function App() {
             srv.providers
           );
         }
-
-        if (
-          srv.integrations?.jellyfinUrl &&
-          requireLoginOnEachDevice &&
-          !isDeviceVerified
-        ) {
-          // Per-Device Jellyfin Login Gate: pre-fill Server URL & Username on this new device,
-          // require Jellyfin login once, and automatically unlock all slskd/Lidarr/ListenBrainz keys upon login!
-          activeProvs = activeProvs.map((p) =>
-            p.type === 'jellyfin'
-              ? {
-                  ...p,
-                  enabled: true,
-                  serverUrl: srv.integrations.jellyfinUrl || p.serverUrl,
-                  username: srv.integrations.jellyfinUsername || p.username,
-                  token: '',
-                  password: '',
-                  status: 'disconnected' as const,
-                  lastMessage:
-                    'Sign in to Jellyfin on this device to unlock your saved slskd, Lidarr, ListenBrainz & playback session.',
-                }
-              : p
-          );
-          setProviders(activeProvs);
-          MusicProviderManager.saveProviders(activeProvs);
-          setIsOnboardingOpen(true);
-        } else if (
-          srv.integrations?.jellyfinUrl &&
-          srv.integrations?.jellyfinToken
-        ) {
-          activeProvs = activeProvs.map((p) =>
-            p.type === 'jellyfin'
-              ? {
-                  ...p,
-                  enabled: true,
-                  serverUrl: srv.integrations.jellyfinUrl || p.serverUrl,
-                  token: srv.integrations.jellyfinToken || p.token,
-                  userId: srv.integrations.jellyfinUserId || p.userId,
-                  username: srv.integrations.jellyfinUsername || p.username,
-                  status: 'connected' as const,
-                }
-              : p
-          );
-          setProviders(activeProvs);
-          MusicProviderManager.saveProviders(activeProvs);
-          setIsOnboardingOpen(false);
-        } else {
-          setProviders(activeProvs);
-          MusicProviderManager.saveProviders(activeProvs);
-          if (MusicProviderManager.hasCompletedOnboarding(activeProvs)) {
-            setIsOnboardingOpen(false);
-          }
-        }
+        setProviders(activeProvs);
+        MusicProviderManager.saveProviders(activeProvs);
+        setIsOnboardingOpen(false);
 
         if (Array.isArray(srv.playlists) && srv.playlists.length > 0) {
           setPlaylists((prev) => {
@@ -613,17 +567,15 @@ export default function App() {
         }
 
         hasLoadedServerConfigRef.current = true;
-        const jfProv = activeProvs.find((p) => p.type === 'jellyfin');
-        if (jfProv && jfProv.token) {
-          syncJellyfinProvider(jfProv);
-        }
+        const primaryProv =
+          activeProvs.find((p) => p.type === 'built-in') || activeProvs[0];
+        syncJellyfinProvider(primaryProv);
       })
       .catch((err) => {
         logDebugError('system', 'Failed to load /api/config on startup', err);
         hasLoadedServerConfigRef.current = true;
         const initialProviders = MusicProviderManager.loadProviders();
-        const jfProv = initialProviders.find((p) => p.type === 'jellyfin');
-        if (jfProv) syncJellyfinProvider(jfProv);
+        syncJellyfinProvider(initialProviders[0]);
       });
 
     return () => {
@@ -658,16 +610,16 @@ export default function App() {
     }
   }, [enabledProviderTypes, sourceFilter]);
 
-  // Strictly show tracks from enabled sources only (Zero demo tracks)
+  // Show all tracks from local SQLite engine and enabled live streams
   const allTracks = useMemo(() => {
     const seen = new Set<string>();
     return remoteTracks.filter((t) => {
-      if (!t || t.source === 'built-in' || t.streamUrl.startsWith('synth://')) {
+      if (!t || String(t.streamUrl || '').startsWith('synth://')) {
         return false;
       }
       if (seen.has(t.id)) return false;
       seen.add(t.id);
-      return enabledProviderTypes.has(t.source);
+      return t.source === 'built-in' || enabledProviderTypes.has(t.source);
     });
   }, [enabledProviderTypes, remoteTracks]);
 
@@ -684,17 +636,14 @@ export default function App() {
     }
   }, [allTracks]);
 
-  // Filter playlists so only playlists from enabled sources appear
+  // Filter playlists so local SQLite playlists and enabled source playlists appear
   const visiblePlaylists = useMemo(() => {
     return playlists.filter((pl) => {
-      if (
-        pl.source === 'built-in' ||
-        pl.id === 'pl-night-drive' ||
-        pl.id === 'pl-spite-anthem'
-      ) {
+      if (pl.id === 'pl-night-drive' || pl.id === 'pl-spite-anthem') {
         return false;
       }
       if (
+        pl.source !== 'built-in' &&
         pl.source !== 'mixed' &&
         pl.source !== 'spotify-resolved' &&
         !enabledProviderTypes.has(pl.source as ProviderType)
@@ -705,16 +654,14 @@ export default function App() {
     });
   }, [enabledProviderTypes, playlists]);
 
-  const jellyfinProv = providers.find((p) => p.type === 'jellyfin');
+  const jellyfinProv =
+    providers.find((p) => p.type === 'built-in') || providers[0];
   const isJellyfinDisconnected = Boolean(
-    jellyfinProv &&
-      jellyfinProv.enabled &&
-      (jellyfinProv.status === 'error' ||
-        Boolean(
-          jellyfinProv.diagnosticLog?.toLowerCase().includes('timeout') ||
-            jellyfinProv.diagnosticLog?.toLowerCase().includes('failed') ||
-            jellyfinProv.diagnosticLog?.toLowerCase().includes('aborted')
-        ))
+    allTracks.length === 0 ||
+      (jellyfinProv &&
+        jellyfinProv.enabled &&
+        (jellyfinProv.status === 'error' ||
+          jellyfinProv.status === 'disconnected'))
   );
 
   const audio = useAudioEngine(allTracks);
@@ -819,6 +766,13 @@ export default function App() {
       MusicProviderManager.savePlaylists(updated);
       return updated;
     });
+    // Persist rename to SQLite playlists table
+    fetch(`/api/playlists/${encodeURIComponent(pl.id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: trimmed }),
+    }).catch(() => {});
+
     setEditingPlaylistId(null);
     setEditingPlaylistNameInput('');
     setToastMessage(
@@ -848,6 +802,11 @@ export default function App() {
       MusicProviderManager.savePlaylists(updated);
       return updated;
     });
+    fetch(`/api/playlists/${encodeURIComponent(pl.id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: realName }),
+    }).catch(() => {});
     setEditingPlaylistId(null);
     setEditingPlaylistNameInput('');
     setToastMessage(`Restored real playlist name: "${realName}"`);
@@ -863,10 +822,16 @@ export default function App() {
     });
   };
 
-  // Confirm & execute safe playlist deletion (deletes ONLY the playlist containers, NEVER the songs or albums)
+  // Confirm & execute safe playlist deletion (deletes ONLY the playlist containers in SQLite, NEVER the songs or albums)
   const handleConfirmDeletePlaylists = () => {
     if (playlistsPendingDeletion.length === 0) return;
     const idsToDelete = new Set(playlistsPendingDeletion.map((p) => p.id));
+
+    for (const pid of idsToDelete) {
+      fetch(`/api/playlists/${encodeURIComponent(pid)}`, {
+        method: 'DELETE',
+      }).catch(() => {});
+    }
 
     setPlaylists((prev) => {
       const remaining = prev.filter((p) => !idsToDelete.has(p.id));
@@ -887,7 +852,7 @@ export default function App() {
     setIsPlaylistSelectMode(false);
     setOpenMenuPlaylistId(null);
     setToastMessage(
-      `🗑️ Deleted ${deletedCount} playlist(s). All songs and albums remain untouched in your library!`
+      `🗑️ Deleted ${deletedCount} playlist(s). All songs and albums remain untouched in /music!`
     );
   };
 
@@ -1333,18 +1298,20 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Automatic ListenBrainz Scrobbling
+  // Automatic Native SQLite + ListenBrainz Scrobbling
   useEffect(() => {
     const tr = audio.currentTrack;
     if (!tr || !audio.isPlaying || !serverIntegrations.listenbrainzToken) {
       return;
     }
-    fetch('/api/listenbrainz/scrobble', {
+    fetch('/api/playback/scrobble', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        trackId: tr.id,
         listenType: 'playing_now',
         track: {
+          id: tr.id,
           title: tr.title,
           artist: tr.artist,
           album: tr.album,
@@ -1360,7 +1327,7 @@ export default function App() {
 
   useEffect(() => {
     const tr = audio.currentTrack;
-    if (!tr || !audio.isPlaying || !serverIntegrations.listenbrainzToken) {
+    if (!tr || !audio.isPlaying) {
       return;
     }
     const threshold = Math.min(240, Math.max(30, (tr.duration || 180) * 0.5));
@@ -1369,12 +1336,14 @@ export default function App() {
       !scrobbledTrackIdsRef.current.has(tr.id)
     ) {
       scrobbledTrackIdsRef.current.add(tr.id);
-      fetch('/api/listenbrainz/scrobble', {
+      fetch('/api/playback/scrobble', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          trackId: tr.id,
           listenType: 'single',
           track: {
+            id: tr.id,
             title: tr.title,
             artist: tr.artist,
             album: tr.album,
@@ -1390,25 +1359,20 @@ export default function App() {
     serverIntegrations.listenbrainzToken,
   ]);
 
-  // Permanently delete a single duplicate track from Jellyfin hard drive
+  // Permanently delete a single duplicate track from /music & SQLite database
   const handleDeleteTrackFromJellyfin = async (track: Track) => {
     setDeletingTrackId(track.id);
     try {
-      const jfProv = providers.find((p) => p.type === 'jellyfin');
       const resp = await fetch(
-        `/api/jellyfin/items/${encodeURIComponent(track.id)}`,
+        `/api/library/tracks/${encodeURIComponent(track.id)}`,
         {
           method: 'DELETE',
-          headers: {
-            'x-jellyfin-url': jfProv?.serverUrl || '',
-            'x-jellyfin-token': jfProv?.token || '',
-          },
         }
       );
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok || !data.ok) {
         setToastMessage(
-          `⚠️ ${data.error || `Failed to delete "${track.title}" from Jellyfin`}`
+          `⚠️ ${data.error || `Failed to delete "${track.title}" from library`}`
         );
       } else {
         setRemoteTracks((prev) => {
@@ -1418,7 +1382,7 @@ export default function App() {
         });
         audio.setQueue(audio.queue.filter((t) => t.id !== track.id));
         setToastMessage(
-          `🗑️ Permanently deleted "${track.title}" from Jellyfin server!`
+          `🗑️ Permanently deleted "${track.title}" from /music & SQLite!`
         );
       }
     } catch (err) {
@@ -1431,19 +1395,16 @@ export default function App() {
     }
   };
 
-  // Bulk delete tracks from Jellyfin hard drive (Maintainerr mode)
+  // Bulk delete tracks from /music & SQLite database (Maintainerr mode)
   const handleBulkDeleteTracksFromJellyfin = async (tracksToDelete: Track[]) => {
     if (tracksToDelete.length === 0) return;
-    const jfProv = providers.find((p) => p.type === 'jellyfin');
     const itemIds = tracksToDelete.map((t) => t.id);
 
     try {
-      const resp = await fetch('/api/jellyfin/items/bulk-delete', {
+      const resp = await fetch('/api/library/tracks/bulk-delete', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-jellyfin-url': jfProv?.serverUrl || '',
-          'x-jellyfin-token': jfProv?.token || '',
         },
         body: JSON.stringify({ itemIds }),
       });
@@ -1461,7 +1422,7 @@ export default function App() {
       audio.setQueue(audio.queue.filter((t) => !deletedSet.has(t.id)));
       setToastMessage(
         data.message ||
-          `🗑️ Removed ${deletedSet.size} track(s) from library!`
+          `🗑️ Removed ${deletedSet.size} track(s) from /music & SQLite!`
       );
     } catch (err) {
       setToastMessage(
@@ -1471,46 +1432,13 @@ export default function App() {
   };
 
   const handleUpdateProviders = (next: ProviderConfig[]) => {
-    const jf = next.find((p) => p.type === 'jellyfin');
-    if (jf && jf.status === 'connected' && jf.token) {
-      try {
-        localStorage.setItem(DEVICE_VERIFIED_STORAGE_KEY, 'true');
-      } catch {
-        // ignore
-      }
-    }
     setProviders(next);
     MusicProviderManager.saveProviders(next);
   };
 
   const handleLockDeviceForLogin = () => {
-    try {
-      localStorage.removeItem('jellyfin_token');
-      localStorage.removeItem('jellyfin_user_id');
-      localStorage.removeItem(DEVICE_VERIFIED_STORAGE_KEY);
-    } catch {
-      // ignore
-    }
-    setProviders((prev) => {
-      const updated = prev.map((p) =>
-        p.type === 'jellyfin'
-          ? {
-              ...p,
-              token: '',
-              password: '',
-              status: 'disconnected' as const,
-              lastMessage:
-                'Device locked. Sign into Jellyfin to unlock your saved slskd, Lidarr & ListenBrainz profile.',
-            }
-          : p
-      );
-      MusicProviderManager.saveProviders(updated);
-      return updated;
-    });
-    setIsOnboardingOpen(true);
-    setToastMessage(
-      '🔒 Locked this device. Sign into Jellyfin to unlock all saved homelab settings!'
-    );
+    syncJellyfinProvider(providers[0]);
+    setToastMessage('🔄 Refreshed Brokeify Standalone SQLite Library!');
   };
 
   const handleMergeRemoteTracks = (newTracks: Track[]) => {
@@ -1553,21 +1481,32 @@ export default function App() {
     setPlaylists(remainingPlaylists);
     setSelectedPlaylistId(null);
     setToastMessage(
-      `Logged out of ${SOURCE_LABELS[type] || type}. Ready to sign back in.`
+      `Disconnected ${SOURCE_LABELS[type] || type}.`
     );
-    setIsOnboardingOpen(true);
   };
 
   const handleSaveResolvedPlaylist = (newPl: Playlist) => {
+    const savedPl: Playlist = {
+      ...newPl,
+      originalName: newPl.originalName || newPl.name,
+      source: 'built-in',
+    };
+    fetch('/api/playlists', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: savedPl.id,
+        name: savedPl.name,
+        description: savedPl.description,
+        trackIds: savedPl.trackIds,
+      }),
+    }).catch(() => {});
     setPlaylists((prev) => {
-      const updated = [
-        { ...newPl, originalName: newPl.originalName || newPl.name },
-        ...prev,
-      ];
+      const updated = [savedPl, ...prev];
       MusicProviderManager.savePlaylists(updated);
       return updated;
     });
-    setSelectedPlaylistId(newPl.id);
+    setSelectedPlaylistId(savedPl.id);
     setLibrarySubTab('songs');
   };
 
@@ -1579,12 +1518,22 @@ export default function App() {
       id: `pl-custom-${Date.now()}`,
       name: trimmed,
       originalName: trimmed,
-      description: 'Unified multi-source playlist created in Brokeify.',
-      source: 'mixed',
+      description: 'Standalone playlist stored in /data/brokeify.db.',
+      source: 'built-in',
       trackIds: allTracks.slice(0, 4).map((t) => t.id),
       createdAt: new Date().toISOString().slice(0, 10),
       coverAccent: '#10b981',
     };
+    fetch('/api/playlists', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: pl.id,
+        name: pl.name,
+        description: pl.description,
+        trackIds: pl.trackIds,
+      }),
+    }).catch(() => {});
     setPlaylists((prev) => {
       const updated = [pl, ...prev];
       MusicProviderManager.savePlaylists(updated);
@@ -1774,32 +1723,37 @@ export default function App() {
         </div>
       )}
 
-      {/* Loud Jellyfin Disconnected Alert Bar — Yells at user so they know before leaving Settings */}
+      {/* Loud Music Drive Disconnected Alert Bar — Alerts user when /music has 0 audio files */}
       {isJellyfinDisconnected && !dismissedJellyfinAlert && (
         <div
           role="alert"
           data-testid="jellyfin-disconnected-alert-bar"
-          className="bg-rose-950/95 border-b-2 border-rose-500 px-4 py-2.5 text-xs font-mono text-rose-200 flex flex-wrap items-center justify-between gap-3 z-50 sticky top-0 shadow-2xl backdrop-blur-md"
+          className="bg-rose-950/95 border-b-2 border-rose-500 px-4 py-2.5 text-xs font-mono text-rose-200 flex flex-wrap items-center justify-between gap-3 z-40 sticky top-0 shadow-2xl backdrop-blur-md"
         >
           <div className="flex items-center gap-2.5 min-w-0 flex-1">
             <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0 animate-pulse" />
             <span className="leading-snug">
               <strong className="text-white uppercase tracking-wider">
-                🚨 JELLYFIN DISCONNECTED // SERVER UNREACHABLE:
+                🚨 NO MUSIC DRIVE CONNECTED // 0 AUDIO FILES FOUND:
               </strong>{' '}
-              Cannot connect to{' '}
-              <code className="text-rose-100 underline font-bold">
-                {jellyfinProv?.serverUrl || 'media server'}
-              </code>
-              .{' '}
+              Brokeify has zero built-in tracks and could not find any audio
+              files in <code className="text-rose-100 underline font-bold">/music</code>.{' '}
               <span className="text-amber-300 font-semibold">
-                In Docker, switch to your local LAN IP (e.g.
-                http://192.168.1.175:8096) to avoid NAT loopback timeouts!
+                Mount your hard drive or NAS share in Docker Compose or set your
+                folder path in Settings!
               </span>
             </span>
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => setIsOnboardingOpen(true)}
+              data-testid="alert-open-drive-setup-btn"
+              className="rounded-lg bg-[#00ff66] hover:bg-emerald-400 text-zinc-950 font-bold px-3 py-1 text-xs transition-colors whitespace-nowrap min-h-[30px]"
+            >
+              Drive &amp; Docker Compose Setup →
+            </button>
             <button
               type="button"
               onClick={() => {
@@ -1808,7 +1762,7 @@ export default function App() {
               }}
               className="rounded-lg bg-rose-500 hover:bg-rose-400 text-zinc-950 font-bold px-3 py-1 text-xs transition-colors whitespace-nowrap min-h-[30px]"
             >
-              Fix in Settings ⚙️
+              Open Settings ⚙️
             </button>
             <button
               type="button"
@@ -1944,8 +1898,6 @@ export default function App() {
 
       {/* Main Content Container — Fluid up to 1920px so 32" & 72" TVs, Chromecasts, Laptops, Car Displays & Phones all look crisp */}
       <main className="relative z-10 flex-1 w-full max-w-[1920px] mx-auto px-3 sm:px-6 xl:px-10 pt-5 space-y-6">
-        {/* Prominent Mobile Pixel / Android In-App Install Prompt Banner */}
-        <MobilePixelInstallBanner />
 
         {/* Cross-Device Playback Handoff Banner ("Pause on Phone -> Press Play on Chromecast / TV and Keep Listening") */}
         {remotePlaybackSession?.track &&
@@ -3169,7 +3121,8 @@ export default function App() {
                             </div>
 
                             <div className="flex items-center gap-2 shrink-0">
-                              {track.source === 'jellyfin' && (
+                              {(track.source === 'built-in' ||
+                                track.source === 'jellyfin') && (
                                 <>
                                   {confirmDeleteTrackId === track.id ? (
                                     <div className="inline-flex items-center gap-1 rounded-xl border border-rose-500/60 bg-rose-950/60 px-2 py-1">
@@ -3203,7 +3156,7 @@ export default function App() {
                                         setConfirmDeleteTrackId(track.id)
                                       }
                                       data-testid={`delete-jellyfin-track-${track.id}`}
-                                      title="Permanently delete duplicate track from Jellyfin server hard drive (DELETE /api/jellyfin/items/:id)"
+                                      title="Permanently delete track from server hard drive"
                                       className="inline-flex items-center justify-center rounded-xl border border-zinc-800 bg-zinc-950 hover:border-rose-500/50 hover:text-rose-400 p-2 text-zinc-500 transition-colors min-h-[36px] min-w-[36px]"
                                     >
                                       <Trash2 className="w-3.5 h-3.5" />

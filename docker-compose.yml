@@ -1,33 +1,21 @@
 services:
   brokeify:
-    # OPTION A (Fastest with 1-click Dockge Update): Pull prebuilt image from GitHub Container Registry
-    # image: ghcr.io/mr-nickey/brokeify:latest
-
-    # OPTION B: Build straight from your GitHub repository branch (Use "Deploy" in Dockge to rebuild)
     build: https://github.com/Mr-Nickey/brokeify.git#main
     container_name: brokeify
     restart: unless-stopped
-    # Port 3487 both inside and outside the container so it never collides with
-    # Port 3000 (Open WebUI, Grafana, UptimeKuma), 5001 (Dockge), 5030 (slskd), or 8096 (Jellyfin)
     ports:
       - "3487:3487"
     extra_hosts:
-      # Allows brokeify to reach host services via host.docker.internal or LAN IP
       - "host.docker.internal:host-gateway"
     environment:
       - NODE_ENV=production
       - PORT=3487
-      # Homelab Tip: Use your local LAN IP (e.g. http://192.168.1.175:8096)
-      # or http://host.docker.internal:8096 instead of an external HTTPS domain
-      # to prevent NAT loopback / timeout inside Docker!
-      - JELLYFIN_URL=http://192.168.1.175:8096
-      # For slskd, use your host LAN IP or host.docker.internal if on separate docker stacks:
-      - SLSKD_URL=http://192.168.1.175:5030
+      - BROKEIFY_DATA_DIR=/data
+      - BROKEIFY_MUSIC_DIR=/music
+      # Optional downloader & scrobbler integrations (can also be configured in the Web UI Settings):
+      # - SLSKD_URL=http://192.168.1.175:5030
       # - SLSKD_API_KEY=your_key_here
       # - LISTENBRAINZ_USER=your_user_here
     volumes:
-      - ./data:/app/data
-      - ./downloads:/app/downloads
-      # Optional: map your media folder directly so Brokeify can write downloads straight into Jellyfin
-      # - D:/Message:/music
-
+      - ./data:/data
+      - /path/to/your/music:/music:rw
