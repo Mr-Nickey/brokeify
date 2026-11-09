@@ -1,7 +1,8 @@
 # ==============================================================================
-# STAGE 1: Builder (Compiles Vite React SPA -> dist/ & Standalone server.js)
+# STAGE 1: Builder (Debian glibc for Vite 8 Rolldown & Tailwind Oxide build tools)
+#          This stage is discarded after compiling dist/ and server.js.
 # ==============================================================================
-FROM node:20-alpine AS builder
+FROM node:20-bookworm-slim AS builder
 
 WORKDIR /build
 
@@ -12,7 +13,8 @@ COPY . .
 RUN npm run build
 
 # ==============================================================================
-# STAGE 2: Ultra-Lean Production Runtime (Zero node_modules, Zero C++ Addons)
+# STAGE 2: Ultra-Lean Production Runtime (~80 MB total, < 3.5 MB app payload)
+#          Zero node_modules, zero C++ native .node addons (no exit code 139).
 # ==============================================================================
 FROM node:20-alpine AS runner
 
@@ -26,7 +28,7 @@ WORKDIR /app
 # Install only ffmpeg (for EBU R128 LUFS audio normalization) and ca-certificates
 RUN apk add --no-cache ffmpeg ca-certificates
 
-# Copy only the compiled production artifacts (< 2 MB total!)
+# Copy only the compiled production artifacts (< 3.5 MB total, no node_modules!)
 COPY --from=builder /build/dist ./dist
 COPY --from=builder /build/server.js ./server.js
 COPY --from=builder /build/version.json ./version.json

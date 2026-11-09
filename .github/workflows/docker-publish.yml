@@ -2,9 +2,13 @@ name: Build and Publish Brokeify Docker Image
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
     tags: [ 'v*.*.*' ]
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
@@ -52,5 +56,3 @@ jobs:
           build-args: |
             GIT_COMMIT_SHA=${{ github.sha }}
             BUILD_TIMESTAMP=${{ github.event.head_commit.timestamp }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max

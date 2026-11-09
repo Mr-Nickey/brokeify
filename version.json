@@ -2,14 +2,14 @@
   "version": "0.1.2",
   "channel": "beta",
   "displayVersion": "v0.1.2-beta",
-  "codename": "Standalone SQLite Beta Deck",
+  "codename": "Standalone Native Engine",
   "repository": "Mr-Nickey/brokeify",
   "branch": "main",
   "releasedAt": "2026-11-09",
   "changelog": [
-    "v0.1.2-beta: Standalone SQLite music server (/data/brokeify.db), Chokidar /music drive & NAS watcher, and EBU R128 -14 LUFS audio normalizer on Port 3487",
+    "v0.1.2-beta: Pure-TS Embedded Database Engine (/data/brokeify.db) with zero native C++ addons (eliminates exit code 139 SIGSEGV)",
+    "Multi-stage Docker image (~80 MB total, 3.2 MB app bundle) with Chokidar /music drive & NAS watcher and EBU R128 -14 LUFS normalizer on Port 3487",
     "Added Connect Android App section with high-contrast QR code, temporary connection token, Copy Server URL button, and link to github.com/Mr-Nickey/brokeify-android",
-    "Added Docker Compose & NAS Drive Setup Guide overlay when no audio files are detected in /music",
-    "Added HTTP 206 Partial Content byte-range streaming (/api/stream/:trackId) and disk-cached cover art (/api/covers/:albumId)"
+    "Added Docker Compose & NAS Drive Setup Guide overlay when no audio files are detected in /music"
   ]
 }
