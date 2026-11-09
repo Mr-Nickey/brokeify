@@ -1,5 +1,8 @@
 node_modules
 dist
+server.js
+public/assets/aistudio
+.aistudio
 .git
 .env
 data

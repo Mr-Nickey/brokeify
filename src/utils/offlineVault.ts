@@ -1,6 +1,5 @@
 import type { Track } from '../types/music';
 import { buildJellyfinStreamCandidates } from './musicLogic';
-import { synthesizeWavBlob } from './synthWavGenerator';
 
 const DB_NAME = 'brokeify-offline-vault';
 const DB_VERSION = 1;
@@ -202,21 +201,8 @@ export async function preloadTrackToVault(track: Track): Promise<Blob | null> {
   const existing = await getCachedTrackBlob(track.id);
   if (existing) return existing;
 
-  const defaultRecipe = track.synthRecipe || {
-    bpm: 118,
-    rootHz: 110,
-    scaleRatios: [1, 1.2, 1.33, 1.5, 1.6],
-    progression: [1, 0.8, 0.9, 1.125],
-    bassPattern: [1, 1, 1.5, 1],
-    padWave: 'sawtooth' as const,
-    leadWave: 'triangle' as const,
-    driveAmount: 1.2,
-  };
-
   if (track.streamUrl.startsWith('synth://')) {
-    const blob = synthesizeWavBlob(track.id, defaultRecipe, 24);
-    await saveTrackBlobToVault(track, blob);
-    return blob;
+    return null;
   }
 
   let savedToken = '';

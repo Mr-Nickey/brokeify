@@ -28,6 +28,15 @@ import {
   inspectMusicDrive,
   setMusicDirectory,
   db,
+  getLibraryCounts,
+  upsertPlaylistWithTracks,
+  deletePlaylistById,
+  getPlaylistTrackIds,
+  setPlaylistTrackIds,
+  deleteTrackFromDb,
+  incrementTrackPlayCount,
+  recordScrobbleInDb,
+  getTrackWithArtistAlbum,
   scannerState,
   startChokidarMusicWatcher,
   runFullLibraryScan,
@@ -502,28 +511,7 @@ function normalizeText(str = '') {
 }
 
 function getLocalLibraryStats() {
-  const totalTracks = (
-    db.prepare(`SELECT COUNT(*) as c FROM tracks`).get() as { c: number }
-  ).c;
-  const totalAlbums = (
-    db.prepare(`SELECT COUNT(*) as c FROM albums`).get() as { c: number }
-  ).c;
-  const totalArtists = (
-    db.prepare(`SELECT COUNT(*) as c FROM artists`).get() as { c: number }
-  ).c;
-  const totalPlaylists = (
-    db.prepare(`SELECT COUNT(*) as c FROM playlists`).get() as { c: number }
-  ).c;
-  const totalScrobbles = (
-    db.prepare(`SELECT COUNT(*) as c FROM scrobbles`).get() as { c: number }
-  ).c;
-  return {
-    totalTracks,
-    totalAlbums,
-    totalArtists,
-    totalPlaylists,
-    totalScrobbles,
-  };
+  return getLibraryCounts();
 }
 
 function getSqliteAudioFingerprints() {
@@ -1059,43 +1047,24 @@ app.post('/api/playlists', (req, res) => {
       String(req.body?.id || '').trim() ||
       `pl-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const description = String(
-      req.body?.description || 'Custom Brokeify SQLite Playlist'
+      req.body?.description || 'Custom Brokeify Playlist'
     ).trim();
-    const isSmart = req.body?.isSmart ? 1 : 0;
+    const isSmart = Boolean(req.body?.isSmart);
     const smartRulesJson = req.body?.smartRules
       ? JSON.stringify(req.body.smartRules)
       : null;
     const trackIds = Array.isArray(req.body?.trackIds)
       ? req.body.trackIds.map(String)
       : [];
-    const now = new Date().toISOString();
 
-    db.prepare(
-      `INSERT INTO playlists (id, name, description, cover_path, is_smart, smart_rules_json, created_at, updated_at)
-       VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         name = excluded.name,
-         description = excluded.description,
-         is_smart = excluded.is_smart,
-         smart_rules_json = excluded.smart_rules_json,
-         updated_at = excluded.updated_at`
-    ).run(id, name, description, isSmart, smartRulesJson, now, now);
-
-    const syncTracksTx = db.transaction((ids: string[]) => {
-      db.prepare(`DELETE FROM playlist_tracks WHERE playlist_id = ?`).run(id);
-      const stmt = db.prepare(
-        `INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)`
-      );
-      ids.forEach((tid, idx) => {
-        const exists = db
-          .prepare(`SELECT 1 FROM tracks WHERE id = ?`)
-          .get(tid);
-        if (exists) {
-          stmt.run(id, tid, idx);
-        }
-      });
+    upsertPlaylistWithTracks({
+      id,
+      name,
+      description,
+      isSmart,
+      smartRulesJson,
+      trackIds,
     });
-    syncTracksTx(trackIds);
 
     const created = queryPlaylists().find((p) => p.id === id);
     res.json({
@@ -1114,9 +1083,7 @@ app.post('/api/playlists', (req, res) => {
 app.put('/api/playlists/:id', (req, res) => {
   try {
     const id = String(req.params.id || '').trim();
-    const existing = db
-      .prepare(`SELECT * FROM playlists WHERE id = ?`)
-      .get(id) as Record<string, any> | undefined;
+    const existing = db.playlists.get(id);
     if (!existing) {
       return res.status(404).json({ ok: false, error: 'Playlist not found.' });
     }
@@ -1128,31 +1095,17 @@ app.put('/api/playlists/:id', (req, res) => {
     const description =
       req.body?.description !== undefined
         ? String(req.body.description).trim()
-        : existing.description;
-    const now = new Date().toISOString();
+        : existing.description || '';
+    const trackIds = Array.isArray(req.body?.trackIds)
+      ? req.body.trackIds.map(String)
+      : undefined;
 
-    db.prepare(
-      `UPDATE playlists SET name = ?, description = ?, updated_at = ? WHERE id = ?`
-    ).run(name, description, now, id);
-
-    if (Array.isArray(req.body?.trackIds)) {
-      const trackIds = req.body.trackIds.map(String);
-      const syncTracksTx = db.transaction((ids: string[]) => {
-        db.prepare(`DELETE FROM playlist_tracks WHERE playlist_id = ?`).run(id);
-        const stmt = db.prepare(
-          `INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)`
-        );
-        ids.forEach((tid, idx) => {
-          const exists = db
-            .prepare(`SELECT 1 FROM tracks WHERE id = ?`)
-            .get(tid);
-          if (exists) {
-            stmt.run(id, tid, idx);
-          }
-        });
-      });
-      syncTracksTx(trackIds);
-    }
+    upsertPlaylistWithTracks({
+      id,
+      name,
+      description,
+      trackIds,
+    });
 
     const updated = queryPlaylists().find((p) => p.id === id);
     res.json({
@@ -1171,8 +1124,7 @@ app.put('/api/playlists/:id', (req, res) => {
 app.delete('/api/playlists/:id', (req, res) => {
   try {
     const id = String(req.params.id || '').trim();
-    db.prepare(`DELETE FROM playlist_tracks WHERE playlist_id = ?`).run(id);
-    db.prepare(`DELETE FROM playlists WHERE id = ?`).run(id);
+    deletePlaylistById(id);
     res.json({
       ok: true,
       deletedId: id,
@@ -1199,17 +1151,14 @@ app.get('/api/cover/:type/:id', (req, res) => {
 });
 
 // ============================================================================
-// 4. TRACK DISK CLEANUP & MAINTAINERR DUPLICATE JANITOR (SQLite + /music)
+// 4. TRACK DISK CLEANUP & MAINTAINERR DUPLICATE JANITOR
 // ============================================================================
 
 function deleteTrackFromDiskAndDb(rawId: string): boolean {
   const cleanId = String(rawId || '').trim();
   if (!cleanId) return false;
 
-  const row = db
-    .prepare(`SELECT id, file_path FROM tracks WHERE id = ?`)
-    .get(cleanId) as { id: string; file_path: string } | undefined;
-
+  const row = deleteTrackFromDb(cleanId);
   if (!row) return false;
 
   try {
@@ -1220,8 +1169,6 @@ function deleteTrackFromDiskAndDb(rawId: string): boolean {
     // ignore unlink error if read-only
   }
 
-  removeAudioFileFromIndex(row.file_path);
-  db.prepare(`DELETE FROM tracks WHERE id = ?`).run(cleanId);
   return true;
 }
 
@@ -1231,12 +1178,12 @@ app.delete('/api/library/tracks/:id', (req, res) => {
   if (!ok) {
     return res
       .status(404)
-      .json({ ok: false, error: 'Track not found in SQLite database.' });
+      .json({ ok: false, error: 'Track not found in database.' });
   }
   return res.json({
     ok: true,
     deletedId: id,
-    message: `Permanently deleted track ${id} from /music and SQLite index.`,
+    message: `Permanently deleted track ${id} from /music and database index.`,
   });
 });
 
@@ -1262,53 +1209,7 @@ app.post('/api/library/tracks/bulk-delete', (req, res) => {
     ok: true,
     deletedIds,
     failedIds,
-    message: `Deleted ${deletedIds.length} track(s) from /music disk & SQLite database.`,
-  });
-});
-
-// Backward-compatible aliases so existing frontend Maintainerr cleanup buttons work seamlessly
-app.delete('/api/jellyfin/items/:id', (req, res) => {
-  const id = String(req.params.id || '').trim();
-  const ok = deleteTrackFromDiskAndDb(id);
-  return res.json({
-    ok,
-    deletedId: id,
-    message: ok
-      ? `Deleted track ${id} from local /music storage.`
-      : 'Track not found in local SQLite database.',
-  });
-});
-
-app.post('/api/jellyfin/items/bulk-delete', (req, res) => {
-  const ids = Array.isArray(req.body?.ids)
-    ? req.body.ids
-    : Array.isArray(req.body?.itemIds)
-      ? req.body.itemIds
-      : [];
-  const deletedIds: string[] = [];
-  const failedIds: string[] = [];
-  for (const rawId of ids) {
-    if (deleteTrackFromDiskAndDb(String(rawId))) {
-      deletedIds.push(String(rawId));
-    } else {
-      failedIds.push(String(rawId));
-    }
-  }
-  return res.json({
-    ok: true,
-    deletedIds,
-    failedIds,
-    message: `Deleted ${deletedIds.length} track(s) from local /music storage.`,
-  });
-});
-
-app.post('/api/jellyfin/refresh', async (_req, res) => {
-  const scanResult = await runFullLibraryScan();
-  return res.json({
-    ok: true,
-    status: 200,
-    ...scanResult,
-    message: `Rescanned /music directory (${scanResult.indexedTracks} tracks indexed).`,
+    message: `Deleted ${deletedIds.length} track(s) from /music disk & database.`,
   });
 });
 
@@ -1337,45 +1238,18 @@ app.post('/api/config', (req, res) => {
     const incoming = req.body?.config || req.body || {};
     const saved = writeServerConfig(incoming);
 
-    // Sync any incoming custom playlists into the SQLite playlists table as well
     if (Array.isArray(incoming.playlists)) {
-      const now = new Date().toISOString();
       for (const pl of incoming.playlists) {
         if (!pl || !pl.id || !pl.name) continue;
-        db.prepare(
-          `INSERT INTO playlists (id, name, description, cover_path, is_smart, smart_rules_json, created_at, updated_at)
-           VALUES (?, ?, ?, NULL, 0, NULL, ?, ?)
-           ON CONFLICT(id) DO UPDATE SET
-             name = excluded.name,
-             description = excluded.description,
-             updated_at = excluded.updated_at`
-        ).run(
-          String(pl.id),
-          String(pl.name),
-          String(pl.description || ''),
-          String(pl.createdAt || now),
-          now
-        );
-
-        if (Array.isArray(pl.trackIds)) {
-          const syncTx = db.transaction((tids: string[]) => {
-            db.prepare(
-              `DELETE FROM playlist_tracks WHERE playlist_id = ?`
-            ).run(String(pl.id));
-            const ins = db.prepare(
-              `INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)`
-            );
-            tids.forEach((tid, idx) => {
-              const exists = db
-                .prepare(`SELECT 1 FROM tracks WHERE id = ?`)
-                .get(String(tid));
-              if (exists) {
-                ins.run(String(pl.id), String(tid), idx);
-              }
-            });
-          });
-          syncTx(pl.trackIds);
-        }
+        upsertPlaylistWithTracks({
+          id: String(pl.id),
+          name: String(pl.name),
+          description: String(pl.description || ''),
+          trackIds: Array.isArray(pl.trackIds)
+            ? pl.trackIds.map(String)
+            : undefined,
+          createdAt: pl.createdAt ? String(pl.createdAt) : undefined,
+        });
       }
     }
 
@@ -1425,19 +1299,9 @@ async function handleScrobbleSubmission(req, res) {
     const nowIso = new Date().toISOString();
     const unixTs = Math.floor(Date.now() / 1000);
 
-    // 1. Update local SQLite play_count, last_played_at, and scrobbles table
     let resolvedTrack = track;
     if (trackId) {
-      const dbTrack = db
-        .prepare(
-          `SELECT t.id, t.title, t.duration_ms, COALESCE(ar.name, 'Unknown Artist') AS artist, COALESCE(al.title, 'Singles') AS album
-           FROM tracks t
-           LEFT JOIN artists ar ON t.artist_id = ar.id
-           LEFT JOIN albums al ON t.album_id = al.id
-           WHERE t.id = ?`
-        )
-        .get(trackId) as any;
-
+      const dbTrack = getTrackWithArtistAlbum(trackId);
       if (dbTrack) {
         resolvedTrack = {
           id: dbTrack.id,
@@ -1448,9 +1312,7 @@ async function handleScrobbleSubmission(req, res) {
             track.duration || Math.round((dbTrack.duration_ms || 180000) / 1000),
         };
         if (listenType === 'single') {
-          db.prepare(
-            `UPDATE tracks SET play_count = COALESCE(play_count, 0) + 1, last_played_at = ? WHERE id = ?`
-          ).run(nowIso, dbTrack.id);
+          incrementTrackPlayCount(dbTrack.id, nowIso);
         }
       }
     }
@@ -1466,7 +1328,7 @@ async function handleScrobbleSubmission(req, res) {
         release_name: resolvedTrack.album || undefined,
         additional_info: {
           submission_client: 'Brokeify Standalone Server',
-          submission_client_version: '3.0.0',
+          submission_client_version: '0.1.2-beta',
           music_service: 'brokeify-standalone',
           duration_ms: resolvedTrack.duration
             ? Math.round(Number(resolvedTrack.duration) * 1000)
@@ -1491,7 +1353,7 @@ async function handleScrobbleSubmission(req, res) {
               'Content-Type': 'application/json',
               Authorization: `Token ${token}`,
               'User-Agent':
-                'BrokeifyStandalone/3.0 (https://github.com/Mr-Nickey/brokeify)',
+                'BrokeifyStandalone/0.1.2-beta (https://github.com/Mr-Nickey/brokeify)',
             },
             body: JSON.stringify({
               listen_type: listenType,
@@ -1506,19 +1368,9 @@ async function handleScrobbleSubmission(req, res) {
       }
     }
 
-    // 3. Record scrobble row in SQLite `scrobbles` table
+    // 3. Record scrobble row in database
     if (listenType === 'single' && trackId) {
-      const exists = db
-        .prepare(`SELECT 1 FROM tracks WHERE id = ?`)
-        .get(trackId);
-      if (exists) {
-        const scrobbleId = `scr-${Date.now()}-${Math.random()
-          .toString(36)
-          .slice(2, 6)}`;
-        db.prepare(
-          `INSERT INTO scrobbles (id, track_id, timestamp, synced_listenbrainz) VALUES (?, ?, ?, ?)`
-        ).run(scrobbleId, trackId, unixTs, syncedToLb);
-      }
+      recordScrobbleInDb(trackId, unixTs, Boolean(syncedToLb));
     }
 
     return res.json({
@@ -3596,46 +3448,11 @@ async function resolvePicardAndAiMetadata(rawArtist, rawTitle, rawAlbum = '') {
   let source = 'musicbrainz';
 
   const cfg = readServerConfig();
-  if (
-    cfg.picardConfig?.useAiMetadataCleanup !== false &&
-    process.env.GEMINI_API_KEY
-  ) {
-    try {
-      const { GoogleGenAI, Type } = await import('@google/genai');
-      const ai = new GoogleGenAI({
-        apiKey: process.env.GEMINI_API_KEY,
-        httpOptions: {
-          headers: { 'User-Agent': 'aistudio-build' },
-        },
-      });
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents: `Clean and standardize this music track metadata like MusicBrainz Picard. Input artist="${cleanArtist}", title="${cleanTitle}", album="${cleanAlbum}". Strip junk like "(Official Video)", "[HD]", "320kbps", track numbers in title, etc.`,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              artist: { type: Type.STRING },
-              title: { type: Type.STRING },
-              album: { type: Type.STRING },
-              year: { type: Type.STRING },
-              trackNumber: { type: Type.STRING },
-              genre: { type: Type.STRING },
-            },
-          },
-        },
-      });
-      const parsedAi = JSON.parse((response.text || '{}').trim());
-      if (parsedAi.title) cleanTitle = parsedAi.title;
-      if (parsedAi.artist) cleanArtist = parsedAi.artist;
-      if (parsedAi.album && !cleanAlbum) cleanAlbum = parsedAi.album;
-      if (parsedAi.year) year = parsedAi.year;
-      if (parsedAi.trackNumber) trackNumber = parsedAi.trackNumber;
-      if (parsedAi.genre) genre = parsedAi.genre;
-      source = 'musicbrainz+ai';
-    } catch {}
-  }
+  cleanTitle = cleanTitle
+    .replace(/\s*\((official\s*(music\s*)?video|official\s*audio|lyric\s*video|hd|4k|hq|320\s*kbps)\)/gi, '')
+    .replace(/\s*\[(official\s*(music\s*)?video|official\s*audio|lyric\s*video|hd|4k|hq|320\s*kbps)\]/gi, '')
+    .replace(/^\d{1,3}\s*[-._]\s*/, '')
+    .trim();
 
   try {
     const q = `recording:"${cleanTitle}"${
@@ -3828,16 +3645,11 @@ async function runSingleAutopilotRule(ruleId) {
     }
   }
 
-  // Update SQLite playlist_tracks for the linked playlist
   let addedCount = 0;
   if (rule.playlistId && matchedTrackIds.length > 0) {
-    const existingRows = db
-      .prepare(
-        `SELECT track_id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position ASC`
-      )
-      .all(rule.playlistId) as Array<{ track_id: string }>;
-    const existingSet = new Set(existingRows.map((r) => r.track_id));
-    const combinedIds = existingRows.map((r) => r.track_id);
+    const existingIds = getPlaylistTrackIds(rule.playlistId);
+    const existingSet = new Set(existingIds);
+    const combinedIds = [...existingIds];
     for (const tid of matchedTrackIds) {
       if (!existingSet.has(tid)) {
         existingSet.add(tid);
@@ -3845,16 +3657,7 @@ async function runSingleAutopilotRule(ruleId) {
         addedCount += 1;
       }
     }
-    const tx = db.transaction((ids: string[]) => {
-      db.prepare(`DELETE FROM playlist_tracks WHERE playlist_id = ?`).run(
-        rule.playlistId
-      );
-      const ins = db.prepare(
-        `INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)`
-      );
-      ids.forEach((tid, idx) => ins.run(rule.playlistId, tid, idx));
-    });
-    tx(combinedIds);
+    setPlaylistTrackIds(rule.playlistId, combinedIds);
   }
 
   let queuedCount = 0;
@@ -4019,10 +3822,7 @@ app.post('/api/stats/record-play', (req, res) => {
     }
 
     const nowIso = new Date().toISOString();
-    // Update SQLite tracks table play_count & last_played_at
-    db.prepare(
-      `UPDATE tracks SET play_count = COALESCE(play_count, 0) + 1, last_played_at = ? WHERE id = ?`
-    ).run(nowIso, String(rawTrack.id));
+    incrementTrackPlayCount(String(rawTrack.id), nowIso);
 
     const cfg = readServerConfig();
     const stats = { ...(cfg.playStats || {}) };
@@ -4430,18 +4230,27 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(
       `[Brokeify] Full-Stack Server listening on http://0.0.0.0:${PORT}`
     );
     pushServerLog(
       'success',
       'system',
-      `[Brokeify] Full-Stack Server listening on http://0.0.0.0:${PORT} (SQLite: ${DB_PATH} | Music: ${MUSIC_DIR})`
+      `[Brokeify] Full-Stack Server listening on http://0.0.0.0:${PORT} (DB: ${DB_PATH} | Music: ${MUSIC_DIR})`
     );
     startChokidarMusicWatcher();
   });
+
+  server.on('error', (err) => {
+    console.error(`[Brokeify] Server listen error on port ${PORT}:`, err);
+  });
+
+  // Keep event loop alive indefinitely in container environments
+  setInterval(() => {}, 60000);
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('[Brokeify] Fatal error starting server:', err);
+});
 

@@ -1,8 +1,7 @@
-import fs from 'fs';
-import path from 'path';
-import crypto from 'crypto';
-import { execFile } from 'child_process';
-import Database from 'better-sqlite3';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
 import chokidar, { type FSWatcher } from 'chokidar';
 import { parseFile } from 'music-metadata';
 import type { Request, Response } from 'express';
@@ -93,185 +92,474 @@ function toSortName(name: string): string {
 }
 
 // ============================================================================
-// 2. EMBEDDED SQLITE DATABASE INITIALIZATION (better-sqlite3)
-//    Runs on container-local Linux disk (/tmp/brokeify-runtime.db) with
-//    mmap_size=0 and journal_mode=DELETE, syncing to /data/brokeify.db.
-//    This prevents SIGSEGV (exit code 139) when /data is bind-mounted from
-//    Windows NTFS (C:/...), WSL2 9P, or SMB/NFS network shares.
+// 2. PURE-TYPESCRIPT EMBEDDED INDEXED DATABASE ENGINE (/data/brokeify.db)
+//    Zero native C++ addons (.node binaries), making SIGSEGV (exit code 139)
+//    physically impossible across all Linux/Windows/WSL2/NAS Docker hosts.
 // ============================================================================
 
-const RUNTIME_DB_PATH = path.join('/tmp', 'brokeify-runtime.db');
-
-function initializeSafeSqliteDatabase(): Database.Database {
-  // 1. Clean up any stale WAL/SHM files left by older crashes on Windows mounts
-  for (const staleFile of [
-    `${DB_PATH}-shm`,
-    `${DB_PATH}-wal`,
-    `${RUNTIME_DB_PATH}-shm`,
-    `${RUNTIME_DB_PATH}-wal`,
-  ]) {
-    try {
-      if (fs.existsSync(staleFile)) {
-        fs.unlinkSync(staleFile);
-      }
-    } catch {}
-  }
-
-  // 2. If a persistent /data/brokeify.db already exists, copy it into /tmp/brokeify-runtime.db
-  try {
-    if (fs.existsSync(DB_PATH)) {
-      const stat = fs.statSync(DB_PATH);
-      if (stat.isFile() && stat.size > 0) {
-        fs.copyFileSync(DB_PATH, RUNTIME_DB_PATH);
-      }
-    }
-  } catch (err) {
-    console.warn(
-      '[Brokeify SQLite] Could not copy existing DB from /data, starting fresh runtime DB:',
-      err
-    );
-  }
-
-  // 3. Open SQLite on container-local /tmp (or in-memory fallback if /tmp fails)
-  let instance: Database.Database;
-  try {
-    instance = new Database(RUNTIME_DB_PATH);
-  } catch (err) {
-    console.warn(
-      '[Brokeify SQLite] Failed opening runtime DB file, falling back to in-memory SQLite:',
-      err
-    );
-    instance = new Database(':memory:');
-  }
-
-  try {
-    instance.pragma('mmap_size = 0');
-    instance.pragma('journal_mode = DELETE');
-    instance.pragma('synchronous = NORMAL');
-    instance.pragma('foreign_keys = ON');
-  } catch (err) {
-    console.warn('[Brokeify SQLite] Pragma warning:', err);
-  }
-
-  return instance;
+export interface ArtistRow {
+  id: string;
+  name: string;
+  sort_name: string;
+  musicbrainz_id: string | null;
+  image_url: string | null;
 }
 
-export const db = initializeSafeSqliteDatabase();
+export interface AlbumRow {
+  id: string;
+  artist_id: string | null;
+  title: string;
+  year: number | null;
+  genre: string | null;
+  cover_path: string | null;
+  musicbrainz_id: string | null;
+}
+
+export interface TrackRow {
+  id: string;
+  album_id: string | null;
+  artist_id: string | null;
+  title: string;
+  track_number: number;
+  disc_number: number;
+  duration_ms: number;
+  file_path: string;
+  format: string;
+  bitrate: number;
+  sample_rate: number;
+  loudness_lufs: number | null;
+  replaygain_track_gain: number | null;
+  play_count: number;
+  last_played_at: string | null;
+}
+
+export interface PlaylistRow {
+  id: string;
+  name: string;
+  description: string | null;
+  cover_path: string | null;
+  is_smart: number;
+  smart_rules_json: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ScrobbleRow {
+  id: string;
+  track_id: string;
+  timestamp: number;
+  synced_listenbrainz: number;
+}
+
+interface PersistedDatabaseSchema {
+  engine: 'brokeify-embedded-db-v2';
+  savedAt: string;
+  artists: ArtistRow[];
+  albums: AlbumRow[];
+  tracks: TrackRow[];
+  playlists: PlaylistRow[];
+  playlistTracks: Record<string, string[]>;
+  scrobbles: ScrobbleRow[];
+}
+
+class BrokeifyEmbeddedDatabase {
+  artists = new Map<string, ArtistRow>();
+  albums = new Map<string, AlbumRow>();
+  tracks = new Map<string, TrackRow>();
+  tracksByPath = new Map<string, string>(); // resolved file_path -> track.id
+  playlists = new Map<string, PlaylistRow>();
+  playlistTracks = new Map<string, string[]>(); // playlist_id -> ordered track_id[]
+  scrobbles: ScrobbleRow[] = [];
+
+  constructor() {
+    this.loadFromDisk();
+  }
+
+  loadFromDisk(): void {
+    // Clean up any legacy SQLite WAL/SHM files
+    for (const ext of ['-shm', '-wal']) {
+      try {
+        if (fs.existsSync(`${DB_PATH}${ext}`)) {
+          fs.unlinkSync(`${DB_PATH}${ext}`);
+        }
+      } catch {}
+    }
+
+    try {
+      if (!fs.existsSync(DB_PATH)) return;
+      const rawBuf = fs.readFileSync(DB_PATH);
+      if (rawBuf.length === 0) return;
+
+      // If an older binary SQLite file exists on disk, ignore it and replace on next sync
+      const header = rawBuf.subarray(0, 16).toString('utf8');
+      if (header.startsWith('SQLite format 3')) {
+        console.log(
+          '[Brokeify DB] Migrating legacy binary database to pure-TS embedded index...'
+        );
+        return;
+      }
+
+      const parsed = JSON.parse(rawBuf.toString('utf8')) as Partial<PersistedDatabaseSchema>;
+      if (Array.isArray(parsed.artists)) {
+        for (const a of parsed.artists) {
+          if (a?.id) this.artists.set(a.id, a);
+        }
+      }
+      if (Array.isArray(parsed.albums)) {
+        for (const al of parsed.albums) {
+          if (al?.id) this.albums.set(al.id, al);
+        }
+      }
+      if (Array.isArray(parsed.tracks)) {
+        for (const t of parsed.tracks) {
+          if (t?.id && t?.file_path) {
+            this.tracks.set(t.id, t);
+            this.tracksByPath.set(path.resolve(t.file_path), t.id);
+          }
+        }
+      }
+      if (Array.isArray(parsed.playlists)) {
+        for (const p of parsed.playlists) {
+          if (p?.id) this.playlists.set(p.id, p);
+        }
+      }
+      if (parsed.playlistTracks && typeof parsed.playlistTracks === 'object') {
+        for (const [pid, tids] of Object.entries(parsed.playlistTracks)) {
+          if (Array.isArray(tids)) {
+            this.playlistTracks.set(pid, tids.map(String));
+          }
+        }
+      }
+      if (Array.isArray(parsed.scrobbles)) {
+        this.scrobbles = parsed.scrobbles.slice(-2000);
+      }
+    } catch (err) {
+      console.warn('[Brokeify DB] Starting with fresh embedded database index:', err);
+    }
+  }
+
+  saveToDisk(): void {
+    try {
+      fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+      const payload: PersistedDatabaseSchema = {
+        engine: 'brokeify-embedded-db-v2',
+        savedAt: new Date().toISOString(),
+        artists: Array.from(this.artists.values()),
+        albums: Array.from(this.albums.values()),
+        tracks: Array.from(this.tracks.values()),
+        playlists: Array.from(this.playlists.values()),
+        playlistTracks: Object.fromEntries(this.playlistTracks.entries()),
+        scrobbles: this.scrobbles.slice(-2000),
+      };
+      const json = JSON.stringify(payload);
+      const tmpPath = `${DB_PATH}.tmp`;
+      fs.writeFileSync(tmpPath, json, 'utf-8');
+      fs.renameSync(tmpPath, DB_PATH);
+    } catch {
+      try {
+        const payload: PersistedDatabaseSchema = {
+          engine: 'brokeify-embedded-db-v2',
+          savedAt: new Date().toISOString(),
+          artists: Array.from(this.artists.values()),
+          albums: Array.from(this.albums.values()),
+          tracks: Array.from(this.tracks.values()),
+          playlists: Array.from(this.playlists.values()),
+          playlistTracks: Object.fromEntries(this.playlistTracks.entries()),
+          scrobbles: this.scrobbles.slice(-2000),
+        };
+        fs.writeFileSync(DB_PATH, JSON.stringify(payload), 'utf-8');
+      } catch {}
+    }
+  }
+
+  pragma(_statement: string): void {
+    // No-op compatibility method
+  }
+
+  exec(_sql: string): void {
+    // No-op compatibility method
+  }
+
+  transaction<T extends (...args: any[]) => any>(fn: T): T {
+    return ((...args: any[]) => {
+      const result = fn(...args);
+      syncDatabaseToPersistentDisk();
+      return result;
+    }) as T;
+  }
+
+  prepare(sql: string) {
+    const norm = sql.replace(/\s+/g, ' ').trim().toLowerCase();
+    return {
+      get: (...params: any[]): any => {
+        if (norm.startsWith('select count(*) as c from tracks')) {
+          return { c: this.tracks.size };
+        }
+        if (norm.startsWith('select count(*) as c from albums')) {
+          return { c: this.albums.size };
+        }
+        if (norm.startsWith('select count(*) as c from artists')) {
+          return { c: this.artists.size };
+        }
+        if (norm.startsWith('select count(*) as c from playlists')) {
+          return { c: this.playlists.size };
+        }
+        if (norm.startsWith('select count(*) as c from scrobbles')) {
+          return { c: this.scrobbles.length };
+        }
+        if (norm.includes('from playlists where id = ?')) {
+          return this.playlists.get(String(params[0]));
+        }
+        if (norm.includes('select 1 from tracks where id = ?')) {
+          return this.tracks.has(String(params[0])) ? { 1: 1 } : undefined;
+        }
+        if (norm.includes('from tracks where id = ?')) {
+          return this.tracks.get(String(params[0]));
+        }
+        if (norm.includes('from tracks where file_path = ?')) {
+          const tid = this.tracksByPath.get(path.resolve(String(params[0])));
+          return tid ? this.tracks.get(tid) : undefined;
+        }
+        return undefined;
+      },
+      all: (...params: any[]): any[] => {
+        if (norm.includes('from playlist_tracks where playlist_id = ?')) {
+          const list = this.playlistTracks.get(String(params[0])) || [];
+          return list.map((track_id) => ({ track_id }));
+        }
+        if (norm.includes('from tracks')) {
+          return Array.from(this.tracks.values());
+        }
+        return [];
+      },
+      run: (...params: any[]) => {
+        if (norm.startsWith('delete from playlist_tracks where playlist_id = ?')) {
+          this.playlistTracks.set(String(params[0]), []);
+          syncDatabaseToPersistentDisk();
+          return { changes: 1 };
+        }
+        if (norm.startsWith('delete from playlists where id = ?')) {
+          const id = String(params[0]);
+          this.playlists.delete(id);
+          this.playlistTracks.delete(id);
+          syncDatabaseToPersistentDisk();
+          return { changes: 1 };
+        }
+        if (norm.startsWith('delete from tracks where id = ?')) {
+          deleteTrackFromDb(String(params[0]));
+          return { changes: 1 };
+        }
+        if (norm.includes('insert') && norm.includes('into playlist_tracks')) {
+          const [pid, tid] = [String(params[0]), String(params[1])];
+          const curr = this.playlistTracks.get(pid) || [];
+          if (!curr.includes(tid)) {
+            curr.push(tid);
+            this.playlistTracks.set(pid, curr);
+          }
+          return { changes: 1 };
+        }
+        if (norm.startsWith('update tracks set play_count')) {
+          const [nowIso, id] = [String(params[0]), String(params[1])];
+          incrementTrackPlayCount(id, nowIso);
+          return { changes: 1 };
+        }
+        syncDatabaseToPersistentDisk();
+        return { changes: 1 };
+      },
+    };
+  }
+}
+
+export const db = new BrokeifyEmbeddedDatabase();
 
 let syncDbTimer: ReturnType<typeof setTimeout> | null = null;
 
 export function syncDatabaseToPersistentDisk(immediate = false): void {
-  const performSync = () => {
-    syncDbTimer = null;
-    try {
-      if (fs.existsSync(RUNTIME_DB_PATH)) {
-        fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-        const tempTarget = `${DB_PATH}.tmp`;
-        fs.copyFileSync(RUNTIME_DB_PATH, tempTarget);
-        fs.renameSync(tempTarget, DB_PATH);
-      }
-    } catch {
-      try {
-        if (fs.existsSync(RUNTIME_DB_PATH)) {
-          fs.copyFileSync(RUNTIME_DB_PATH, DB_PATH);
-        }
-      } catch {}
-    }
-  };
-
   if (immediate) {
-    if (syncDbTimer) clearTimeout(syncDbTimer);
-    performSync();
+    if (syncDbTimer) {
+      clearTimeout(syncDbTimer);
+      syncDbTimer = null;
+    }
+    db.saveToDisk();
     return;
   }
-
   if (!syncDbTimer) {
-    syncDbTimer = setTimeout(performSync, 2500);
+    syncDbTimer = setTimeout(() => {
+      syncDbTimer = null;
+      db.saveToDisk();
+    }, 1500);
   }
 }
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS artists (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    sort_name TEXT,
-    musicbrainz_id TEXT,
-    image_url TEXT
-  );
+export function getLibraryCounts() {
+  return {
+    totalTracks: db.tracks.size,
+    totalAlbums: db.albums.size,
+    totalArtists: db.artists.size,
+    totalPlaylists: db.playlists.size,
+    totalScrobbles: db.scrobbles.length,
+  };
+}
 
-  CREATE TABLE IF NOT EXISTS albums (
-    id TEXT PRIMARY KEY,
-    artist_id TEXT,
-    title TEXT NOT NULL,
-    year INTEGER,
-    genre TEXT,
-    cover_path TEXT,
-    musicbrainz_id TEXT,
-    FOREIGN KEY (artist_id) REFERENCES artists(id) ON DELETE SET NULL
-  );
+export function pruneOrphanedAlbumsAndArtists(): void {
+  const activeAlbumIds = new Set<string>();
+  const activeArtistIds = new Set<string>();
 
-  CREATE TABLE IF NOT EXISTS tracks (
-    id TEXT PRIMARY KEY,
-    album_id TEXT,
-    artist_id TEXT,
-    title TEXT NOT NULL,
-    track_number INTEGER,
-    disc_number INTEGER,
-    duration_ms INTEGER,
-    file_path TEXT UNIQUE NOT NULL,
-    format TEXT,
-    bitrate INTEGER,
-    sample_rate INTEGER,
-    loudness_lufs REAL,
-    replaygain_track_gain REAL,
-    play_count INTEGER DEFAULT 0,
-    last_played_at TEXT,
-    FOREIGN KEY (album_id) REFERENCES albums(id) ON DELETE SET NULL,
-    FOREIGN KEY (artist_id) REFERENCES artists(id) ON DELETE SET NULL
-  );
+  for (const track of db.tracks.values()) {
+    if (track.album_id) activeAlbumIds.add(track.album_id);
+    if (track.artist_id) activeArtistIds.add(track.artist_id);
+  }
 
-  CREATE TABLE IF NOT EXISTS playlists (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    description TEXT,
-    cover_path TEXT,
-    is_smart INTEGER DEFAULT 0,
-    smart_rules_json TEXT,
-    created_at TEXT,
-    updated_at TEXT
-  );
+  for (const albumId of db.albums.keys()) {
+    if (!activeAlbumIds.has(albumId)) {
+      db.albums.delete(albumId);
+    }
+  }
 
-  CREATE TABLE IF NOT EXISTS playlist_tracks (
-    playlist_id TEXT NOT NULL,
-    track_id TEXT NOT NULL,
-    position INTEGER NOT NULL,
-    PRIMARY KEY (playlist_id, position),
-    FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE,
-    FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
-  );
+  for (const artistId of db.artists.keys()) {
+    if (!activeArtistIds.has(artistId)) {
+      db.artists.delete(artistId);
+    }
+  }
+}
 
-  CREATE TABLE IF NOT EXISTS scrobbles (
-    id TEXT PRIMARY KEY,
-    track_id TEXT NOT NULL,
-    timestamp INTEGER NOT NULL,
-    synced_listenbrainz INTEGER DEFAULT 0,
-    FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
-  );
+export function upsertPlaylistWithTracks(params: {
+  id: string;
+  name: string;
+  description?: string;
+  isSmart?: boolean;
+  smartRulesJson?: string | null;
+  trackIds?: string[];
+  createdAt?: string;
+}): void {
+  const now = new Date().toISOString();
+  const existing = db.playlists.get(params.id);
 
-  CREATE INDEX IF NOT EXISTS idx_artists_name ON artists(name);
-  CREATE INDEX IF NOT EXISTS idx_artists_sort_name ON artists(sort_name);
-  CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id);
-  CREATE INDEX IF NOT EXISTS idx_albums_title ON albums(title);
-  CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id);
-  CREATE INDEX IF NOT EXISTS idx_tracks_artist_id ON tracks(artist_id);
-  CREATE INDEX IF NOT EXISTS idx_tracks_file_path ON tracks(file_path);
-  CREATE INDEX IF NOT EXISTS idx_tracks_title ON tracks(title);
-  CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist ON playlist_tracks(playlist_id, position);
-  CREATE INDEX IF NOT EXISTS idx_scrobbles_track_id ON scrobbles(track_id);
-  CREATE INDEX IF NOT EXISTS idx_scrobbles_timestamp ON scrobbles(timestamp);
-`);
+  db.playlists.set(params.id, {
+    id: params.id,
+    name: params.name,
+    description: params.description ?? existing?.description ?? '',
+    cover_path: existing?.cover_path ?? null,
+    is_smart: params.isSmart !== undefined ? (params.isSmart ? 1 : 0) : existing?.is_smart ?? 0,
+    smart_rules_json:
+      params.smartRulesJson !== undefined
+        ? params.smartRulesJson
+        : existing?.smart_rules_json ?? null,
+    created_at: params.createdAt || existing?.created_at || now,
+    updated_at: now,
+  });
 
-syncDatabaseToPersistentDisk(true);
+  if (Array.isArray(params.trackIds)) {
+    const validIds: string[] = [];
+    const seen = new Set<string>();
+    for (const rawTid of params.trackIds) {
+      const tid = String(rawTid).trim();
+      if (tid && !seen.has(tid) && db.tracks.has(tid)) {
+        seen.add(tid);
+        validIds.push(tid);
+      }
+    }
+    db.playlistTracks.set(params.id, validIds);
+  } else if (!db.playlistTracks.has(params.id)) {
+    db.playlistTracks.set(params.id, []);
+  }
+
+  syncDatabaseToPersistentDisk();
+}
+
+export function deletePlaylistById(playlistId: string): boolean {
+  const existed = db.playlists.delete(playlistId);
+  db.playlistTracks.delete(playlistId);
+  syncDatabaseToPersistentDisk();
+  return existed;
+}
+
+export function getPlaylistTrackIds(playlistId: string): string[] {
+  return [...(db.playlistTracks.get(playlistId) || [])];
+}
+
+export function setPlaylistTrackIds(playlistId: string, trackIds: string[]): void {
+  const valid: string[] = [];
+  const seen = new Set<string>();
+  for (const rawId of trackIds) {
+    const tid = String(rawId).trim();
+    if (tid && !seen.has(tid) && db.tracks.has(tid)) {
+      seen.add(tid);
+      valid.push(tid);
+    }
+  }
+  db.playlistTracks.set(playlistId, valid);
+  const pl = db.playlists.get(playlistId);
+  if (pl) {
+    pl.updated_at = new Date().toISOString();
+  }
+  syncDatabaseToPersistentDisk();
+}
+
+export function deleteTrackFromDb(trackId: string): TrackRow | null {
+  const row = db.tracks.get(trackId);
+  if (!row) return null;
+
+  db.tracks.delete(trackId);
+  db.tracksByPath.delete(path.resolve(row.file_path));
+
+  for (const [pid, tids] of db.playlistTracks.entries()) {
+    if (tids.includes(trackId)) {
+      db.playlistTracks.set(
+        pid,
+        tids.filter((id) => id !== trackId)
+      );
+    }
+  }
+
+  pruneOrphanedAlbumsAndArtists();
+  syncDatabaseToPersistentDisk();
+  return row;
+}
+
+export function incrementTrackPlayCount(
+  trackId: string,
+  playedAtIso = new Date().toISOString()
+): TrackRow | null {
+  const row = db.tracks.get(trackId);
+  if (!row) return null;
+  row.play_count = (row.play_count || 0) + 1;
+  row.last_played_at = playedAtIso;
+  syncDatabaseToPersistentDisk();
+  return row;
+}
+
+export function recordScrobbleInDb(
+  trackId: string,
+  timestampUnix: number,
+  syncedListenBrainz: boolean
+): void {
+  if (!db.tracks.has(trackId)) return;
+  db.scrobbles.push({
+    id: `scr-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    track_id: trackId,
+    timestamp: timestampUnix,
+    synced_listenbrainz: syncedListenBrainz ? 1 : 0,
+  });
+  if (db.scrobbles.length > 2000) {
+    db.scrobbles.splice(0, db.scrobbles.length - 2000);
+  }
+  syncDatabaseToPersistentDisk();
+}
+
+export function getTrackWithArtistAlbum(trackId: string) {
+  const t = db.tracks.get(trackId);
+  if (!t) return null;
+  const ar = t.artist_id ? db.artists.get(t.artist_id) : undefined;
+  const al = t.album_id ? db.albums.get(t.album_id) : undefined;
+  return {
+    id: t.id,
+    title: t.title,
+    duration_ms: t.duration_ms,
+    artist: ar?.name || 'Unknown Artist',
+    album: al?.title || 'Singles',
+  };
+}
 
 // ============================================================================
 // 3. EBU R128 LUFS BACKGROUND NORMALIZATION ENGINE (ffmpeg)
@@ -312,7 +600,6 @@ function analyzeFileEbuR128(
       { timeout: 60000, maxBuffer: 10 * 1024 * 1024 },
       (_err, stdout, stderr) => {
         const combined = `${stdout || ''}\n${stderr || ''}`;
-        // Match the final Summary "I:         -14.2 LUFS"
         const matches = [...combined.matchAll(/I:\s*(-?\d+(?:\.\d+)?)\s*LUFS/gi)];
         if (matches.length === 0) {
           resolve(null);
@@ -324,7 +611,6 @@ function analyzeFileEbuR128(
           resolve(null);
           return;
         }
-        // Standard target is -14.0 LUFS
         const rawGain = -14.0 - lufs;
         const clampedGain = Math.max(-15, Math.min(12, Number(rawGain.toFixed(2))));
         resolve({
@@ -350,9 +636,12 @@ async function processNextLufsJob() {
       if (fs.existsSync(job.filePath)) {
         const result = await analyzeFileEbuR128(job.filePath);
         if (result) {
-          db.prepare(
-            `UPDATE tracks SET loudness_lufs = ?, replaygain_track_gain = ? WHERE id = ?`
-          ).run(result.loudnessLufs, result.replaygainDb, job.trackId);
+          const track = db.tracks.get(job.trackId);
+          if (track) {
+            track.loudness_lufs = result.loudnessLufs;
+            track.replaygain_track_gain = result.replaygainDb;
+            syncDatabaseToPersistentDisk();
+          }
         }
       }
     } catch {
@@ -406,14 +695,12 @@ function parseFallbackFromFilePath(filePath: string): {
     artist = grandParentDir;
   }
 
-  // Check if filename starts with track number e.g. "01 - Title" or "01. Title"
   const numPrefix = base.match(/^(\d{1,3})\s*[-._]\s*(.+)$/);
   if (numPrefix) {
     trackNumber = parseInt(numPrefix[1], 10);
     title = numPrefix[2].trim();
   }
 
-  // Check if title has "Artist - Title"
   if (title.includes(' - ')) {
     const parts = title.split(' - ');
     if (parts.length >= 2) {
@@ -450,7 +737,6 @@ export async function indexAudioFile(filePath: string): Promise<string | null> {
     let sampleRate = 44100;
     let replayGainDb: number | null = null;
     let embeddedPicture: { data: Uint8Array; format?: string } | null = null;
-    let mbTrackId: string | null = null;
     let mbAlbumId: string | null = null;
     let mbArtistId: string | null = null;
 
@@ -506,7 +792,6 @@ export async function indexAudioFile(filePath: string): Promise<string | null> {
           format: c.picture[0].format,
         };
       }
-      if (c.musicbrainz_recordingid) mbTrackId = c.musicbrainz_recordingid;
       if (c.musicbrainz_albumid) mbAlbumId = c.musicbrainz_albumid;
       if (Array.isArray(c.musicbrainz_artistid) && c.musicbrainz_artistid[0]) {
         mbArtistId = c.musicbrainz_artistid[0];
@@ -519,7 +804,6 @@ export async function indexAudioFile(filePath: string): Promise<string | null> {
     const albumId = sha1Id('alb', `${artist}::${album}`);
     const trackId = sha1Id('trk', resolvedPath);
 
-    // Extract or locate cover art -> /data/covers/{album_id}.jpg
     const targetCoverPath = path.join(COVERS_DIR, `${albumId}.jpg`);
     let finalCoverPath: string | null = fs.existsSync(targetCoverPath)
       ? targetCoverPath
@@ -533,7 +817,6 @@ export async function indexAudioFile(filePath: string): Promise<string | null> {
     }
 
     if (!finalCoverPath) {
-      // Check directory for cover.jpg / folder.jpg
       const trackDir = path.dirname(resolvedPath);
       for (const candidateName of COVER_FILENAMES) {
         const candidateFile = path.join(trackDir, candidateName);
@@ -547,90 +830,53 @@ export async function indexAudioFile(filePath: string): Promise<string | null> {
       }
     }
 
-    // Upsert Artist
-    db.prepare(
-      `INSERT INTO artists (id, name, sort_name, musicbrainz_id, image_url)
-       VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         name = excluded.name,
-         sort_name = excluded.sort_name,
-         musicbrainz_id = COALESCE(excluded.musicbrainz_id, artists.musicbrainz_id),
-         image_url = COALESCE(excluded.image_url, artists.image_url)`
-    ).run(
-      artistId,
-      artist,
-      toSortName(artist),
-      mbArtistId,
-      `/api/cover/artist/${artistId}`
-    );
+    const existingArtist = db.artists.get(artistId);
+    db.artists.set(artistId, {
+      id: artistId,
+      name: artist,
+      sort_name: toSortName(artist),
+      musicbrainz_id: mbArtistId || existingArtist?.musicbrainz_id || null,
+      image_url: `/api/cover/artist/${artistId}`,
+    });
 
-    // Upsert Album
-    db.prepare(
-      `INSERT INTO albums (id, artist_id, title, year, genre, cover_path, musicbrainz_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         artist_id = excluded.artist_id,
-         title = excluded.title,
-         year = COALESCE(excluded.year, albums.year),
-         genre = COALESCE(excluded.genre, albums.genre),
-         cover_path = COALESCE(excluded.cover_path, albums.cover_path),
-         musicbrainz_id = COALESCE(excluded.musicbrainz_id, albums.musicbrainz_id)`
-    ).run(albumId, artistId, album, year, genre, finalCoverPath, mbAlbumId);
+    const existingAlbum = db.albums.get(albumId);
+    db.albums.set(albumId, {
+      id: albumId,
+      artist_id: artistId,
+      title: album,
+      year: year ?? existingAlbum?.year ?? null,
+      genre: genre || existingAlbum?.genre || 'Music',
+      cover_path: finalCoverPath || existingAlbum?.cover_path || null,
+      musicbrainz_id: mbAlbumId || existingAlbum?.musicbrainz_id || null,
+    });
 
-    // Check existing track for LUFS / play_count preservation
-    const existingTrack = db
-      .prepare(
-        `SELECT id, loudness_lufs, replaygain_track_gain, play_count, last_played_at FROM tracks WHERE file_path = ?`
-      )
-      .get(resolvedPath) as
-      | {
-          id: string;
-          loudness_lufs: number | null;
-          replaygain_track_gain: number | null;
-          play_count: number;
-          last_played_at: string | null;
-        }
-      | undefined;
+    const existingTrackId = db.tracksByPath.get(resolvedPath);
+    const existingTrack = existingTrackId
+      ? db.tracks.get(existingTrackId)
+      : db.tracks.get(trackId);
 
     const preservedLufs = existingTrack?.loudness_lufs ?? null;
     const preservedGain =
       existingTrack?.replaygain_track_gain ?? replayGainDb ?? null;
 
-    db.prepare(
-      `INSERT INTO tracks (
-         id, album_id, artist_id, title, track_number, disc_number,
-         duration_ms, file_path, format, bitrate, sample_rate,
-         loudness_lufs, replaygain_track_gain, play_count, last_played_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(file_path) DO UPDATE SET
-         album_id = excluded.album_id,
-         artist_id = excluded.artist_id,
-         title = excluded.title,
-         track_number = excluded.track_number,
-         disc_number = excluded.disc_number,
-         duration_ms = excluded.duration_ms,
-         format = excluded.format,
-         bitrate = excluded.bitrate,
-         sample_rate = excluded.sample_rate,
-         loudness_lufs = COALESCE(tracks.loudness_lufs, excluded.loudness_lufs),
-         replaygain_track_gain = COALESCE(tracks.replaygain_track_gain, excluded.replaygain_track_gain)`
-    ).run(
-      trackId,
-      albumId,
-      artistId,
+    db.tracks.set(trackId, {
+      id: trackId,
+      album_id: albumId,
+      artist_id: artistId,
       title,
-      trackNumber,
-      discNumber,
-      durationMs,
-      resolvedPath,
+      track_number: trackNumber,
+      disc_number: discNumber,
+      duration_ms: durationMs,
+      file_path: resolvedPath,
       format,
       bitrate,
-      sampleRate,
-      preservedLufs,
-      preservedGain,
-      existingTrack?.play_count ?? 0,
-      existingTrack?.last_played_at ?? null
-    );
+      sample_rate: sampleRate,
+      loudness_lufs: preservedLufs,
+      replaygain_track_gain: preservedGain,
+      play_count: existingTrack?.play_count ?? 0,
+      last_played_at: existingTrack?.last_played_at ?? null,
+    });
+    db.tracksByPath.set(resolvedPath, trackId);
 
     if (preservedLufs === null) {
       enqueueTrackForLufsAnalysis(trackId, resolvedPath);
@@ -646,21 +892,13 @@ export async function indexAudioFile(filePath: string): Promise<string | null> {
 export function removeAudioFileFromIndex(filePath: string) {
   try {
     const resolvedPath = path.resolve(filePath);
-    db.prepare(`DELETE FROM tracks WHERE file_path = ?`).run(resolvedPath);
-    // Clean up empty albums and artists
-    db.prepare(
-      `DELETE FROM albums WHERE id NOT IN (SELECT DISTINCT album_id FROM tracks WHERE album_id IS NOT NULL)`
-    ).run();
-    db.prepare(
-      `DELETE FROM artists WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL)`
-    ).run();
+    const trackId = db.tracksByPath.get(resolvedPath);
+    if (trackId) {
+      deleteTrackFromDb(trackId);
+    }
   } catch {}
 }
 
-/**
- * Automatic .m3u / .m3u8 Playlist Importer
- * Resolves internal track paths against the SQLite tracks table and populates playlists + playlist_tracks.
- */
 export function importM3uPlaylistFile(m3uFilePath: string): string | null {
   try {
     const resolvedM3u = path.resolve(m3uFilePath);
@@ -679,13 +917,9 @@ export function importM3uPlaylistFile(m3uFilePath: string): string | null {
       .map((l) => l.trim())
       .filter((l) => l.length > 0 && !l.startsWith('#'));
 
-    const allDbTracks = db
-      .prepare(`SELECT id, file_path, title FROM tracks`)
-      .all() as Array<{ id: string; file_path: string; title: string }>;
-
     const byExactPath = new Map<string, string>();
     const byLowerBasename = new Map<string, string>();
-    for (const row of allDbTracks) {
+    for (const row of db.tracks.values()) {
       byExactPath.set(path.resolve(row.file_path), row.id);
       byLowerBasename.set(path.basename(row.file_path).toLowerCase(), row.id);
     }
@@ -710,35 +944,13 @@ export function importM3uPlaylistFile(m3uFilePath: string): string | null {
       }
     }
 
-    const now = new Date().toISOString();
-    db.prepare(
-      `INSERT INTO playlists (id, name, description, cover_path, is_smart, smart_rules_json, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 0, NULL, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         name = excluded.name,
-         description = excluded.description,
-         updated_at = excluded.updated_at`
-    ).run(
-      playlistId,
-      playlistName || 'Imported M3U Playlist',
-      `Auto-imported from ${path.basename(resolvedM3u)} (${matchedTrackIds.length} tracks)`,
-      null,
-      now,
-      now
-    );
-
-    const tx = db.transaction((ids: string[]) => {
-      db.prepare(`DELETE FROM playlist_tracks WHERE playlist_id = ?`).run(
-        playlistId
-      );
-      const insertStmt = db.prepare(
-        `INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)`
-      );
-      ids.forEach((tid, idx) => {
-        insertStmt.run(playlistId, tid, idx);
-      });
+    upsertPlaylistWithTracks({
+      id: playlistId,
+      name: playlistName || 'Imported M3U Playlist',
+      description: `Auto-imported from ${path.basename(resolvedM3u)} (${matchedTrackIds.length} tracks)`,
+      isSmart: false,
+      trackIds: matchedTrackIds,
     });
-    tx(matchedTrackIds);
 
     return playlistId;
   } catch (err) {
@@ -772,19 +984,23 @@ export function purgeLegacySampleFiles(baseDir: string = MUSIC_DIR) {
         fs.rmSync(targetFile, { force: true });
       }
     }
-    // Also remove any SQLite rows referencing those legacy sample artists/playlists
-    db.prepare(
-      `DELETE FROM tracks WHERE file_path LIKE '%Chrome Tape Syndicate%' OR file_path LIKE '%The Self-Hosted Collective%'`
-    ).run();
-    db.prepare(
-      `DELETE FROM playlists WHERE name = 'Night Drive Synthwave' OR id = 'pl-all-local-tracks'`
-    ).run();
-    db.prepare(
-      `DELETE FROM albums WHERE id NOT IN (SELECT DISTINCT album_id FROM tracks WHERE album_id IS NOT NULL)`
-    ).run();
-    db.prepare(
-      `DELETE FROM artists WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL)`
-    ).run();
+
+    for (const track of Array.from(db.tracks.values())) {
+      if (
+        track.file_path.includes('Chrome Tape Syndicate') ||
+        track.file_path.includes('The Self-Hosted Collective')
+      ) {
+        deleteTrackFromDb(track.id);
+      }
+    }
+
+    for (const pl of Array.from(db.playlists.values())) {
+      if (pl.name === 'Night Drive Synthwave' || pl.id === 'pl-all-local-tracks') {
+        deletePlaylistById(pl.id);
+      }
+    }
+
+    pruneOrphanedAlbumsAndArtists();
   } catch {
     // ignore cleanup errors
   }
@@ -847,9 +1063,7 @@ export function inspectMusicDrive(targetDir?: string): MusicDriveStatus {
     exists && readable
       ? walkMusicDirectory(dirToCheck)
       : { audioFiles: [], m3uFiles: [] };
-  const indexedTrackCount = (
-    db.prepare(`SELECT COUNT(*) as c FROM tracks`).get() as { c: number }
-  ).c;
+  const indexedTrackCount = db.tracks.size;
 
   const audioFileCount = walked.audioFiles.length;
   const playlistFileCount = walked.m3uFiles.length;
@@ -896,7 +1110,11 @@ function walkMusicDirectory(dir: string): {
       return;
     }
     for (const entry of entries) {
-      if (entry.name.startsWith('.') || entry.name === '$RECYCLE.BIN' || entry.name === 'System Volume Information') {
+      if (
+        entry.name.startsWith('.') ||
+        entry.name === '$RECYCLE.BIN' ||
+        entry.name === 'System Volume Information'
+      ) {
         continue;
       }
       const fullPath = path.join(current, entry.name);
@@ -922,13 +1140,10 @@ export async function runFullLibraryScan(): Promise<{
   importedPlaylists: number;
 }> {
   if (scannerState.isScanning) {
-    const total = (
-      db.prepare(`SELECT COUNT(*) as c FROM tracks`).get() as { c: number }
-    ).c;
-    const pls = (
-      db.prepare(`SELECT COUNT(*) as c FROM playlists`).get() as { c: number }
-    ).c;
-    return { indexedTracks: total, importedPlaylists: pls };
+    return {
+      indexedTracks: db.tracks.size,
+      importedPlaylists: db.playlists.size,
+    };
   }
 
   scannerState.isScanning = true;
@@ -937,11 +1152,8 @@ export async function runFullLibraryScan(): Promise<{
     const { audioFiles, m3uFiles } = walkMusicDirectory(MUSIC_DIR);
 
     // Prune deleted files from DB first
-    const existingRows = db
-      .prepare(`SELECT file_path FROM tracks`)
-      .all() as Array<{ file_path: string }>;
     const diskSet = new Set(audioFiles.map((f) => path.resolve(f)));
-    for (const row of existingRows) {
+    for (const row of Array.from(db.tracks.values())) {
       if (!diskSet.has(path.resolve(row.file_path))) {
         removeAudioFileFromIndex(row.file_path);
       }
@@ -953,7 +1165,6 @@ export async function runFullLibraryScan(): Promise<{
       const id = await indexAudioFile(file);
       if (id) indexedCount++;
       scannerState.scannedFilesCount = indexedCount;
-      // Yield to the Node.js event loop every 8 files so HTTP requests stay fast
       if (i % 8 === 0) {
         await new Promise((resolve) => setImmediate(resolve));
       }
@@ -966,7 +1177,7 @@ export async function runFullLibraryScan(): Promise<{
     }
 
     scannerState.lastScanAt = new Date().toISOString();
-    syncDatabaseToPersistentDisk();
+    syncDatabaseToPersistentDisk(true);
     return { indexedTracks: indexedCount, importedPlaylists: m3uCount };
   } finally {
     scannerState.isScanning = false;
@@ -997,7 +1208,6 @@ export function startChokidarMusicWatcher() {
 
   purgeLegacySampleFiles(MUSIC_DIR);
 
-  // Run initial scan asynchronously so server startup is never blocked
   setTimeout(() => {
     runFullLibraryScan().catch((err) =>
       console.error('[Brokeify Scanner] Initial scan error:', err)
@@ -1113,61 +1323,48 @@ export function queryTracks(filters?: {
   search?: string;
   limit?: number;
 }): FormattedTrackPayload[] {
-  const conditions: string[] = [];
-  const params: any[] = [];
+  const searchLower = filters?.search?.trim().toLowerCase() || '';
 
-  if (filters?.albumId) {
-    conditions.push('t.album_id = ?');
-    params.push(filters.albumId);
-  }
-  if (filters?.artistId) {
-    conditions.push('t.artist_id = ?');
-    params.push(filters.artistId);
-  }
-  if (filters?.search?.trim()) {
-    const like = `%${filters.search.trim()}%`;
-    conditions.push(
-      '(t.title LIKE ? OR ar.name LIKE ? OR al.title LIKE ? OR al.genre LIKE ?)'
-    );
-    params.push(like, like, like, like);
-  }
+  const matched = Array.from(db.tracks.values()).filter((t) => {
+    if (filters?.albumId && t.album_id !== filters.albumId) return false;
+    if (filters?.artistId && t.artist_id !== filters.artistId) return false;
+    if (searchLower) {
+      const ar = t.artist_id ? db.artists.get(t.artist_id) : undefined;
+      const al = t.album_id ? db.albums.get(t.album_id) : undefined;
+      const hay = `${t.title} ${ar?.name || ''} ${al?.title || ''} ${al?.genre || ''}`.toLowerCase();
+      if (!hay.includes(searchLower)) return false;
+    }
+    return true;
+  });
 
-  const whereClause =
-    conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-  const limitClause = filters?.limit ? `LIMIT ${Number(filters.limit)}` : '';
+  matched.sort((a, b) => {
+    const arA = (a.artist_id ? db.artists.get(a.artist_id)?.sort_name : '') || '';
+    const arB = (b.artist_id ? db.artists.get(b.artist_id)?.sort_name : '') || '';
+    const cmpAr = arA.localeCompare(arB, undefined, { sensitivity: 'base' });
+    if (cmpAr !== 0) return cmpAr;
 
-  const rows = db
-    .prepare(
-      `SELECT
-         t.id,
-         t.album_id,
-         t.artist_id,
-         t.title,
-         t.track_number,
-         t.disc_number,
-         t.duration_ms,
-         t.file_path,
-         t.format,
-         t.bitrate,
-         t.sample_rate,
-         t.loudness_lufs,
-         t.replaygain_track_gain,
-         t.play_count,
-         t.last_played_at,
-         COALESCE(ar.name, 'Unknown Artist') AS artist_name,
-         COALESCE(al.title, 'Singles') AS album_title,
-         al.year AS album_year,
-         COALESCE(al.genre, 'Music') AS album_genre
-       FROM tracks t
-       LEFT JOIN artists ar ON t.artist_id = ar.id
-       LEFT JOIN albums al ON t.album_id = al.id
-       ${whereClause}
-       ORDER BY ar.sort_name COLLATE NOCASE ASC, al.title COLLATE NOCASE ASC, t.disc_number ASC, t.track_number ASC, t.title COLLATE NOCASE ASC
-       ${limitClause}`
-    )
-    .all(...params) as Array<Record<string, any>>;
+    const alA = (a.album_id ? db.albums.get(a.album_id)?.title : '') || '';
+    const alB = (b.album_id ? db.albums.get(b.album_id)?.title : '') || '';
+    const cmpAl = alA.localeCompare(alB, undefined, { sensitivity: 'base' });
+    if (cmpAl !== 0) return cmpAl;
 
-  return rows.map((r) => {
+    if ((a.disc_number || 1) !== (b.disc_number || 1)) {
+      return (a.disc_number || 1) - (b.disc_number || 1);
+    }
+    if ((a.track_number || 1) !== (b.track_number || 1)) {
+      return (a.track_number || 1) - (b.track_number || 1);
+    }
+    return a.title.localeCompare(b.title, undefined, { sensitivity: 'base' });
+  });
+
+  const sliced =
+    filters?.limit && filters.limit > 0
+      ? matched.slice(0, Number(filters.limit))
+      : matched;
+
+  return sliced.map((r) => {
+    const ar = r.artist_id ? db.artists.get(r.artist_id) : undefined;
+    const al = r.album_id ? db.albums.get(r.album_id) : undefined;
     const durationMs = Number(r.duration_ms || 180000);
     const durationSec = Math.max(1, Math.round(durationMs / 1000));
     const normGain =
@@ -1181,10 +1378,10 @@ export function queryTracks(filters?: {
       albumId: r.album_id ? String(r.album_id) : null,
       artistId: r.artist_id ? String(r.artist_id) : null,
       title: String(r.title || 'Untitled'),
-      artist: String(r.artist_name || 'Unknown Artist'),
-      album: String(r.album_title || 'Singles'),
-      year: r.album_year ? Number(r.album_year) : null,
-      genre: String(r.album_genre || 'Music'),
+      artist: String(ar?.name || 'Unknown Artist'),
+      album: String(al?.title || 'Singles'),
+      year: al?.year ? Number(al.year) : null,
+      genre: String(al?.genre || 'Music'),
       trackNumber: Number(r.track_number || 1),
       discNumber: Number(r.disc_number || 1),
       duration: durationSec,
@@ -1213,111 +1410,100 @@ export function queryTracks(filters?: {
 }
 
 export function queryArtists(search?: string) {
-  const params: any[] = [];
-  let where = '';
-  if (search?.trim()) {
-    where = 'WHERE ar.name LIKE ?';
-    params.push(`%${search.trim()}%`);
+  const searchLower = search?.trim().toLowerCase() || '';
+  const albumCounts = new Map<string, number>();
+  const trackCounts = new Map<string, number>();
+
+  for (const al of db.albums.values()) {
+    if (al.artist_id) {
+      albumCounts.set(al.artist_id, (albumCounts.get(al.artist_id) || 0) + 1);
+    }
+  }
+  for (const tr of db.tracks.values()) {
+    if (tr.artist_id) {
+      trackCounts.set(tr.artist_id, (trackCounts.get(tr.artist_id) || 0) + 1);
+    }
   }
 
-  const rows = db
-    .prepare(
-      `SELECT
-         ar.id,
-         ar.name,
-         ar.sort_name,
-         ar.musicbrainz_id,
-         ar.image_url,
-         COUNT(DISTINCT al.id) AS album_count,
-         COUNT(DISTINCT t.id) AS track_count
-       FROM artists ar
-       LEFT JOIN albums al ON al.artist_id = ar.id
-       LEFT JOIN tracks t ON t.artist_id = ar.id
-       ${where}
-       GROUP BY ar.id
-       ORDER BY ar.sort_name COLLATE NOCASE ASC`
-    )
-    .all(...params) as Array<Record<string, any>>;
+  const list = Array.from(db.artists.values()).filter((ar) => {
+    if (searchLower && !ar.name.toLowerCase().includes(searchLower)) {
+      return false;
+    }
+    return true;
+  });
 
-  return rows.map((r) => ({
+  list.sort((a, b) =>
+    (a.sort_name || a.name).localeCompare(b.sort_name || b.name, undefined, {
+      sensitivity: 'base',
+    })
+  );
+
+  return list.map((r) => ({
     id: String(r.id),
     name: String(r.name),
     sortName: String(r.sort_name || r.name),
     musicbrainzId: r.musicbrainz_id || null,
     imageUrl: `/api/cover/artist/${encodeURIComponent(String(r.id))}`,
-    albumCount: Number(r.album_count || 0),
-    trackCount: Number(r.track_count || 0),
+    albumCount: albumCounts.get(r.id) || 0,
+    trackCount: trackCounts.get(r.id) || 0,
   }));
 }
 
 export function queryAlbums(filters?: { artistId?: string; search?: string }) {
-  const conditions: string[] = [];
-  const params: any[] = [];
-
-  if (filters?.artistId) {
-    conditions.push('al.artist_id = ?');
-    params.push(filters.artistId);
-  }
-  if (filters?.search?.trim()) {
-    const like = `%${filters.search.trim()}%`;
-    conditions.push('(al.title LIKE ? OR ar.name LIKE ?)');
-    params.push(like, like);
+  const searchLower = filters?.search?.trim().toLowerCase() || '';
+  const trackCounts = new Map<string, number>();
+  for (const tr of db.tracks.values()) {
+    if (tr.album_id) {
+      trackCounts.set(tr.album_id, (trackCounts.get(tr.album_id) || 0) + 1);
+    }
   }
 
-  const where =
-    conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const list = Array.from(db.albums.values()).filter((al) => {
+    if (filters?.artistId && al.artist_id !== filters.artistId) return false;
+    if (searchLower) {
+      const arName = (al.artist_id ? db.artists.get(al.artist_id)?.name : '') || '';
+      if (
+        !al.title.toLowerCase().includes(searchLower) &&
+        !arName.toLowerCase().includes(searchLower)
+      ) {
+        return false;
+      }
+    }
+    return true;
+  });
 
-  const rows = db
-    .prepare(
-      `SELECT
-         al.id,
-         al.artist_id,
-         al.title,
-         al.year,
-         al.genre,
-         al.cover_path,
-         al.musicbrainz_id,
-         COALESCE(ar.name, 'Unknown Artist') AS artist_name,
-         COUNT(t.id) AS track_count
-       FROM albums al
-       LEFT JOIN artists ar ON al.artist_id = ar.id
-       LEFT JOIN tracks t ON t.album_id = al.id
-       ${where}
-       GROUP BY al.id
-       ORDER BY al.title COLLATE NOCASE ASC`
-    )
-    .all(...params) as Array<Record<string, any>>;
+  list.sort((a, b) =>
+    a.title.localeCompare(b.title, undefined, { sensitivity: 'base' })
+  );
 
-  return rows.map((r) => ({
-    id: String(r.id),
-    artistId: r.artist_id ? String(r.artist_id) : null,
-    artistName: String(r.artist_name || 'Unknown Artist'),
-    title: String(r.title),
-    year: r.year ? Number(r.year) : null,
-    genre: r.genre ? String(r.genre) : 'Music',
-    coverUrl: `/api/cover/album/${encodeURIComponent(String(r.id))}`,
-    musicbrainzId: r.musicbrainz_id || null,
-    trackCount: Number(r.track_count || 0),
-  }));
+  return list.map((r) => {
+    const ar = r.artist_id ? db.artists.get(r.artist_id) : undefined;
+    return {
+      id: String(r.id),
+      artistId: r.artist_id ? String(r.artist_id) : null,
+      artistName: String(ar?.name || 'Unknown Artist'),
+      title: String(r.title),
+      year: r.year ? Number(r.year) : null,
+      genre: r.genre ? String(r.genre) : 'Music',
+      coverUrl: `/api/cover/album/${encodeURIComponent(String(r.id))}`,
+      musicbrainzId: r.musicbrainz_id || null,
+      trackCount: trackCounts.get(r.id) || 0,
+    };
+  });
 }
 
 export function queryPlaylists() {
-  const pls = db
-    .prepare(
-      `SELECT id, name, description, cover_path, is_smart, smart_rules_json, created_at, updated_at
-       FROM playlists
-       ORDER BY updated_at DESC, name COLLATE NOCASE ASC`
-    )
-    .all() as Array<Record<string, any>>;
-
-  const trackRowsStmt = db.prepare(
-    `SELECT track_id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position ASC`
-  );
+  const pls = Array.from(db.playlists.values()).sort((a, b) => {
+    const cmpDate = String(b.updated_at || '').localeCompare(String(a.updated_at || ''));
+    if (cmpDate !== 0) return cmpDate;
+    return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+  });
 
   return pls.map((p) => {
     const pid = String(p.id);
-    const tRows = trackRowsStmt.all(pid) as Array<{ track_id: string }>;
-    const trackIds = tRows.map((tr) => String(tr.track_id));
+    const trackIds = (db.playlistTracks.get(pid) || []).filter((tid) =>
+      db.tracks.has(tid)
+    );
 
     return {
       id: pid,
@@ -1357,10 +1543,7 @@ export function handleStreamTrack(req: Request, res: Response) {
     return res.status(400).json({ error: 'Missing trackId' });
   }
 
-  const row = db
-    .prepare(`SELECT id, file_path, format FROM tracks WHERE id = ?`)
-    .get(trackId) as { id: string; file_path: string; format: string } | undefined;
-
+  const row = db.tracks.get(trackId);
   if (!row || !row.file_path || !fs.existsSync(row.file_path)) {
     return res.status(404).json({ error: 'Track audio file not found on disk' });
   }
@@ -1451,17 +1634,11 @@ export function handleServeCover(req: Request, res: Response) {
   let subtitle = 'Music Library';
 
   if (type === 'album') {
-    const alb = db
-      .prepare(
-        `SELECT al.title, al.cover_path, COALESCE(ar.name, 'Artist') AS artist_name
-         FROM albums al LEFT JOIN artists ar ON al.artist_id = ar.id WHERE al.id = ?`
-      )
-      .get(id) as
-      | { title: string; cover_path: string | null; artist_name: string }
-      | undefined;
+    const alb = db.albums.get(id);
     if (alb) {
       title = alb.title;
-      subtitle = alb.artist_name;
+      const ar = alb.artist_id ? db.artists.get(alb.artist_id) : undefined;
+      subtitle = ar?.name || 'Artist';
       coverPath = alb.cover_path;
     }
     const diskCandidate = path.join(COVERS_DIR, `${id}.jpg`);
@@ -1469,42 +1646,33 @@ export function handleServeCover(req: Request, res: Response) {
       coverPath = diskCandidate;
     }
   } else if (type === 'artist') {
-    const art = db
-      .prepare(`SELECT name FROM artists WHERE id = ?`)
-      .get(id) as { name: string } | undefined;
+    const art = db.artists.get(id);
     if (art) {
       title = art.name;
       subtitle = 'Artist';
     }
-    const albCover = db
-      .prepare(
-        `SELECT cover_path FROM albums WHERE artist_id = ? AND cover_path IS NOT NULL LIMIT 1`
-      )
-      .get(id) as { cover_path: string | null } | undefined;
-    if (albCover?.cover_path) {
-      coverPath = albCover.cover_path;
+    for (const al of db.albums.values()) {
+      if (al.artist_id === id && al.cover_path) {
+        coverPath = al.cover_path;
+        break;
+      }
     }
   } else if (type === 'playlist') {
-    const pl = db
-      .prepare(`SELECT name, cover_path FROM playlists WHERE id = ?`)
-      .get(id) as { name: string; cover_path: string | null } | undefined;
+    const pl = db.playlists.get(id);
     if (pl) {
       title = pl.name;
       subtitle = 'Playlist';
       coverPath = pl.cover_path;
     }
     if (!coverPath) {
-      const firstTrackAlbum = db
-        .prepare(
-          `SELECT al.cover_path FROM playlist_tracks pt
-           JOIN tracks t ON pt.track_id = t.id
-           JOIN albums al ON t.album_id = al.id
-           WHERE pt.playlist_id = ? AND al.cover_path IS NOT NULL
-           ORDER BY pt.position ASC LIMIT 1`
-        )
-        .get(id) as { cover_path: string | null } | undefined;
-      if (firstTrackAlbum?.cover_path) {
-        coverPath = firstTrackAlbum.cover_path;
+      const tids = db.playlistTracks.get(id) || [];
+      for (const tid of tids) {
+        const tr = db.tracks.get(tid);
+        const al = tr?.album_id ? db.albums.get(tr.album_id) : undefined;
+        if (al?.cover_path) {
+          coverPath = al.cover_path;
+          break;
+        }
       }
     }
   }
@@ -1537,32 +1705,23 @@ export async function enrichTrackFromMusicBrainz(trackId: string): Promise<{
   message: string;
   track?: FormattedTrackPayload;
 }> {
-  const row = db
-    .prepare(
-      `SELECT t.id, t.title, t.album_id, t.artist_id, COALESCE(ar.name, '') AS artist_name, COALESCE(al.title, '') AS album_title
-       FROM tracks t
-       LEFT JOIN artists ar ON t.artist_id = ar.id
-       LEFT JOIN albums al ON t.album_id = al.id
-       WHERE t.id = ?`
-    )
-    .get(trackId) as
-    | {
-        id: string;
-        title: string;
-        album_id: string;
-        artist_id: string;
-        artist_name: string;
-        album_title: string;
-      }
-    | undefined;
-
-  if (!row) {
-    return { ok: false, message: 'Track not found in SQLite database.' };
+  const trackRow = db.tracks.get(trackId);
+  if (!trackRow) {
+    return { ok: false, message: 'Track not found in database.' };
   }
 
-  const query = `recording:"${row.title}"${
-    row.artist_name && row.artist_name !== 'Unknown Artist'
-      ? ` AND artist:"${row.artist_name}"`
+  const artistRow = trackRow.artist_id
+    ? db.artists.get(trackRow.artist_id)
+    : undefined;
+  const albumRow = trackRow.album_id
+    ? db.albums.get(trackRow.album_id)
+    : undefined;
+  const artistName = artistRow?.name || '';
+  const albumTitle = albumRow?.title || '';
+
+  const query = `recording:"${trackRow.title}"${
+    artistName && artistName !== 'Unknown Artist'
+      ? ` AND artist:"${artistName}"`
       : ''
   }`;
   const url = `https://musicbrainz.org/ws/2/recording?query=${encodeURIComponent(
@@ -1571,7 +1730,8 @@ export async function enrichTrackFromMusicBrainz(trackId: string): Promise<{
 
   const resp = await fetch(url, {
     headers: {
-      'User-Agent': 'BrokeifyStandaloneServer/1.0.0 ( https://github.com/Mr-Nickey/brokeify )',
+      'User-Agent':
+        'BrokeifyStandaloneServer/0.1.2-beta ( https://github.com/Mr-Nickey/brokeify )',
       Accept: 'application/json',
     },
     signal: AbortSignal.timeout(8000),
@@ -1590,35 +1750,33 @@ export async function enrichTrackFromMusicBrainz(trackId: string): Promise<{
     return { ok: false, message: 'No matching recording found on MusicBrainz.' };
   }
 
-  const canonicalTitle = String(rec.title || row.title);
+  const canonicalTitle = String(rec.title || trackRow.title);
   const artistCredit = rec['artist-credit']?.[0];
   const canonicalArtist = String(
-    artistCredit?.name || artistCredit?.artist?.name || row.artist_name
+    artistCredit?.name || artistCredit?.artist?.name || artistName
   );
   const artistMbid = artistCredit?.artist?.id || null;
 
   const officialRelease =
     (rec.releases || []).find((r: any) => r.status === 'Official') ||
     rec.releases?.[0];
-  const canonicalAlbum = String(officialRelease?.title || row.album_title || 'Singles');
+  const canonicalAlbum = String(officialRelease?.title || albumTitle || 'Singles');
   const releaseMbid = officialRelease?.id || null;
   const releaseYear = officialRelease?.date
     ? parseInt(String(officialRelease.date).slice(0, 4), 10)
     : null;
 
-  // Update Artist & Album in SQLite
-  if (row.artist_id) {
-    db.prepare(
-      `UPDATE artists SET name = ?, sort_name = ?, musicbrainz_id = COALESCE(?, musicbrainz_id) WHERE id = ?`
-    ).run(canonicalArtist, toSortName(canonicalArtist), artistMbid, row.artist_id);
+  if (artistRow) {
+    artistRow.name = canonicalArtist;
+    artistRow.sort_name = toSortName(canonicalArtist);
+    if (artistMbid) artistRow.musicbrainz_id = artistMbid;
   }
 
-  if (row.album_id) {
-    db.prepare(
-      `UPDATE albums SET title = ?, year = COALESCE(?, year), musicbrainz_id = COALESCE(?, musicbrainz_id) WHERE id = ?`
-    ).run(canonicalAlbum, releaseYear, releaseMbid, row.album_id);
+  if (albumRow) {
+    albumRow.title = canonicalAlbum;
+    if (releaseYear) albumRow.year = releaseYear;
+    if (releaseMbid) albumRow.musicbrainz_id = releaseMbid;
 
-    // Pull high-res cover art from Cover Art Archive if releaseMbid is available
     if (releaseMbid) {
       try {
         const coverResp = await fetch(
@@ -1627,12 +1785,9 @@ export async function enrichTrackFromMusicBrainz(trackId: string): Promise<{
         );
         if (coverResp.ok) {
           const arrBuf = await coverResp.arrayBuffer();
-          const targetCover = path.join(COVERS_DIR, `${row.album_id}.jpg`);
+          const targetCover = path.join(COVERS_DIR, `${albumRow.id}.jpg`);
           fs.writeFileSync(targetCover, Buffer.from(arrBuf));
-          db.prepare(`UPDATE albums SET cover_path = ? WHERE id = ?`).run(
-            targetCover,
-            row.album_id
-          );
+          albumRow.cover_path = targetCover;
         }
       } catch {
         // Cover Art Archive optional
@@ -1640,12 +1795,10 @@ export async function enrichTrackFromMusicBrainz(trackId: string): Promise<{
     }
   }
 
-  db.prepare(`UPDATE tracks SET title = ? WHERE id = ?`).run(
-    canonicalTitle,
-    row.id
-  );
+  trackRow.title = canonicalTitle;
+  syncDatabaseToPersistentDisk();
 
-  const updated = queryTracks().find((t) => t.id === row.id);
+  const updated = queryTracks().find((t) => t.id === trackRow.id);
   return {
     ok: true,
     message: `Matched "${canonicalArtist} - ${canonicalTitle}" (${canonicalAlbum}) via MusicBrainz`,

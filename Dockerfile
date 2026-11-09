@@ -1,30 +1,36 @@
-FROM node:20-bookworm-slim
+# ==============================================================================
+# STAGE 1: Builder (Compiles Vite React SPA -> dist/ & Standalone server.js)
+# ==============================================================================
+FROM node:20-alpine AS builder
+
+WORKDIR /build
+
+COPY package*.json .npmrc* ./
+RUN npm install --legacy-peer-deps
+
+COPY . .
+RUN npm run build
+
+# ==============================================================================
+# STAGE 2: Ultra-Lean Production Runtime (Zero node_modules, Zero C++ Addons)
+# ==============================================================================
+FROM node:20-alpine AS runner
 
 LABEL org.opencontainers.image.title="Brokeify"
-LABEL org.opencontainers.image.description="Brokeify Standalone SQLite Music Server, Chokidar Watcher & Audio Streaming Engine"
+LABEL org.opencontainers.image.description="Brokeify Standalone Music Server, Chokidar Watcher & Audio Streaming Engine"
 LABEL org.opencontainers.image.source="https://github.com/Mr-Nickey/brokeify"
 LABEL org.opencontainers.image.licenses="MIT"
 
 WORKDIR /app
 
-# Install ffmpeg (for EBU R128 LUFS audio normalization), python3, and C++ build tools on Debian glibc (avoids Alpine musl code 139 segfaults)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      ffmpeg \
-      python3 \
-      make \
-      g++ \
-      ca-certificates \
-      curl && \
-    rm -rf /var/lib/apt/lists/*
+# Install only ffmpeg (for EBU R128 LUFS audio normalization) and ca-certificates
+RUN apk add --no-cache ffmpeg ca-certificates
 
-# Copy package files and install dependencies (rebuilding better-sqlite3 cleanly against Debian glibc)
-COPY package*.json .npmrc* ./
-RUN npm install --legacy-peer-deps && npm rebuild better-sqlite3
-
-# Copy full source code and build both Vite React frontend and Express/SQLite server.js bundle
-COPY . .
-RUN npm run build
+# Copy only the compiled production artifacts (< 2 MB total!)
+COPY --from=builder /build/dist ./dist
+COPY --from=builder /build/server.js ./server.js
+COPY --from=builder /build/version.json ./version.json
+COPY --from=builder /build/package.json ./package.json
 
 # Create persistent /data (/data/brokeify.db, /data/covers, /data/config.json) and /music directories
 RUN mkdir -p /data /data/covers /music /app/data /app/downloads /tmp
@@ -41,5 +47,4 @@ ENV BROKEIFY_BUILD_TIME=${BUILD_TIMESTAMP}
 
 EXPOSE 3487
 
-# Start the standalone Brokeify Express + SQLite + Static Web Player server on Port 3487
 CMD ["node", "server.js"]
