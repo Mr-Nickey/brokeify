@@ -785,7 +785,7 @@ app.get('/api/mobile/pair-info', (req, res) => {
   res.json({
     ok: true,
     app: 'brokeify',
-    version: '3.0.0-standalone',
+    version: '0.1.2-beta',
     serverUrl: detectedOriginUrl,
     localUrl: lanUrl,
     lanUrl,
@@ -4081,7 +4081,7 @@ app.get('/api/debug/logs', async (_req, res) => {
     serverInfo: {
       uptimeSec: Math.round(process.uptime()),
       nodeVersion: process.version,
-      port: Number(process.env.BROKEIFY_PORT || process.env.PORT || 3487),
+      port: Number(process.env.PORT || 3487),
       configPath: CONFIG_FILE_PATH,
       dbPath: DB_PATH,
       musicDir: MUSIC_DIR,
@@ -4329,10 +4329,10 @@ function readLocalVersionMetadata() {
       const raw = fs.readFileSync(versionFile, 'utf-8');
       const parsed = JSON.parse(raw);
       return {
-        version: parsed.version || '3.0.0',
-        channel: parsed.channel || 'standalone',
+        version: parsed.version || '0.1.2',
+        channel: parsed.channel || 'beta',
         displayVersion:
-          parsed.displayVersion || `v${parsed.version || '3.0.0'}-standalone`,
+          parsed.displayVersion || `v${parsed.version || '0.1.2'}-beta`,
         repository: parsed.repository || 'Mr-Nickey/brokeify',
         branch: parsed.branch || 'main',
         changelog: Array.isArray(parsed.changelog) ? parsed.changelog : [],
@@ -4340,13 +4340,13 @@ function readLocalVersionMetadata() {
     }
   } catch {}
   return {
-    version: '3.0.0',
-    channel: 'standalone',
-    displayVersion: 'v3.0.0-standalone',
+    version: '0.1.2',
+    channel: 'beta',
+    displayVersion: 'v0.1.2-beta',
     repository: 'Mr-Nickey/brokeify',
     branch: 'main',
     changelog: [
-      'v3.0.0-standalone: All-in-one standalone SQLite music server, chokidar scanner, EBU R128 LUFS normalizer & HTTP 206 Range streaming engine',
+      'v0.1.2-beta: Standalone SQLite music server, chokidar scanner, EBU R128 LUFS normalizer & Android App QR pairing on Port 3487',
     ],
   };
 }
@@ -4400,7 +4400,7 @@ app.post('/api/version/check', (_req, res) => {
 async function startServer() {
   startChokidarMusicWatcher();
 
-  const PORT = Number(process.env.BROKEIFY_PORT || process.env.PORT || 3487);
+  const PORT = Number(process.env.PORT || 3487);
   const distPath = path.join(__dirname, 'dist');
   const distIndex = path.join(distPath, 'index.html');
   const isProd = process.env.NODE_ENV === 'production';
@@ -4432,30 +4432,17 @@ async function startServer() {
     });
   }
 
-  const portsToBind = Array.from(new Set([PORT, 3487, 3000]));
-  for (const p of portsToBind) {
-    if (p === PORT) {
-      app.listen(p, '0.0.0.0', () => {
-        console.log(
-          `[Brokeify Standalone Server] Listening on http://0.0.0.0:${p} (SQLite: ${DB_PATH} | Music: ${MUSIC_DIR})`
-        );
-        pushServerLog(
-          'success',
-          'system',
-          `Brokeify Standalone Server started on port ${p} (SQLite: ${DB_PATH} | Music: ${MUSIC_DIR})`
-        );
-      });
-    } else {
-      try {
-        const extraServer = app.listen(p, '0.0.0.0', () => {
-          console.log(
-            `[Brokeify Standalone Server] Dual-port listener active on http://0.0.0.0:${p}`
-          );
-        });
-        extraServer.on('error', () => {});
-      } catch {}
-    }
-  }
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(
+      `[Brokeify] Full-Stack Server listening on http://0.0.0.0:${PORT}`
+    );
+    pushServerLog(
+      'success',
+      'system',
+      `[Brokeify] Full-Stack Server listening on http://0.0.0.0:${PORT} (SQLite: ${DB_PATH} | Music: ${MUSIC_DIR})`
+    );
+  });
 }
 
 startServer();
+

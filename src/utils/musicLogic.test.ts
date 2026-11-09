@@ -207,9 +207,9 @@ test('Proactive stream buffer defaults to 6s and computeBufferedAheadSeconds mea
 
 test('ROTATING_SPITE_TAGLINES includes all 3 required taglines', () => {
   assert.equal(ROTATING_SPITE_TAGLINES.length, 3);
-  assert.ok(ROTATING_SPITE_TAGLINES[0].includes('Powered by spite and hard drives'));
-  assert.ok(ROTATING_SPITE_TAGLINES[1].includes('Jellyfin + Navidrome + Emby + Plex'));
-  assert.ok(ROTATING_SPITE_TAGLINES[2].includes('$11.99 a month is highway robbery'));
+  assert.ok(ROTATING_SPITE_TAGLINES[0].includes('Standalone SQLite Music Server'));
+  assert.ok(ROTATING_SPITE_TAGLINES[1].includes('EBU R128 -14 LUFS'));
+  assert.ok(ROTATING_SPITE_TAGLINES[2].includes('Port 3487'));
 });
 
 test('fisherYatesShuffle preserves all elements and does not mutate input', () => {

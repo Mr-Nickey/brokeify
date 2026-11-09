@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   Code2,
   Copy,
+  ExternalLink,
   Globe,
   KeyRound,
   Loader2,
@@ -319,8 +320,19 @@ const AndroidQrPairingPanel: React.FC<AndroidQrContentProps> = ({
 
             <ol className="text-xs text-zinc-200 space-y-2 list-decimal list-inside font-mono leading-relaxed">
               <li>
-                Open the <strong>Brokeify Android App</strong> on your phone and
-                tap <strong>&ldquo;Connect to Docker Server&rdquo;</strong>{' '}
+                Download &amp; install the official{' '}
+                <a
+                  href="https://github.com/Mr-Nickey/brokeify-android"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[#00ff66] underline hover:text-emerald-300 font-bold"
+                >
+                  Brokeify Android APK (github.com/Mr-Nickey/brokeify-android)
+                </a>{' '}
+                <span className="text-zinc-400">
+                  (Android-only for now)
+                </span>
+                , then tap <strong>&ldquo;Connect to Docker Server&rdquo;</strong>{' '}
                 (or the <strong>Scan QR Code 📷</strong> icon).
               </li>
               <li>
@@ -694,11 +706,24 @@ export const ConnectAndroidAppSection: React.FC = () => {
           <p className="text-xs sm:text-sm text-zinc-300 max-w-3xl">
             Scan this high-contrast QR code using your Brokeify Android
             app&apos;s built-in camera scanner to link your phone to this Docker
-            server and stream your library on the go.
+            server and stream your library on the go (mobile app is{' '}
+            <strong className="text-white">Android-only for now</strong>).
           </p>
         </div>
 
-        <div className="shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          <a
+            href="https://github.com/Mr-Nickey/brokeify-android"
+            target="_blank"
+            rel="noopener noreferrer"
+            data-testid="download-android-apk-link"
+            className="inline-flex items-center gap-2 rounded-xl border border-purple-500/50 bg-purple-500/15 hover:bg-purple-500/25 px-3.5 py-2 text-xs font-mono font-bold text-purple-300 transition-colors whitespace-nowrap min-h-[40px]"
+          >
+            <Smartphone className="w-4 h-4" />
+            <span>Get Android APK (GitHub)</span>
+            <ExternalLink className="w-3.5 h-3.5" />
+          </a>
+
           <button
             type="button"
             onClick={() => setShowPopup(true)}

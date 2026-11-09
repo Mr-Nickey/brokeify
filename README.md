@@ -2,49 +2,58 @@
 
 <img src="./public/pwa-192x192.png" alt="Brokeify Logo" width="110" height="110" />
 
-# Brokeify v3.0 (Standalone All-In-One SQLite Edition)
+# Brokeify (v0.1.2-beta)
 
-**Because $11.99 a month is highway robbery.**  
-*100% Standalone Self-Hosted Music Server, Embedded SQLite Library Engine (`/data/brokeify.db`), Real-Time Chokidar `/music` Drive & NAS Watcher, EBU R128 `-14 LUFS` Car-Stereo Normalizer, Android App QR Camera Pairing, and `slskd` + Lidarr + YouTube Music Autopilot — powered by spite, hard drives, and a '99 retro deck.*
+*Standalone Self-Hosted Music Server on Port `3487` · Embedded SQLite Library Engine (`/data/brokeify.db`) · Real-Time Chokidar `/music` Drive & NAS Watcher · EBU R128 `-14 LUFS` Audio Normalizer · Android App QR Camera Pairing · `slskd` + Lidarr + YouTube Music Downloader*
 
 [![Docker Ready](https://img.shields.io/badge/Docker%20%26%20Dockge-Port%203487-00ff66?style=for-the-badge&logo=docker&logoColor=black)](https://github.com/Mr-Nickey/brokeify)
-[![Current Version](https://img.shields.io/badge/Version-v3.0.0--standalone-00ff66?style=for-the-badge&logo=github)](https://github.com/Mr-Nickey/brokeify/releases)
+[![Current Version](https://img.shields.io/badge/Version-v0.1.2--beta-purple?style=for-the-badge&logo=github)](https://github.com/Mr-Nickey/brokeify/releases)
 [![Native SQLite Engine](https://img.shields.io/badge/Engine-Embedded%20SQLite%20%2B%20FFmpeg%20LUFS-38bdf8?style=for-the-badge&logo=sqlite&logoColor=white)](https://github.com/Mr-Nickey/brokeify)
-[![Android Companion API](https://img.shields.io/badge/Android%20App-Camera%20QR%20Pairing%20%2B%20HTTP%20206-a855f7?style=for-the-badge&logo=android&logoColor=white)](https://github.com/Mr-Nickey/brokeify)
+[![Android Companion App](https://img.shields.io/badge/Android%20APK-brokeify--android-a855f7?style=for-the-badge&logo=android&logoColor=white)](https://github.com/Mr-Nickey/brokeify-android)
 
 </div>
 
 ---
 
-## 🎧 What is Brokeify v3.0?
+## 📱 Official Brokeify Android App (APK Download)
 
-**Brokeify** is a completely standalone, all-in-one self-hosted music server, library manager, and audio streaming engine built for **Port `3487`**. No external media servers (no Jellyfin, Plex, Navidrome, or Subsonic) are required.
+Download the companion mobile app to stream from your Brokeify Docker server on the go or in the car:
 
-Point Brokeify at any local hard drive or NAS share mounted at `/music`, and Brokeify handles everything:
+👉 **Android APK & Source:** **[github.com/Mr-Nickey/brokeify-android](https://github.com/Mr-Nickey/brokeify-android)**
 
-- **Embedded SQLite Database (`/data/brokeify.db`):** High-speed normalized tables (`artists`, `albums`, `tracks`, `playlists`, `playlist_tracks`, `scrobbles`) with instant search and filtering.
-- **Zero Built-In Demo Tracks:** If no drive is connected or `/music` is empty, Brokeify displays an interactive **Connect Your Music Drive / NAS Setup Guide** with copy-ready Dockge/Docker Compose YAML and a live folder tester.
-- **Real-Time `chokidar` File & Playlist Watcher (`/music`):** Automatically indexes `FLAC`, `MP3`, `OGG`, `OPUS`, `M4A`, `WAV`, and `AAC` audio files via `music-metadata`, extracts embedded album art to `/data/covers/{album_id}.jpg`, and imports `.m3u` / `.m3u8` playlists.
-- **Integrated EBU R128 (`-14 LUFS`) Audio Normalization:** Background `ffmpeg` loudness scanner computes integrated loudness (`loudness_lufs`) and ReplayGain (`replaygain_track_gain`) so your car stereo and Android app play every album at a consistent volume without harsh jumps.
-- **Native Android App Camera QR Code Pairing (`Settings → Connect Android App`):**
+> **Note:** The mobile companion app is **Android-only for now**. Install the APK from [`brokeify-android`](https://github.com/Mr-Nickey/brokeify-android), open the built-in camera scanner inside the app, and scan the QR code in Brokeify's **Settings → Connect Android App** tab to link your phone.
+
+---
+
+## 🎧 Overview
+
+**Brokeify (`v0.1.2-beta`)** is a standalone, all-in-one self-hosted music server, library manager, and audio streaming engine built for **Port `3487`**. No external media servers are required.
+
+Mount any local hard drive or NAS share at `/music`, and Brokeify handles indexing, normalization, playlists, discovery, and streaming:
+
+- **Embedded SQLite Database (`/data/brokeify.db`):** Normalized tables (`artists`, `albums`, `tracks`, `playlists`, `playlist_tracks`, `scrobbles`) with fast search and filtering.
+- **Zero Built-In Demo Tracks:** If no drive is connected or `/music` is empty, Brokeify displays a **Connect Your Music Drive / NAS Setup Guide** with copy-ready Docker Compose YAML and a live folder tester.
+- **Real-Time `chokidar` File & Playlist Watcher (`/music`):** Automatically indexes `FLAC`, `MP3`, `OGG`, `OPUS`, `M4A`, `WAV`, and `AAC` audio files via `music-metadata`, caches embedded album art to `/data/covers/{album_id}.jpg`, and imports `.m3u` / `.m3u8` playlists.
+- **Integrated EBU R128 (`-14 LUFS`) Audio Normalization:** Background `ffmpeg` loudness scanner computes integrated loudness (`loudness_lufs`) and ReplayGain (`replaygain_track_gain`) for consistent volume across tracks.
+- **Connect Android App (`Settings → Connect Android App`):**
   - Displays a large, high-contrast QR code encoding a JSON payload with your server's local URL (`serverUrl` / `localUrl`), a 15-minute temporary connection token (`pair_...`), persistent API key, and streaming endpoints.
-  - Includes a 1-click **Copy Server URL** button and step-by-step instructions for scanning with your Android app's built-in camera.
-- **Better-Than-Explo Discovery & Multi-Downloader (`Request / Discover` Tab):**
-  - Drop any **Spotify Playlist / Album URL** or search **MusicBrainz** to inspect missing tracks and grab lossless FLAC / 320k MP3 via **`slskd` (Soulseek)**, **`Lidarr`**, or **`YouTube Music` (`yt-dlp`)**.
-- **Native ListenBrainz Scrobbler & MusicBrainz Auto-Tagger:**
-  - Automatically scrobbles tracks at 50% or 4 minutes of playback to ListenBrainz and cleans/organizes messy tags into `{Artist}/{Album} ({Year})/{TrackNumber} - {Title}.{ext}`.
+  - Includes a **Copy Server URL** button and instructions for scanning with the [**Brokeify Android App**](https://github.com/Mr-Nickey/brokeify-android) camera.
+- **Discovery & Multi-Downloader (`Request / Discover` Tab):**
+  - Search **MusicBrainz** or import a **Spotify Playlist / Album URL** to inspect missing tracks and download via **`slskd` (Soulseek)**, **`Lidarr`**, or **`YouTube Music` (`yt-dlp`)**.
+- **ListenBrainz Scrobbler & MusicBrainz Auto-Tagger:**
+  - Automatically scrobbles tracks at 50% or 4 minutes of playback to ListenBrainz and organizes tags into `{Artist}/{Album} ({Year})/{TrackNumber} - {Title}.{ext}`.
 
 ---
 
 ## 🐳 Quick Start: Dockge & Docker Compose (Port `3487`)
 
-Brokeify runs natively on **Port `3487`** (`3487:3487`) so it never conflicts with Port `3000` (Grafana, Open WebUI, Uptime Kuma, Gitea).
+Brokeify runs on **Port `3487`** (`3487:3487` with `PORT=3487`).
 
-### Option A: 1-Minute Setup in Dockge (Pulling Directly from GitHub)
+### Option A: Dockge / Docker Compose Setup (Pulling from GitHub)
 
 1. Open **Dockge** (`http://<your-server-ip>:5001`) and click **+ Compose**.
 2. Set the Stack Name to `brokeify`.
-3. Paste the following into the `compose.yaml` editor and replace the left side of `:/music:rw` with your actual music drive or NAS mount path:
+3. Paste the following into `compose.yaml` and replace the left side of `:/music:rw` with your music drive or NAS path:
 
 ```yaml
 services:
@@ -73,14 +82,14 @@ services:
       - /d/Message:/music:rw
 ```
 
-4. Click **Deploy** (and whenever you push updates to GitHub, click **Update** or run `docker compose build --no-cache && docker compose up -d` to pull the latest commit from `main`).
+4. Click **Deploy** (to pull the latest GitHub changes later, click **Update** or run `docker compose build --no-cache && docker compose up -d`).
 5. Open `http://<your-server-ip>:3487`.
 
 ---
 
-### Option B: Mounting a Network NAS Share (Synology / TrueNAS / Unraid SMB or NFS)
+### Option B: Mounting a Network NAS Share (SMB / CIFS)
 
-If your music lives on a NAS (`//192.168.1.x/music`), you can mount it directly in `docker-compose.yml` so Brokeify's `chokidar` scanner indexes it automatically:
+If your music is stored on a NAS (`//192.168.1.x/music`), you can mount it directly in `docker-compose.yml`:
 
 ```yaml
 services:
@@ -110,23 +119,21 @@ volumes:
 
 ---
 
-## 📱 Connecting Your Custom Android App (Camera QR Code Scanner)
+## 📱 Connecting the Brokeify Android App (Camera QR Code Scanner)
 
-Brokeify includes a dedicated **Connect Android App** pairing workflow in the top navigation bar (**`Connect Android App (QR)`**) and inside **`Settings → 1. Music Sources & Storage`**:
+Download the Android app (**Android-only for now**) from **[github.com/Mr-Nickey/brokeify-android](https://github.com/Mr-Nickey/brokeify-android)**.
 
-1. Open Brokeify in your desktop browser and go to **Settings** (or click **Connect Android App (QR)** in the top bar).
-2. Point your Android app's built-in camera scanner at the high-contrast QR code.
+1. Open Brokeify in your desktop browser and go to **Settings** (or click **📱 Connect Android App** in the top navigation bar).
+2. Open the [**Brokeify Android App**](https://github.com/Mr-Nickey/brokeify-android) on your phone and point its built-in camera scanner at the QR code.
 3. The QR code encodes a JSON payload containing the server's local URL, temporary connection token (`pair_...`), persistent API key (`brk_...`), and REST endpoints:
 
 ```json
 {
   "app": "brokeify",
-  "version": "3.0-sqlite",
-  "serverName": "Brokeify Music Server",
+  "v": 1,
   "serverUrl": "http://192.168.1.175:3487",
   "localUrl": "http://192.168.1.175:3487",
   "token": "pair_a1b2c3d4e5f6...",
-  "tokenExpiresAt": 1762709800000,
   "apiKey": "brk_9f8e7d6c5b4a...",
   "endpoints": {
     "verify": "/api/mobile/verify",
@@ -135,7 +142,7 @@ Brokeify includes a dedicated **Connect Android App** pairing workflow in the to
     "artists": "/api/library/artists",
     "playlists": "/api/playlists",
     "stream": "/api/stream/{trackId}",
-    "covers": "/api/covers/{albumId}",
+    "cover": "/api/covers/{albumId}",
     "scrobble": "/api/scrobble"
   }
 }
@@ -148,7 +155,7 @@ All endpoints support CORS and accept either `Authorization: Bearer <token>` or 
 | Endpoint | Method | Description |
 | :--- | :---: | :--- |
 | `/api/health` | `GET` | Server status, SQLite library counts (`totalTracks`, `totalAlbums`, `totalArtists`), LUFS queue status, and mounted `/music` drive diagnostics. |
-| `/api/mobile/pair-info` | `GET` | Generates/returns the QR pairing payload (`serverUrl`, `localUrl`, 15-min `token`, `apiKey`, and QR Data URL). |
+| `/api/mobile/pair-info` | `GET` | Generates/returns the QR pairing payload (`serverUrl`, `localUrl`, 15-min `token`, `apiKey`, and paired device list). |
 | `/api/mobile/regenerate-token` | `POST` | Issues a fresh 15-minute temporary pairing token (`pair_...`). |
 | `/api/mobile/verify` | `GET` / `POST` | Verifies the temporary `token` or persistent `apiKey` during camera QR handshake and returns server library summary + persistent `apiKey`. |
 | `/api/library/artists` | `GET` | Paginated list of artists (`?search=&limit=&offset=`). |
@@ -161,7 +168,7 @@ All endpoints support CORS and accept either `Authorization: Bearer <token>` or 
 
 ---
 
-## 🛠️ Building Locally for Development or Production
+## 🛠️ Building Locally
 
 ```bash
 # 1. Install dependencies
@@ -177,5 +184,5 @@ PORT=3487 npm start
 ---
 
 <div align="center">
-  <sub>Built with spite, hard drives, and Google AI Studio · Standalone SQLite Engine on Docker Port 3487 · Zero Subscriptions Forever</sub>
+  <sub>Brokeify v0.1.2-beta · Self-Hosted SQLite Music Server on Port 3487 · <a href="https://github.com/Mr-Nickey/brokeify-android">Brokeify Android App</a></sub>
 </div>

@@ -1,7 +1,7 @@
 {
   "name": "brokeify",
   "private": true,
-  "version": "0.0.0.1-beta",
+  "version": "0.1.2-beta",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",

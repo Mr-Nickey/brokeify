@@ -89,9 +89,9 @@ export function isValidVisualTheme(value?: string): value is VisualThemeId {
 }
 
 export const ROTATING_SPITE_TAGLINES: readonly string[] = [
-  'Zero subscriptions. Powered by spite and hard drives.',
-  'Jellyfin + Navidrome + Emby + Plex. One ring to rule them all.',
-  'Because $11.99 a month is highway robbery.',
+  'Standalone SQLite Music Server & Chokidar Watcher.',
+  'EBU R128 -14 LUFS Volume Normalization Engine.',
+  'Native Android App QR Pairing on Port 3487.',
 ];
 
 export const EQ_FREQUENCIES = [60, 230, 910, 3600, 14000] as const;

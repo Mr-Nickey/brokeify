@@ -1,16 +1,15 @@
 {
-  "version": "0.0.0.1",
+  "version": "0.1.2",
   "channel": "beta",
-  "displayVersion": "v0.0.0.1-beta",
-  "codename": "Homelab Beta Deck",
+  "displayVersion": "v0.1.2-beta",
+  "codename": "Standalone SQLite Beta Deck",
   "repository": "Mr-Nickey/brokeify",
   "branch": "main",
-  "releasedAt": "2026-11-08",
+  "releasedAt": "2026-11-09",
   "changelog": [
-    "v0.0.0.1-beta: Initial self-hosted Docker full-stack beta release on Port 3487",
-    "Added Per-Device Jellyfin Login Gate with Zero-Reentry shared homelab profile",
-    "Added Cross-Device Playback Handoff (pause on phone, resume on Chromecast/TV)",
-    "Added Lidarr, slskd, YouTube Music & Internet Archive download engines",
-    "Added Diagnostic & Error Logger (Settings -> 4. Debug & Error Logs) and GitHub Version Checker"
+    "v0.1.2-beta: Standalone SQLite music server (/data/brokeify.db), Chokidar /music drive & NAS watcher, and EBU R128 -14 LUFS audio normalizer on Port 3487",
+    "Added Connect Android App section with high-contrast QR code, temporary connection token, Copy Server URL button, and link to github.com/Mr-Nickey/brokeify-android",
+    "Added Docker Compose & NAS Drive Setup Guide overlay when no audio files are detected in /music",
+    "Added HTTP 206 Partial Content byte-range streaming (/api/stream/:trackId) and disk-cached cover art (/api/covers/:albumId)"
   ]
 }
