@@ -1,6 +1,7 @@
 services:
   brokeify:
-    build: https://github.com/Mr-Nickey/brokeify.git#main
+    image: ghcr.io/mr-nickey/brokeify:latest
+    pull_policy: always
     container_name: brokeify
     restart: unless-stopped
     ports:
@@ -26,4 +27,3 @@ services:
       # Example (Windows / WSL2): /d/Message:/music:rw
       # Example (Linux / NAS):    /mnt/nas/music:/music:rw
       - /path/to/your/music:/music:rw
-

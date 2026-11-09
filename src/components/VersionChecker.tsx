@@ -69,8 +69,8 @@ export const VersionChecker: React.FC<VersionCheckerProps> = ({
   }
 
   const v = versionStatus || {
-    localVersion: '0.0.0.1',
-    localDisplayVersion: 'v0.0.0.1-beta',
+    localVersion: '0.1.2',
+    localDisplayVersion: 'v0.1.2-beta',
     localChannel: 'beta',
     localCommitSha: null,
     localBuildTime: null,
@@ -83,13 +83,12 @@ export const VersionChecker: React.FC<VersionCheckerProps> = ({
     repository: 'Mr-Nickey/brokeify',
     branch: 'main',
     updateAvailable: false,
-    statusSummary: 'Running local Docker build.',
+    statusSummary: 'Running Docker image ghcr.io/mr-nickey/brokeify:latest.',
     checkedAt: new Date().toISOString(),
     changelog: [
-      'v0.0.0.1-beta: Initial full-stack Docker release on Port 3487',
-      'Cross-Device Playback Handoff (phone to TV/Chromecast)',
-      'Per-device Jellyfin login gate & zero-reentry shared homelab profile',
-      'Lidarr, slskd, YouTube Music, and Internet Archive download engines',
+      'v0.1.2-beta: Standalone SQLite music server, Chokidar /music drive watcher & EBU R128 -14 LUFS normalizer on Port 3487',
+      'Added Connect Android App section with high-contrast QR code & temporary connection token',
+      'Published pre-built GHCR image (ghcr.io/mr-nickey/brokeify:latest) for 1-click Dockge updates',
     ],
   };
 
@@ -248,17 +247,14 @@ export const VersionChecker: React.FC<VersionCheckerProps> = ({
           {showHowToUpdate && (
             <div className="rounded-lg bg-zinc-950 p-3 border border-zinc-800 space-y-2">
               <div className="text-xs font-mono font-bold text-zinc-300">
-                Update in 3 Commands on your Homelab / Server:
+                Click &ldquo;Update&rdquo; in Dockge, or run on your server:
               </div>
               <pre className="text-[11px] font-mono bg-zinc-900/90 text-zinc-200 p-2.5 rounded border border-zinc-800 overflow-x-auto select-all">
-{`docker compose down
-docker compose pull || docker compose build --no-cache
+{`docker compose pull
 docker compose up -d`}
               </pre>
               <p className="text-[11px] text-zinc-400 font-mono">
-                All settings, API keys, playlists &amp; themes in{' '}
-                <code className="text-[#00ff66]">/app/data/config.json</code>{' '}
-                are kept completely safe across Docker rebuilds.
+                All settings, SQLite database (<code className="text-[#00ff66]">/data/brokeify.db</code>), and cover art in <code className="text-[#00ff66]">/data</code> are kept safe across image updates.
               </p>
             </div>
           )}

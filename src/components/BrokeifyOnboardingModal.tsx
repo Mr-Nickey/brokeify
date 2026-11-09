@@ -55,7 +55,8 @@ interface BrokeifyOnboardingModalProps {
 
 const DOCKER_COMPOSE_LOCAL_EXAMPLE = `services:
   brokeify:
-    build: https://github.com/Mr-Nickey/brokeify.git#main
+    image: ghcr.io/mr-nickey/brokeify:latest
+    pull_policy: always
     container_name: brokeify
     restart: unless-stopped
     ports:
@@ -79,7 +80,8 @@ networks: {}`;
 
 const DOCKER_COMPOSE_NAS_SMB_EXAMPLE = `services:
   brokeify:
-    build: https://github.com/Mr-Nickey/brokeify.git#main
+    image: ghcr.io/mr-nickey/brokeify:latest
+    pull_policy: always
     container_name: brokeify
     restart: unless-stopped
     ports:

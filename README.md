@@ -47,9 +47,9 @@ Mount any local hard drive or NAS share at `/music`, and Brokeify handles indexi
 
 ## 🐳 Quick Start: Dockge & Docker Compose (Port `3487`)
 
-Brokeify runs on **Port `3487`** (`3487:3487` with `PORT=3487`).
+Every push to `main` automatically builds and publishes a ready-to-pull Docker image to GitHub Container Registry (`ghcr.io/mr-nickey/brokeify:latest`) via GitHub Actions. Using `image: ghcr.io/mr-nickey/brokeify:latest` with `pull_policy: always` ensures clicking **Update** in Dockge pulls the latest release immediately.
 
-### Option A: Dockge / Docker Compose Setup (Pulling from GitHub)
+### Option A: Dockge / Docker Compose Setup
 
 1. Open **Dockge** (`http://<your-server-ip>:5001`) and click **+ Compose**.
 2. Set the Stack Name to `brokeify`.
@@ -58,7 +58,8 @@ Brokeify runs on **Port `3487`** (`3487:3487` with `PORT=3487`).
 ```yaml
 services:
   brokeify:
-    build: https://github.com/Mr-Nickey/brokeify.git#main
+    image: ghcr.io/mr-nickey/brokeify:latest
+    pull_policy: always
     container_name: brokeify
     restart: unless-stopped
     ports:
@@ -75,15 +76,18 @@ services:
       # - SLSKD_API_KEY=your_slskd_api_key
       # - LISTENBRAINZ_USER=your_listenbrainz_username
     volumes:
-      - ./data:/data
+      - /c/docker/brokeify/data:/data
       # Mount your local hard drive or NAS music folder to /music inside the container:
       # Windows Docker / WSL2 example: /d/Message:/music:rw
       # Linux / NAS example: /mnt/nas/music:/music:rw
       - /d/Message:/music:rw
 ```
 
-4. Click **Deploy** (to pull the latest GitHub changes later, click **Update** or run `docker compose build --no-cache && docker compose up -d`).
+4. Click **Deploy** (and whenever a new version is pushed to GitHub, click **Update** in Dockge or run `docker compose pull && docker compose up -d`).
 5. Open `http://<your-server-ip>:3487`.
+
+> **Note on GHCR Package Visibility (First-Time Setup):**  
+> After the first GitHub Action run under the **Actions** tab (`Build and Publish Brokeify Docker Image`), open your GitHub **Packages** page (`ghcr.io/mr-nickey/brokeify`), go to **Package settings**, and set visibility to **Public** so Dockge can pull `ghcr.io/mr-nickey/brokeify:latest` without needing `docker login`.
 
 ---
 
@@ -94,7 +98,8 @@ If your music is stored on a NAS (`//192.168.1.x/music`), you can mount it direc
 ```yaml
 services:
   brokeify:
-    build: https://github.com/Mr-Nickey/brokeify.git#main
+    image: ghcr.io/mr-nickey/brokeify:latest
+    pull_policy: always
     container_name: brokeify
     restart: unless-stopped
     ports:

@@ -4398,8 +4398,6 @@ app.post('/api/version/check', (_req, res) => {
 // ============================================================================
 
 async function startServer() {
-  startChokidarMusicWatcher();
-
   const PORT = Number(process.env.PORT || 3487);
   const distPath = path.join(__dirname, 'dist');
   const distIndex = path.join(distPath, 'index.html');
@@ -4441,6 +4439,7 @@ async function startServer() {
       'system',
       `[Brokeify] Full-Stack Server listening on http://0.0.0.0:${PORT} (SQLite: ${DB_PATH} | Music: ${MUSIC_DIR})`
     );
+    startChokidarMusicWatcher();
   });
 }
 

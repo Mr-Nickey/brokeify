@@ -94,12 +94,101 @@ function toSortName(name: string): string {
 
 // ============================================================================
 // 2. EMBEDDED SQLITE DATABASE INITIALIZATION (better-sqlite3)
+//    Runs on container-local Linux disk (/tmp/brokeify-runtime.db) with
+//    mmap_size=0 and journal_mode=DELETE, syncing to /data/brokeify.db.
+//    This prevents SIGSEGV (exit code 139) when /data is bind-mounted from
+//    Windows NTFS (C:/...), WSL2 9P, or SMB/NFS network shares.
 // ============================================================================
 
-export const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.pragma('synchronous = NORMAL');
-db.pragma('foreign_keys = ON');
+const RUNTIME_DB_PATH = path.join('/tmp', 'brokeify-runtime.db');
+
+function initializeSafeSqliteDatabase(): Database.Database {
+  // 1. Clean up any stale WAL/SHM files left by older crashes on Windows mounts
+  for (const staleFile of [
+    `${DB_PATH}-shm`,
+    `${DB_PATH}-wal`,
+    `${RUNTIME_DB_PATH}-shm`,
+    `${RUNTIME_DB_PATH}-wal`,
+  ]) {
+    try {
+      if (fs.existsSync(staleFile)) {
+        fs.unlinkSync(staleFile);
+      }
+    } catch {}
+  }
+
+  // 2. If a persistent /data/brokeify.db already exists, copy it into /tmp/brokeify-runtime.db
+  try {
+    if (fs.existsSync(DB_PATH)) {
+      const stat = fs.statSync(DB_PATH);
+      if (stat.isFile() && stat.size > 0) {
+        fs.copyFileSync(DB_PATH, RUNTIME_DB_PATH);
+      }
+    }
+  } catch (err) {
+    console.warn(
+      '[Brokeify SQLite] Could not copy existing DB from /data, starting fresh runtime DB:',
+      err
+    );
+  }
+
+  // 3. Open SQLite on container-local /tmp (or in-memory fallback if /tmp fails)
+  let instance: Database.Database;
+  try {
+    instance = new Database(RUNTIME_DB_PATH);
+  } catch (err) {
+    console.warn(
+      '[Brokeify SQLite] Failed opening runtime DB file, falling back to in-memory SQLite:',
+      err
+    );
+    instance = new Database(':memory:');
+  }
+
+  try {
+    instance.pragma('mmap_size = 0');
+    instance.pragma('journal_mode = DELETE');
+    instance.pragma('synchronous = NORMAL');
+    instance.pragma('foreign_keys = ON');
+  } catch (err) {
+    console.warn('[Brokeify SQLite] Pragma warning:', err);
+  }
+
+  return instance;
+}
+
+export const db = initializeSafeSqliteDatabase();
+
+let syncDbTimer: ReturnType<typeof setTimeout> | null = null;
+
+export function syncDatabaseToPersistentDisk(immediate = false): void {
+  const performSync = () => {
+    syncDbTimer = null;
+    try {
+      if (fs.existsSync(RUNTIME_DB_PATH)) {
+        fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+        const tempTarget = `${DB_PATH}.tmp`;
+        fs.copyFileSync(RUNTIME_DB_PATH, tempTarget);
+        fs.renameSync(tempTarget, DB_PATH);
+      }
+    } catch {
+      try {
+        if (fs.existsSync(RUNTIME_DB_PATH)) {
+          fs.copyFileSync(RUNTIME_DB_PATH, DB_PATH);
+        }
+      } catch {}
+    }
+  };
+
+  if (immediate) {
+    if (syncDbTimer) clearTimeout(syncDbTimer);
+    performSync();
+    return;
+  }
+
+  if (!syncDbTimer) {
+    syncDbTimer = setTimeout(performSync, 2500);
+  }
+}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS artists (
@@ -181,6 +270,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_scrobbles_track_id ON scrobbles(track_id);
   CREATE INDEX IF NOT EXISTS idx_scrobbles_timestamp ON scrobbles(timestamp);
 `);
+
+syncDatabaseToPersistentDisk(true);
 
 // ============================================================================
 // 3. EBU R128 LUFS BACKGROUND NORMALIZATION ENGINE (ffmpeg)
@@ -796,7 +887,8 @@ function walkMusicDirectory(dir: string): {
   const audioFiles: string[] = [];
   const m3uFiles: string[] = [];
 
-  function walk(current: string) {
+  function walk(current: string, depth = 0) {
+    if (depth > 12) return;
     let entries: fs.Dirent[] = [];
     try {
       entries = fs.readdirSync(current, { withFileTypes: true });
@@ -804,10 +896,12 @@ function walkMusicDirectory(dir: string): {
       return;
     }
     for (const entry of entries) {
-      if (entry.name.startsWith('.')) continue;
+      if (entry.name.startsWith('.') || entry.name === '$RECYCLE.BIN' || entry.name === 'System Volume Information') {
+        continue;
+      }
       const fullPath = path.join(current, entry.name);
       if (entry.isDirectory()) {
-        walk(fullPath);
+        walk(fullPath, depth + 1);
       } else if (entry.isFile()) {
         const ext = path.extname(entry.name).toLowerCase();
         if (SUPPORTED_AUDIO_EXTENSIONS.has(ext)) {
@@ -819,7 +913,7 @@ function walkMusicDirectory(dir: string): {
     }
   }
 
-  walk(dir);
+  walk(dir, 0);
   return { audioFiles, m3uFiles };
 }
 
@@ -854,10 +948,15 @@ export async function runFullLibraryScan(): Promise<{
     }
 
     let indexedCount = 0;
-    for (const file of audioFiles) {
+    for (let i = 0; i < audioFiles.length; i++) {
+      const file = audioFiles[i];
       const id = await indexAudioFile(file);
       if (id) indexedCount++;
       scannerState.scannedFilesCount = indexedCount;
+      // Yield to the Node.js event loop every 8 files so HTTP requests stay fast
+      if (i % 8 === 0) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
     }
 
     let m3uCount = 0;
@@ -867,6 +966,7 @@ export async function runFullLibraryScan(): Promise<{
     }
 
     scannerState.lastScanAt = new Date().toISOString();
+    syncDatabaseToPersistentDisk();
     return { indexedTracks: indexedCount, importedPlaylists: m3uCount };
   } finally {
     scannerState.isScanning = false;
@@ -897,17 +997,20 @@ export function startChokidarMusicWatcher() {
 
   purgeLegacySampleFiles(MUSIC_DIR);
 
-  // Run initial scan immediately
-  runFullLibraryScan().catch((err) =>
-    console.error('[Brokeify Scanner] Initial scan error:', err)
-  );
+  // Run initial scan asynchronously so server startup is never blocked
+  setTimeout(() => {
+    runFullLibraryScan().catch((err) =>
+      console.error('[Brokeify Scanner] Initial scan error:', err)
+    );
+  }, 300);
 
   try {
     if (fs.existsSync(MUSIC_DIR)) {
       activeWatcher = chokidar.watch(MUSIC_DIR, {
-        ignored: /(^|[/\\])\../,
+        ignored: /(^|[/\\])(\..|\$RECYCLE\.BIN|System Volume Information)/,
         persistent: true,
         ignoreInitial: true,
+        ignorePermissionErrors: true,
         awaitWriteFinish: {
           stabilityThreshold: 1500,
           pollInterval: 250,
@@ -919,23 +1022,31 @@ export function startChokidarMusicWatcher() {
           const ext = path.extname(filePath).toLowerCase();
           if (SUPPORTED_AUDIO_EXTENSIONS.has(ext)) {
             await indexAudioFile(filePath);
+            syncDatabaseToPersistentDisk();
           } else if (SUPPORTED_PLAYLIST_EXTENSIONS.has(ext)) {
             importM3uPlaylistFile(filePath);
+            syncDatabaseToPersistentDisk();
           }
         })
         .on('change', async (filePath) => {
           const ext = path.extname(filePath).toLowerCase();
           if (SUPPORTED_AUDIO_EXTENSIONS.has(ext)) {
             await indexAudioFile(filePath);
+            syncDatabaseToPersistentDisk();
           } else if (SUPPORTED_PLAYLIST_EXTENSIONS.has(ext)) {
             importM3uPlaylistFile(filePath);
+            syncDatabaseToPersistentDisk();
           }
         })
         .on('unlink', (filePath) => {
           const ext = path.extname(filePath).toLowerCase();
           if (SUPPORTED_AUDIO_EXTENSIONS.has(ext)) {
             removeAudioFileFromIndex(filePath);
+            syncDatabaseToPersistentDisk();
           }
+        })
+        .on('error', (err) => {
+          console.warn('[Brokeify Watcher] Non-fatal watcher warning:', err);
         });
     }
   } catch (err) {
