@@ -5,29 +5,15 @@ import {
   ArrowDownToLine,
   Check,
   CheckCircle2,
-  Cloud,
-  CloudDownload,
-  CloudUpload,
   Database,
-  Eye,
-  EyeOff,
   HardDrive,
   Loader2,
-  Lock,
-  LogOut,
-  Plus,
   Radio,
   RefreshCw,
   Save,
   Server,
   ShieldCheck,
-  Smartphone,
-  Sparkles,
   Terminal,
-  Wifi,
-  WifiOff,
-  X,
-  Zap,
 } from 'lucide-react';
 import type {
   BrokeifyCloudSettings,
@@ -39,14 +25,15 @@ import type {
   Track,
 } from '../types/music';
 import { MusicProviderManager } from '../services/MusicProviderManager';
-import { buildJellyfinDisplayPrefsUrl } from '../utils/musicLogic';
 import {
   ARTWORK_CACHE_DB_NAME,
   clearArtworkCache,
   getArtworkCacheStats,
 } from '../utils/artworkCache';
-import { PWAInstallButton } from './PWAInstallButton';
-import { SlidingToggle } from './SlidingToggle';
+import {
+  ConnectAndroidAppSection,
+  PWAInstallButton,
+} from './PWAInstallButton';
 import { VersionChecker } from './VersionChecker';
 
 interface SourcesHubViewProps {
@@ -68,45 +55,18 @@ interface SourcesHubViewProps {
   onLockDeviceForLogin?: () => void;
 }
 
-const RADIO_TAGS = [
-  'rock',
-  'synthwave',
-  'electronic',
-  'jazz',
-  'metal',
-  'ambient',
-] as const;
-
 export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
   providers,
   onUpdateProviders,
   onMergeRemoteTracks,
   onMergeRemotePlaylists,
   storagePersistStatus,
-  cloudSyncStatus,
-  onPushCloudSettings,
-  onPullCloudSettings,
-  onApplyRestoredCloudSettings,
   onOpenOnboardingModal,
-  onLogoutProvider,
   serverIntegrations,
   serverConfigPath = '/app/data/config.json',
   onUpdateServerIntegrations,
   onSaveServerConfigNow,
-  onLockDeviceForLogin,
 }) => {
-  const [testingId, setTestingId] = useState<string | null>(null);
-  const [selectedRadioTag, setSelectedRadioTag] = useState<string>('rock');
-  const [fetchingCloudSource, setFetchingCloudSource] = useState<string | null>(
-    null
-  );
-  const [showAddSourcePicker, setShowAddSourcePicker] =
-    useState<boolean>(false);
-  const [visibleSecrets, setVisibleSecrets] = useState<Record<string, boolean>>(
-    {}
-  );
-  const [confirmingLogoutType, setConfirmingLogoutType] =
-    useState<ProviderType | null>(null);
   const [isSavingConfigFile, setIsSavingConfigFile] = useState<boolean>(false);
   const [isTestingLidarr, setIsTestingLidarr] = useState<boolean>(false);
   const [lidarrTestStatus, setLidarrTestStatus] = useState<{
@@ -122,15 +82,6 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
     hint?: string;
   } | null>(null);
 
-  const [isTestingJellyfin, setIsTestingJellyfin] = useState<boolean>(false);
-  const [jellyfinTestStatus, setJellyfinTestStatus] = useState<{
-    ok: boolean;
-    message: string;
-    hint?: string;
-    serverName?: string;
-    version?: string;
-  } | null>(null);
-
   const [isTestingListenbrainz, setIsTestingListenbrainz] =
     useState<boolean>(false);
   const [listenbrainzTestStatus, setListenbrainzTestStatus] = useState<{
@@ -140,16 +91,6 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
   } | null>(null);
 
   const [isTestingAll, setIsTestingAll] = useState<boolean>(false);
-  const [allServicesResult, setAllServicesResult] = useState<{
-    ok: boolean;
-    services: {
-      jellyfin: { ok: boolean; message: string; hint?: string };
-      slskd: { ok: boolean; message: string; hint?: string };
-      lidarr: { ok: boolean; message: string; hint?: string };
-      listenbrainz: { ok: boolean; message: string };
-      storage: { ok: boolean; message: string };
-    };
-  } | null>(null);
 
   const [savedCardFeedback, setSavedCardFeedback] = useState<
     Record<string, string>
@@ -296,9 +237,6 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
     refreshSqliteHealth();
   }, []);
 
-  const jellyfinProvider =
-    providers.find((p) => p.type === 'jellyfin') || providers[0];
-
   const showSavedCard = (cardKey: string, msg = 'Saved to config.json!') => {
     setSavedCardFeedback((prev) => ({ ...prev, [cardKey]: msg }));
     setTimeout(() => {
@@ -358,47 +296,6 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
     }
   };
 
-  const handleTestJellyfin = async (prov?: ProviderConfig) => {
-    const targetProv = prov || jellyfinProvider;
-    setIsTestingJellyfin(true);
-    setJellyfinTestStatus(null);
-    try {
-      const resp = await fetch('/api/jellyfin/test', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          serverUrl: targetProv?.serverUrl,
-          token: targetProv?.token,
-          username: targetProv?.username,
-          password: targetProv?.password,
-        }),
-      });
-      const data = await resp.json().catch(() => ({}));
-      if (resp.ok && data.ok) {
-        setJellyfinTestStatus({
-          ok: true,
-          message: data.message || 'Connected to Jellyfin!',
-          serverName: data.serverName,
-          version: data.serverVersion,
-        });
-      } else {
-        setJellyfinTestStatus({
-          ok: false,
-          message: data.error || 'Connection failed to Jellyfin.',
-          hint: data.hint,
-        });
-      }
-    } catch {
-      setJellyfinTestStatus({
-        ok: false,
-        message: 'Network error testing Jellyfin connection.',
-        hint: 'Ensure port 8096 is reachable from this Docker container.',
-      });
-    } finally {
-      setIsTestingJellyfin(false);
-    }
-  };
-
   const handleTestListenbrainz = async () => {
     setIsTestingListenbrainz(true);
     setListenbrainzTestStatus(null);
@@ -436,16 +333,11 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
 
   const handleTestAllServices = async () => {
     setIsTestingAll(true);
-    setAllServicesResult(null);
     try {
       const resp = await fetch('/api/services/test-all', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          jellyfin: {
-            jellyfinUrl: jellyfinProvider?.serverUrl,
-            jellyfinToken: jellyfinProvider?.token,
-          },
           slskd: {
             slskdUrl: serverIntegrations?.slskdUrl,
             slskdApiKey: serverIntegrations?.slskdApiKey,
@@ -462,10 +354,6 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
       });
       const data = await resp.json().catch(() => ({}));
       if (resp.ok && data.services) {
-        setAllServicesResult(data);
-        if (data.services.jellyfin) {
-          setJellyfinTestStatus(data.services.jellyfin);
-        }
         if (data.services.slskd) {
           setSlskdTestStatus(data.services.slskd);
         }
@@ -476,587 +364,12 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
           setListenbrainzTestStatus(data.services.listenbrainz);
         }
       }
+      await refreshSqliteHealth();
     } catch {
       // ignore
     } finally {
       setIsTestingAll(false);
     }
-  };
-
-  const jellyfinDisplayPrefsEndpoint = jellyfinProvider?.serverUrl?.trim()
-    ? buildJellyfinDisplayPrefsUrl(
-        jellyfinProvider.serverUrl,
-        jellyfinProvider.userId || jellyfinProvider.username || 'admin',
-        jellyfinProvider.token
-      )
-    : '/DisplayPreferences/brokeify?client=Brokeify';
-
-  const handleFieldChange = (
-    id: string,
-    field: keyof ProviderConfig,
-    value: string | boolean
-  ) => {
-    const next = providers.map((p) =>
-      p.id === id ? { ...p, [field]: value } : p
-    );
-    onUpdateProviders(next);
-  };
-
-  const handleSecretChange = (prov: ProviderConfig, rawValue: string) => {
-    const next = providers.map((p) => {
-      if (p.id !== prov.id) return p;
-      if (p.type === 'plex') {
-        return { ...p, token: rawValue, password: rawValue };
-      }
-      return {
-        ...p,
-        password: rawValue,
-        token: '',
-        authMode: 'password' as const,
-      };
-    });
-    onUpdateProviders(next);
-  };
-
-  const handleClearSecret = (prov: ProviderConfig) => {
-    if (prov.type === 'jellyfin') {
-      try {
-        localStorage.removeItem('jellyfin_token');
-        localStorage.removeItem('jellyfin_user_id');
-      } catch {
-        // ignore
-      }
-    }
-    const next = providers.map((p) =>
-      p.id === prov.id
-        ? {
-            ...p,
-            password: '',
-            token: '',
-            userId: '',
-            status: 'disconnected' as const,
-            diagnosticLog: 'Cleared saved credentials from localStorage.',
-            lastMessage: 'Cleared saved credentials.',
-          }
-        : p
-    );
-    onUpdateProviders(next);
-  };
-
-  const toggleSecretVisibility = (id: string) => {
-    setVisibleSecrets((prev) => ({ ...prev, [id]: !prev[id] }));
-  };
-
-  const handleActivateHiddenSource = (provId: string) => {
-    const next = providers.map((p) =>
-      p.id === provId ? { ...p, enabled: true } : p
-    );
-    onUpdateProviders(next);
-  };
-
-  const handleTestAndSync = async (provider: ProviderConfig) => {
-    setTestingId(provider.id);
-    try {
-      if (provider.type === 'jellyfin' || provider.type === 'emby') {
-        const {
-          updatedConfig,
-          tracks,
-          playlists: syncedPlaylists,
-          restoredCloudSettings,
-        } = await MusicProviderManager.fetchJellyfinMusic(provider);
-
-        // Auto-turn OFF Built-In Demo Tracks once Jellyfin connects with real songs
-        const shouldDisableDemo =
-          provider.type === 'jellyfin' &&
-          updatedConfig.status === 'connected' &&
-          tracks.length > 0;
-
-        const updatedList = providers.map((p) => {
-          if (p.id === provider.id) return updatedConfig;
-          if (shouldDisableDemo && p.type === 'built-in') {
-            return {
-              ...p,
-              enabled: false,
-              lastMessage:
-                'Auto-disabled so only your real Jellyfin library & playlists appear.',
-            };
-          }
-          return p;
-        });
-
-        onUpdateProviders(updatedList);
-        if (tracks.length > 0) {
-          onMergeRemoteTracks(tracks, provider.name);
-        }
-        if (syncedPlaylists.length > 0) {
-          onMergeRemotePlaylists(syncedPlaylists);
-        }
-
-        if (
-          provider.type === 'jellyfin' &&
-          updatedConfig.status === 'connected'
-        ) {
-          if (restoredCloudSettings) {
-            onApplyRestoredCloudSettings(restoredCloudSettings);
-          } else {
-            await onPullCloudSettings(updatedConfig);
-          }
-        }
-      } else if (provider.type === 'navidrome') {
-        const { updatedConfig, tracks } =
-          await MusicProviderManager.connectNavidrome(provider);
-        onUpdateProviders(
-          providers.map((p) => (p.id === provider.id ? updatedConfig : p))
-        );
-        if (tracks.length > 0) {
-          onMergeRemoteTracks(tracks, provider.name);
-        }
-      } else if (provider.type === 'plex') {
-        const { updatedConfig, tracks } =
-          await MusicProviderManager.connectPlex(provider);
-        onUpdateProviders(
-          providers.map((p) => (p.id === provider.id ? updatedConfig : p))
-        );
-        if (tracks.length > 0) {
-          onMergeRemoteTracks(tracks, provider.name);
-        }
-      } else if (provider.type === 'radio-browser') {
-        const tracks = await MusicProviderManager.fetchRadioBrowserStations(
-          selectedRadioTag
-        );
-        const msg = `✅ Connected! Loaded ${tracks.length} live ${selectedRadioTag.toUpperCase()} stations`;
-        const updated: ProviderConfig = {
-          ...provider,
-          enabled: true,
-          status: 'connected',
-          lastMessage: msg,
-          diagnosticLog: msg,
-          trackCount: tracks.length,
-        };
-        onUpdateProviders(
-          providers.map((p) => (p.id === provider.id ? updated : p))
-        );
-        onMergeRemoteTracks(tracks, `Radio-Browser (${selectedRadioTag})`);
-      } else if (provider.type === 'internet-archive') {
-        const tracks =
-          await MusicProviderManager.fetchInternetArchiveTracks();
-        const msg = `✅ Connected! Loaded ${tracks.length} lossless/VBR live concert recordings`;
-        const updated: ProviderConfig = {
-          ...provider,
-          enabled: true,
-          status: 'connected',
-          lastMessage: msg,
-          diagnosticLog: msg,
-          trackCount: tracks.length,
-        };
-        onUpdateProviders(
-          providers.map((p) => (p.id === provider.id ? updated : p))
-        );
-        onMergeRemoteTracks(tracks, 'Internet Archive');
-      } else {
-        const {
-          updatedConfig,
-          tracks,
-          playlists: syncedPlaylists,
-        } = await MusicProviderManager.fetchLocalSqliteLibrary(provider);
-        onUpdateProviders(
-          providers.map((p) => (p.id === provider.id ? updatedConfig : p))
-        );
-        if (tracks.length > 0) {
-          onMergeRemoteTracks(tracks, provider.name);
-        }
-        if (syncedPlaylists.length > 0) {
-          onMergeRemotePlaylists(syncedPlaylists);
-        }
-        await refreshSqliteHealth();
-      }
-    } finally {
-      setTestingId(null);
-    }
-  };
-
-  const handleFetchRadioTag = async (tag: string) => {
-    setSelectedRadioTag(tag);
-    setFetchingCloudSource('radio');
-    try {
-      const tracks = await MusicProviderManager.fetchRadioBrowserStations(tag);
-      onMergeRemoteTracks(tracks, `Radio-Browser (${tag})`);
-    } finally {
-      setFetchingCloudSource(null);
-    }
-  };
-
-  const activeProviders = providers.filter((p) => p.enabled);
-  const hiddenProviders = providers.filter((p) => !p.enabled);
-
-  const renderConnectorCard = (prov: ProviderConfig) => {
-    const isTesting = testingId === prov.id;
-    const isJellyfinOrEmby = prov.type === 'jellyfin' || prov.type === 'emby';
-    const isSelfHosted = ['jellyfin', 'emby', 'navidrome', 'plex'].includes(
-      prov.type
-    );
-    const currentSecretValue =
-      prov.type === 'plex' ? (prov.token ?? '') : (prov.password ?? '');
-    const isShowingSecret = Boolean(visibleSecrets[prov.id]);
-    const diagnosticText = prov.diagnosticLog || prov.lastMessage;
-    const isConnectedSession =
-      prov.status === 'connected' || Boolean(prov.token?.trim());
-
-    return (
-      <div
-        key={prov.id}
-        data-testid={`connector-card-${prov.type}`}
-        className="rounded-2xl border border-zinc-800/90 bg-zinc-900/50 p-5 sm:p-6 flex flex-col justify-between gap-5 transition-colors"
-      >
-        <div className="space-y-4">
-          {/* Card Header + Sliding Toggle Switch */}
-          <div className="flex items-start justify-between gap-4">
-            <div className="flex items-center gap-3 min-w-0">
-              <div className="w-10 h-10 rounded-xl bg-zinc-800/90 flex items-center justify-center shrink-0">
-                {prov.type === 'navidrome' ? (
-                  <HardDrive className="w-5 h-5 text-emerald-400" />
-                ) : prov.type === 'radio-browser' ? (
-                  <Radio className="w-5 h-5 text-emerald-400" />
-                ) : prov.type === 'internet-archive' ? (
-                  <Cloud className="w-5 h-5 text-purple-400" />
-                ) : prov.type === 'built-in' ? (
-                  <ShieldCheck className="w-5 h-5 text-emerald-400" />
-                ) : (
-                  <Server className="w-5 h-5 text-purple-400" />
-                )}
-              </div>
-              <div className="min-w-0">
-                <h3 className="text-base font-bold text-white truncate">
-                  {prov.name}
-                </h3>
-                <p className="text-xs text-zinc-400 font-mono truncate">
-                  {isJellyfinOrEmby
-                    ? 'Quick Connect or Username & Password'
-                    : prov.type === 'navidrome'
-                      ? 'Subsonic REST API v1.16.1'
-                      : prov.type === 'plex'
-                        ? 'Plex Music Server (X-Plex-Token)'
-                        : prov.serverUrl}
-                </p>
-              </div>
-            </div>
-
-            <SlidingToggle
-              checked={prov.enabled}
-              onChange={(nextChecked) =>
-                handleFieldChange(prov.id, 'enabled', nextChecked)
-              }
-              label={prov.enabled ? 'ON' : 'OFF'}
-              ariaLabel={`Enable ${prov.name}`}
-              testId={`toggle-provider-${prov.type}`}
-            />
-          </div>
-
-          {/* Active Session Banner + Quick Connect / Log Out Bar for Jellyfin */}
-          {prov.type === 'jellyfin' && (
-            <div className="rounded-xl border border-zinc-800/90 bg-zinc-950/80 px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2.5">
-              <div className="flex items-center gap-2 text-xs">
-                {isConnectedSession ? (
-                  <>
-                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                    <span className="text-zinc-200">
-                      Signed in as{' '}
-                      <strong className="text-emerald-400">
-                        {prov.username || 'Jellyfin User'}
-                      </strong>
-                    </span>
-                  </>
-                ) : (
-                  <span className="text-zinc-400">
-                    Sign in with{' '}
-                    <strong className="text-zinc-200">Quick Connect</strong> or
-                    enter your Username &amp; Password below.
-                  </span>
-                )}
-              </div>
-
-              <div className="flex items-center gap-2">
-                {onOpenOnboardingModal && (
-                  <button
-                    type="button"
-                    onClick={onOpenOnboardingModal}
-                    data-testid="card-jellyfin-quickconnect-btn"
-                    className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500 hover:text-zinc-950 border border-emerald-500/40 px-2.5 py-1 text-xs font-bold text-emerald-300 transition-colors"
-                  >
-                    <Zap className="w-3.5 h-3.5" />
-                    <span>Quick Connect</span>
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Self-Hosted Server Configuration Fields */}
-          {isSelfHosted && (
-            <div className="space-y-3.5 pt-1">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {/* Server URL */}
-                <div className="sm:col-span-2">
-                  <label
-                    htmlFor={`url-${prov.id}`}
-                    className="block text-xs font-medium text-zinc-400 mb-1"
-                  >
-                    Server URL
-                  </label>
-                  <input
-                    id={`url-${prov.id}`}
-                    type="url"
-                    value={prov.serverUrl ?? ''}
-                    onChange={(e) =>
-                      handleFieldChange(prov.id, 'serverUrl', e.target.value)
-                    }
-                    placeholder="https://jellyfin.yourdomain.com"
-                    className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3.5 py-2 text-sm text-white placeholder-zinc-500 focus:border-emerald-500 focus:outline-none font-mono"
-                  />
-                </div>
-
-                {/* Username */}
-                {prov.type !== 'plex' && (
-                  <div>
-                    <label
-                      htmlFor={`user-${prov.id}`}
-                      className="block text-xs font-medium text-zinc-400 mb-1"
-                    >
-                      Username
-                    </label>
-                    <input
-                      id={`user-${prov.id}`}
-                      type="text"
-                      value={prov.username ?? ''}
-                      onChange={(e) =>
-                        handleFieldChange(prov.id, 'username', e.target.value)
-                      }
-                      placeholder="Enter username (e.g., admin)"
-                      className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3.5 py-2 text-sm text-white placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
-                    />
-                  </div>
-                )}
-
-                {/* Password with Clear (X) and Show/Hide (Eye) buttons */}
-                <div className={prov.type === 'plex' ? 'sm:col-span-2' : ''}>
-                  <label
-                    htmlFor={`token-${prov.id}`}
-                    className="block text-xs font-medium text-zinc-400 mb-1"
-                  >
-                    {prov.type === 'plex'
-                      ? 'X-Plex-Token'
-                      : 'Password'}
-                  </label>
-                  <div className="relative flex items-center">
-                    <input
-                      id={`token-${prov.id}`}
-                      type={isShowingSecret ? 'text' : 'password'}
-                      value={currentSecretValue}
-                      onChange={(e) => handleSecretChange(prov, e.target.value)}
-                      placeholder={
-                        prov.type === 'plex'
-                          ? 'Paste your X-Plex-Token...'
-                          : isConnectedSession && !currentSecretValue
-                            ? 'Authenticated via Session Token (or enter password)'
-                            : 'Enter your password...'
-                      }
-                      className="w-full rounded-xl border border-zinc-800 bg-zinc-950 pl-3.5 pr-20 py-2 text-sm text-white placeholder-zinc-500 focus:border-emerald-500 focus:outline-none font-mono"
-                    />
-
-                    <div className="absolute right-1.5 flex items-center gap-0.5">
-                      <button
-                        type="button"
-                        onClick={() => handleClearSecret(prov)}
-                        aria-label={`Clear saved password for ${prov.name}`}
-                        title="Clear password"
-                        data-testid={`clear-secret-${prov.type}`}
-                        className="rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-rose-400 transition-colors"
-                      >
-                        <X className="w-4 h-4" />
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => toggleSecretVisibility(prov.id)}
-                        aria-label={
-                          isShowingSecret
-                            ? `Hide password for ${prov.name}`
-                            : `Show password for ${prov.name}`
-                        }
-                        title={
-                          isShowingSecret ? 'Hide password' : 'Show password'
-                        }
-                        data-testid={`toggle-show-secret-${prov.type}`}
-                        className="rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-white transition-colors"
-                      >
-                        {isShowingSecret ? (
-                          <EyeOff className="w-4 h-4 text-emerald-400" />
-                        ) : (
-                          <Eye className="w-4 h-4" />
-                        )}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Radio-Browser Genre Tags */}
-          {prov.type === 'radio-browser' && (
-            <div className="pt-1">
-              <p className="text-xs text-zinc-400 mb-2">
-                Fetch live stations by genre tag:
-              </p>
-              <div className="flex flex-wrap gap-1.5">
-                {RADIO_TAGS.map((tag) => (
-                  <button
-                    key={tag}
-                    type="button"
-                    onClick={() => handleFetchRadioTag(tag)}
-                    disabled={fetchingCloudSource === 'radio'}
-                    className={`px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 min-h-[36px] ${
-                      selectedRadioTag === tag
-                        ? 'bg-emerald-500 text-zinc-950 font-semibold'
-                        : 'bg-zinc-800/80 text-zinc-300 hover:bg-zinc-800 hover:text-white'
-                    }`}
-                  >
-                    #{tag}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Action Row + Live Diagnostic Log */}
-        <div className="space-y-3 pt-3 border-t border-zinc-800/60">
-          <div className="flex items-center justify-between gap-3">
-            <span className="text-xs font-mono text-zinc-400 tabular-nums">
-              {prov.trackCount !== undefined && prov.trackCount > 0
-                ? `${prov.trackCount} tracks${
-                    prov.playlistCount
-                      ? ` & ${prov.playlistCount} playlists`
-                      : ''
-                  } mounted`
-                : `Status: ${prov.status.toUpperCase()}`}
-            </span>
-
-            <div className="flex flex-wrap items-center gap-2">
-              {prov.type === 'jellyfin' && (
-                <button
-                  type="button"
-                  disabled={isTestingJellyfin}
-                  onClick={() => handleTestJellyfin(prov)}
-                  data-testid="test-jellyfin-connection-btn"
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-500/50 bg-emerald-500/15 hover:bg-emerald-500/25 px-3 py-2 text-xs font-mono font-bold text-[#00ff66] transition-colors whitespace-nowrap shrink-0 min-h-[40px]"
-                >
-                  {isTestingJellyfin ? (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  ) : (
-                    <RefreshCw className="w-3.5 h-3.5" />
-                  )}
-                  <span>Test Connection</span>
-                </button>
-              )}
-
-              <button
-                type="button"
-                onClick={() => handleTestAndSync(prov)}
-                disabled={isTesting}
-                data-testid={`test-connection-${prov.type}`}
-                className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 px-4 py-2 text-xs font-bold text-zinc-950 transition-colors whitespace-nowrap shrink-0 min-h-[40px]"
-              >
-                {isTesting ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <RefreshCw className="w-3.5 h-3.5" />
-                )}
-                <span>
-                  {isConnectedSession && !currentSecretValue
-                    ? 'Sync Library & Playlists'
-                    : 'Connect & Save'}
-                </span>
-              </button>
-            </div>
-          </div>
-
-          {/* LOUD JELLYFIN DISCONNECTED WARNING BANNER */}
-          {prov.type === 'jellyfin' &&
-            ((jellyfinTestStatus && !jellyfinTestStatus.ok) ||
-              prov.status === 'error') && (
-              <div
-                role="alert"
-                className="rounded-xl border-2 border-rose-500 bg-rose-950/90 p-4 space-y-2.5 animate-pulse shadow-lg"
-              >
-                <div className="flex items-center gap-2 text-rose-200 font-mono font-bold text-xs uppercase">
-                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
-                  <span>🚨 JELLYFIN DISCONNECTED // SERVER UNREACHABLE!</span>
-                </div>
-                <p className="text-xs font-mono text-white leading-relaxed">
-                  {jellyfinTestStatus?.message ||
-                    diagnosticText ||
-                    'Could not connect to Jellyfin.'}
-                </p>
-                <div className="rounded-lg bg-black/60 p-2.5 text-[11px] font-mono text-amber-300 border border-amber-500/30">
-                  <strong>💡 HOMELAB DOCKER FIX:</strong> Inside Docker, router
-                  NAT loopback prevents resolving external domain names (e.g.{' '}
-                  <code>https://jellyfin.flockingreeds.farm</code>). Use your
-                  local LAN IP <code>http://192.168.1.175:8096</code> directly!
-                </div>
-                <div className="flex flex-wrap items-center gap-2 pt-1">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      handleFieldChange(
-                        prov.id,
-                        'serverUrl',
-                        'http://192.168.1.175:8096'
-                      );
-                      handleTestJellyfin({
-                        ...prov,
-                        serverUrl: 'http://192.168.1.175:8096',
-                      });
-                    }}
-                    className="rounded-lg bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold px-3 py-1.5 text-xs font-mono"
-                  >
-                    Switch URL to http://192.168.1.175:8096 &amp; Re-Test
-                  </button>
-                  <button
-                    type="button"
-                    disabled={isTestingJellyfin}
-                    onClick={() => handleTestJellyfin(prov)}
-                    className="rounded-lg border border-rose-500 bg-rose-900/40 text-rose-200 hover:text-white px-3 py-1.5 text-xs font-mono"
-                  >
-                    {isTestingJellyfin ? 'Testing...' : 'Re-Test Current URL'}
-                  </button>
-                </div>
-              </div>
-            )}
-
-          {/* Live Diagnostic Log Box beneath Connect & Save */}
-          <div
-            data-testid={`diagnostic-log-${prov.type}`}
-            className={`rounded-xl border px-3.5 py-2.5 text-xs font-mono leading-relaxed flex items-start gap-2 ${
-              prov.status === 'error'
-                ? 'border-rose-500/40 bg-rose-950/30 text-rose-300'
-                : prov.status === 'connected'
-                  ? 'border-emerald-500/30 bg-emerald-950/20 text-emerald-300'
-                  : 'border-zinc-800 bg-zinc-950/80 text-zinc-400'
-            }`}
-          >
-            {prov.status === 'error' ? (
-              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-            ) : prov.status === 'connected' ? (
-              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
-            ) : (
-              <Terminal className="w-4 h-4 text-zinc-500 shrink-0 mt-0.5" />
-            )}
-            <span className="break-words">{diagnosticText}</span>
-          </div>
-        </div>
-      </div>
-    );
   };
 
   return (
@@ -2068,78 +1381,8 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
         </section>
       )}
 
-      {/* Section 1: Native Android App & Android Auto Camera QR Code Pairing */}
-      <section
-        aria-labelledby="android-qr-companion-heading"
-        data-testid="android-qr-companion-section"
-        className="rounded-2xl border border-[#00ff66]/40 bg-zinc-900/40 p-5 sm:p-6 space-y-4"
-      >
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-zinc-800/80 pb-4">
-          <div className="space-y-1">
-            <div className="flex items-center gap-2.5">
-              <Smartphone className="w-5 h-5 text-[#00ff66] shrink-0" />
-              <h2
-                id="android-qr-companion-heading"
-                className="text-lg font-bold text-white tracking-tight font-mono"
-              >
-                Native Android App &amp; Android Auto Camera QR Pairing
-              </h2>
-            </div>
-            <p className="text-xs text-zinc-400">
-              Click the button on the right to open the QR Code Popup. Scan it
-              with the camera inside your custom Android app to pair your phone
-              with this Docker container and stream music on the go.
-            </p>
-          </div>
-
-          <div className="shrink-0">
-            <PWAInstallButton />
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs font-mono">
-          <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4 space-y-1.5">
-            <span className="text-[#00ff66] font-bold block">
-              1. Camera QR Scan Handshake
-            </span>
-            <p className="text-zinc-400 text-[11px] leading-relaxed">
-              Your Android camera scans a single JSON payload containing{' '}
-              <code className="text-white">url</code>,{' '}
-              <code className="text-white">lanUrl</code>, and{' '}
-              <code className="text-white">apiKey</code>, then calls{' '}
-              <code className="text-[#00ff66]">POST /api/mobile/verify</code> to
-              confirm pairing.
-            </p>
-          </div>
-
-          <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4 space-y-1.5">
-            <span className="text-purple-300 font-bold block">
-              2. Library &amp; Playlist Sync API
-            </span>
-            <p className="text-zinc-400 text-[11px] leading-relaxed">
-              Fetch indexed songs from{' '}
-              <code className="text-white">GET /api/library/tracks</code>,
-              albums from <code className="text-white">GET /api/library/albums</code>,
-              and playlists from{' '}
-              <code className="text-white">GET /api/playlists</code> (including{' '}
-              <code className="text-[#00ff66]">loudnessLufs</code> for ExoPlayer
-              volume leveling).
-            </p>
-          </div>
-
-          <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4 space-y-1.5">
-            <span className="text-sky-300 font-bold block">
-              3. HTTP 206 Range Audio &amp; Covers
-            </span>
-            <p className="text-zinc-400 text-[11px] leading-relaxed">
-              Stream lossless FLAC/MP3 with instant seeking via{' '}
-              <code className="text-white">GET /api/stream/:trackId</code> and
-              cached album covers via{' '}
-              <code className="text-white">GET /api/covers/:albumId</code>.
-            </p>
-          </div>
-        </div>
-      </section>
+      {/* Section 1: Connect Android App (Inline High-Contrast QR Code, Copy Server URL, Temporary Token & Camera Scanner Instructions) */}
+      <ConnectAndroidAppSection />
 
       {/* Section 2: Disk-Backed Artwork Cache & Browser Storage Persistence */}
       <section

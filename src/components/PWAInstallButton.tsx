@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import QRCode from 'qrcode';
 import {
+  Camera,
   Check,
   CheckCircle2,
   Code2,
@@ -8,6 +9,7 @@ import {
   Globe,
   KeyRound,
   Loader2,
+  Maximize2,
   QrCode,
   RefreshCw,
   Smartphone,
@@ -23,13 +25,18 @@ export interface PairedAndroidDevice {
   connectedAt: string;
 }
 
-interface MobilePairInfoResponse {
+export interface MobilePairInfoResponse {
   ok: boolean;
   app: string;
   version: string;
   serverUrl: string;
+  localUrl?: string;
   lanUrl: string;
   port: number;
+  token?: string;
+  tempToken?: string;
+  expiresAt?: string;
+  expiresInSeconds?: number;
   apiKey: string;
   libraryStats?: {
     totalTracks: number;
@@ -42,19 +49,20 @@ interface MobilePairInfoResponse {
 
 type QrPayloadFormat = 'json' | 'deeplink';
 
-interface AndroidQrPairingModalProps {
-  isOpen: boolean;
-  onClose: () => void;
+interface AndroidQrContentProps {
+  isModal?: boolean;
+  onClose?: () => void;
+  onOpenPopupModal?: () => void;
 }
 
-export const AndroidQrPairingModal: React.FC<AndroidQrPairingModalProps> = ({
-  isOpen,
+const AndroidQrPairingPanel: React.FC<AndroidQrContentProps> = ({
+  isModal = false,
   onClose,
+  onOpenPopupModal,
 }) => {
   const [pairInfo, setPairInfo] = useState<MobilePairInfoResponse | null>(null);
-  const [loading, setLoading] = useState<boolean>(false);
   const [customServerUrl, setCustomServerUrl] = useState<string>('');
-  const [urlMode, setUrlMode] = useState<'origin' | 'lan' | 'custom'>('origin');
+  const [urlMode, setUrlMode] = useState<'lan' | 'origin' | 'custom'>('lan');
   const [payloadFormat, setPayloadFormat] = useState<QrPayloadFormat>('json');
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
@@ -66,51 +74,64 @@ export const AndroidQrPairingModal: React.FC<AndroidQrPairingModalProps> = ({
       ? window.location.origin
       : 'http://192.168.1.175:3487';
 
-  const fetchPairInfo = async (silent = false) => {
-    if (!silent) setLoading(true);
+  const fetchPairInfo = async () => {
     try {
       const resp = await fetch('/api/mobile/pair-info');
       if (resp.ok) {
         const data = (await resp.json()) as MobilePairInfoResponse;
         setPairInfo(data);
         if (!customServerUrl) {
-          setCustomServerUrl(browserOrigin);
+          setCustomServerUrl(
+            data.localUrl || data.lanUrl || browserOrigin
+          );
         }
       }
     } catch {
       // ignore
-    } finally {
-      if (!silent) setLoading(false);
     }
   };
 
   useEffect(() => {
-    if (!isOpen) return;
-    fetchPairInfo(false);
+    fetchPairInfo();
     const interval = setInterval(() => {
-      fetchPairInfo(true);
-    }, 3000);
+      fetchPairInfo();
+    }, 4000);
     return () => clearInterval(interval);
-  }, [isOpen]);
+  }, []);
 
   const activeServerUrl = useMemo(() => {
     if (urlMode === 'lan') {
-      return pairInfo?.lanUrl || 'http://192.168.1.175:3487';
+      return (
+        pairInfo?.localUrl ||
+        pairInfo?.lanUrl ||
+        'http://192.168.1.175:3487'
+      ).replace(/\/+$/, '');
     }
     if (urlMode === 'custom') {
       return customServerUrl.trim().replace(/\/+$/, '') || browserOrigin;
     }
     return browserOrigin.replace(/\/+$/, '');
-  }, [browserOrigin, customServerUrl, pairInfo?.lanUrl, urlMode]);
+  }, [
+    browserOrigin,
+    customServerUrl,
+    pairInfo?.lanUrl,
+    pairInfo?.localUrl,
+    urlMode,
+  ]);
+
+  const tempToken =
+    pairInfo?.tempToken || pairInfo?.token || 'pair_temp_token';
 
   const qrPayloadString = useMemo(() => {
     const apiKey = pairInfo?.apiKey || 'brk_standalone';
-    const lanUrl = pairInfo?.lanUrl || 'http://192.168.1.175:3487';
+    const localUrl =
+      pairInfo?.localUrl || pairInfo?.lanUrl || 'http://192.168.1.175:3487';
 
     if (payloadFormat === 'deeplink') {
       const params = new URLSearchParams({
-        url: activeServerUrl,
-        lan: lanUrl,
+        serverUrl: activeServerUrl,
+        localUrl,
+        token: tempToken,
         key: apiKey,
       });
       return `brokeify://pair?${params.toString()}`;
@@ -119,8 +140,11 @@ export const AndroidQrPairingModal: React.FC<AndroidQrPairingModalProps> = ({
     return JSON.stringify({
       app: 'brokeify',
       v: 1,
-      url: activeServerUrl,
-      lanUrl,
+      serverUrl: activeServerUrl,
+      localUrl,
+      publicUrl: browserOrigin,
+      token: tempToken,
+      expiresAt: pairInfo?.expiresAt || null,
       apiKey,
       endpoints: {
         verify: '/api/mobile/verify',
@@ -133,17 +157,26 @@ export const AndroidQrPairingModal: React.FC<AndroidQrPairingModalProps> = ({
         scrobble: '/api/scrobble',
       },
     });
-  }, [activeServerUrl, pairInfo?.apiKey, pairInfo?.lanUrl, payloadFormat]);
+  }, [
+    activeServerUrl,
+    browserOrigin,
+    pairInfo?.apiKey,
+    pairInfo?.expiresAt,
+    pairInfo?.lanUrl,
+    pairInfo?.localUrl,
+    payloadFormat,
+    tempToken,
+  ]);
 
   useEffect(() => {
-    if (!isOpen || !qrPayloadString) return;
+    if (!qrPayloadString) return;
     let cancelled = false;
     QRCode.toDataURL(qrPayloadString, {
       errorCorrectionLevel: 'M',
       margin: 2,
-      width: 320,
+      width: 360,
       color: {
-        dark: '#070a0f',
+        dark: '#000000',
         light: '#ffffff',
       },
     })
@@ -154,14 +187,12 @@ export const AndroidQrPairingModal: React.FC<AndroidQrPairingModalProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [isOpen, qrPayloadString]);
-
-  if (!isOpen) return null;
+  }, [qrPayloadString]);
 
   const handleCopy = (key: string, value: string) => {
     navigator.clipboard?.writeText(value).catch(() => {});
     setCopiedKey(key);
-    setTimeout(() => setCopiedKey(null), 2200);
+    setTimeout(() => setCopiedKey(null), 2400);
   };
 
   const handleRegenerateToken = async () => {
@@ -169,9 +200,11 @@ export const AndroidQrPairingModal: React.FC<AndroidQrPairingModalProps> = ({
     try {
       const resp = await fetch('/api/mobile/regenerate-token', {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rotateApiKey: false }),
       });
       if (resp.ok) {
-        await fetchPairInfo(true);
+        await fetchPairInfo();
       }
     } finally {
       setRegeneratingKey(false);
@@ -185,15 +218,15 @@ export const AndroidQrPairingModal: React.FC<AndroidQrPairingModalProps> = ({
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${pairInfo?.apiKey || ''}`,
+          Authorization: `Bearer ${tempToken}`,
         },
         body: JSON.stringify({
-          deviceName: 'Android Pixel Companion (Test)',
-          model: 'Android Camera QR Handshake',
-          apiKey: pairInfo?.apiKey,
+          deviceName: 'Android Companion App',
+          model: 'Built-in Camera QR Scanner',
+          token: tempToken,
         }),
       });
-      await fetchPairInfo(true);
+      await fetchPairInfo();
     } finally {
       setTestingHandshake(false);
     }
@@ -202,212 +235,242 @@ export const AndroidQrPairingModal: React.FC<AndroidQrPairingModalProps> = ({
   const pairedDevices = pairInfo?.pairedDevices || [];
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md p-3 sm:p-6 overflow-y-auto"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="android-qr-modal-title"
-      data-testid="android-qr-pairing-modal"
-    >
-      <div className="w-full max-w-3xl winamp-bezel rounded-3xl border-2 border-[#00ff66]/50 bg-zinc-950 overflow-hidden shadow-2xl my-auto text-left">
-        {/* Header Bar */}
-        <div className="winamp-titlebar px-5 py-3.5 flex items-center justify-between border-b border-zinc-700/80">
-          <div className="flex items-center gap-2.5">
-            <QrCode className="w-5 h-5 text-[#00ff66]" />
-            <h3
-              id="android-qr-modal-title"
-              className="text-xs sm:text-sm font-mono font-bold uppercase tracking-wider text-white"
-            >
-              BROKEIFY ANDROID APP // QR CAMERA PAIRING &amp; ON-THE-GO STREAMING
-            </h3>
+    <div className="space-y-5">
+      {/* Main Grid: Large High-Contrast QR Code + Controls & Instructions */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+        {/* Left Column: Large High-Contrast Scannable QR Code */}
+        <div className="lg:col-span-5 flex flex-col items-center justify-center rounded-2xl border-2 border-[#00ff66]/50 bg-zinc-950/90 p-5 space-y-4 shadow-xl">
+          <div className="rounded-2xl bg-white p-4 shadow-2xl border-4 border-[#00ff66]">
+            {qrDataUrl ? (
+              <img
+                src={qrDataUrl}
+                alt="Connect Android App High-Contrast QR Code"
+                data-testid="android-qr-code-img"
+                className="w-60 h-60 sm:w-68 sm:h-68 object-contain"
+              />
+            ) : (
+              <div className="w-60 h-60 sm:w-68 sm:h-68 flex items-center justify-center text-zinc-900">
+                <Loader2 className="w-8 h-8 animate-spin" />
+              </div>
+            )}
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close Android QR Pairing Modal"
-            data-testid="close-android-qr-modal-btn"
-            className="rounded-lg p-1.5 text-zinc-300 hover:bg-zinc-800 hover:text-white transition-colors"
-          >
-            <X className="w-4 h-4" />
-          </button>
+
+          <div className="w-full space-y-2 text-center">
+            <div className="inline-flex items-center gap-1.5 rounded-full bg-[#00ff66]/15 border border-[#00ff66]/40 px-3 py-1 text-xs font-mono font-bold text-[#00ff66]">
+              <Camera className="w-3.5 h-3.5" />
+              <span>Scan with Android App Camera</span>
+            </div>
+            <p className="text-[11px] font-mono text-zinc-400">
+              Encodes Local Server URL + Temporary Connection Token
+            </p>
+          </div>
+
+          {/* Primary Copy Server URL Button right beneath QR Code */}
+          <div className="w-full flex flex-col sm:flex-row gap-2">
+            <button
+              type="button"
+              onClick={() => handleCopy('server-url', activeServerUrl)}
+              data-testid="copy-server-url-btn"
+              className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-4 py-2.5 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[42px] shadow-lg"
+            >
+              {copiedKey === 'server-url' ? (
+                <>
+                  <Check className="w-4 h-4" />
+                  <span>Copied Server URL!</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-4 h-4" />
+                  <span>Copy Server URL</span>
+                </>
+              )}
+            </button>
+
+            {!isModal && onOpenPopupModal && (
+              <button
+                type="button"
+                onClick={onOpenPopupModal}
+                data-testid="open-qr-popup-btn"
+                title="Open QR Code in Fullscreen Popup"
+                className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-900 hover:border-[#00ff66]/50 hover:text-[#00ff66] px-3.5 py-2.5 text-xs font-mono font-semibold text-zinc-200 transition-colors min-h-[42px]"
+              >
+                <Maximize2 className="w-4 h-4" />
+                <span>Popup</span>
+              </button>
+            )}
+          </div>
         </div>
 
-        <div className="p-5 sm:p-6 space-y-5 max-h-[85vh] overflow-y-auto">
-          {/* Top Grid: Left = Scannable QR Code, Right = URL Selector & Live Status */}
-          <div className="grid grid-cols-1 md:grid-cols-12 gap-5 items-center">
-            {/* Scannable High-Contrast QR Code Card */}
-            <div className="md:col-span-5 flex flex-col items-center justify-center rounded-2xl border border-zinc-800 bg-zinc-900/70 p-4 space-y-3">
-              <div className="rounded-2xl bg-white p-3 shadow-xl border-4 border-[#00ff66]">
-                {qrDataUrl ? (
-                  <img
-                    src={qrDataUrl}
-                    alt="Brokeify Android App Pairing QR Code"
-                    data-testid="android-qr-code-img"
-                    className="w-56 h-56 sm:w-64 sm:h-64 object-contain"
-                  />
-                ) : (
-                  <div className="w-56 h-56 sm:w-64 sm:h-64 flex items-center justify-center text-zinc-900">
-                    <Loader2 className="w-8 h-8 animate-spin" />
-                  </div>
-                )}
-              </div>
+        {/* Right Column: Server URL Config, Temp Token, & Step-by-Step Camera Instructions */}
+        <div className="lg:col-span-7 space-y-4">
+          {/* Step-by-Step Instructions on how to use the Android App's built-in camera scanner */}
+          <div className="rounded-2xl border border-zinc-800 bg-zinc-950/80 p-4 space-y-3">
+            <div className="flex items-center justify-between gap-2 border-b border-zinc-800/80 pb-2.5">
+              <h3 className="text-xs sm:text-sm font-mono font-bold uppercase text-[#00ff66] flex items-center gap-2">
+                <Camera className="w-4 h-4" />
+                <span>
+                  How to Link Your Android App Using the Built-In Camera Scanner
+                </span>
+              </h3>
+              <span className="rounded bg-emerald-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-[#00ff66]">
+                ZERO TYPING
+              </span>
+            </div>
 
-              <div className="text-center space-y-0.5">
-                <div className="text-xs font-mono font-bold text-[#00ff66]">
-                  Scan with Brokeify Android App Camera
-                </div>
-                <div className="text-[11px] font-mono text-zinc-400">
-                  {pairInfo?.libraryStats?.totalTracks ?? 0} tracks ·{' '}
-                  {pairInfo?.libraryStats?.totalAlbums ?? 0} albums ready to
-                  stream
-                </div>
+            <ol className="text-xs text-zinc-200 space-y-2 list-decimal list-inside font-mono leading-relaxed">
+              <li>
+                Open the <strong>Brokeify Android App</strong> on your phone and
+                tap <strong>&ldquo;Connect to Docker Server&rdquo;</strong>{' '}
+                (or the <strong>Scan QR Code 📷</strong> icon).
+              </li>
+              <li>
+                Point your phone&apos;s built-in camera scanner at the{' '}
+                <strong className="text-[#00ff66]">high-contrast QR code</strong>{' '}
+                on the left.
+              </li>
+              <li>
+                The camera automatically reads the JSON payload containing your{' '}
+                <strong>Local Server URL</strong> (
+                <code className="text-white">{activeServerUrl}</code>) and{' '}
+                <strong>Temporary Connection Token</strong> (
+                <code className="text-[#00ff66]">{tempToken}</code>).
+              </li>
+              <li>
+                Your Android app sends a handshake to{' '}
+                <code className="text-[#00ff66]">POST /api/mobile/verify</code>,
+                exchanges the temporary token for a persistent session key, and
+                immediately syncs your tracks, albums, and playlists for on-the-go
+                streaming!
+              </li>
+            </ol>
+          </div>
+
+          {/* Server Local / Public URL Selector */}
+          <div className="rounded-2xl border border-zinc-800 bg-zinc-950/80 p-4 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label className="text-xs font-mono font-bold uppercase text-zinc-300">
+                Server URL Encoded in QR Code
+              </label>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setUrlMode('lan')}
+                  className={`rounded-lg border px-2.5 py-1 text-[11px] font-mono font-bold flex items-center gap-1 transition-colors ${
+                    urlMode === 'lan'
+                      ? 'border-[#00ff66] bg-[#00ff66]/15 text-[#00ff66]'
+                      : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white'
+                  }`}
+                >
+                  <Wifi className="w-3 h-3" />
+                  <span>Local LAN URL</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setUrlMode('origin')}
+                  className={`rounded-lg border px-2.5 py-1 text-[11px] font-mono font-bold flex items-center gap-1 transition-colors ${
+                    urlMode === 'origin'
+                      ? 'border-[#00ff66] bg-[#00ff66]/15 text-[#00ff66]'
+                      : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white'
+                  }`}
+                >
+                  <Globe className="w-3 h-3" />
+                  <span>Browser / Domain URL</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setUrlMode('custom')}
+                  className={`rounded-lg border px-2.5 py-1 text-[11px] font-mono font-bold flex items-center gap-1 transition-colors ${
+                    urlMode === 'custom'
+                      ? 'border-[#00ff66] bg-[#00ff66]/15 text-[#00ff66]'
+                      : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white'
+                  }`}
+                >
+                  <Code2 className="w-3 h-3" />
+                  <span>Custom</span>
+                </button>
               </div>
             </div>
 
-            {/* Connection URL Mode & Format Controls */}
-            <div className="md:col-span-7 space-y-4">
-              <div className="space-y-1">
-                <h4 className="text-sm sm:text-base font-bold text-white font-mono flex items-center gap-2">
-                  <Smartphone className="w-4 h-4 text-[#00ff66]" />
-                  <span>Instant Android Camera Pairing</span>
-                </h4>
-                <p className="text-xs text-zinc-300 leading-relaxed">
-                  Point your custom Android app&apos;s camera at this QR code. It
-                  contains your server URL, local LAN fallback, API key, and
-                  HTTP 206 streaming endpoints so you can play music on the go
-                  with zero typing.
-                </p>
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+              <input
+                type="text"
+                value={urlMode === 'custom' ? customServerUrl : activeServerUrl}
+                onChange={(e) => {
+                  setUrlMode('custom');
+                  setCustomServerUrl(e.target.value);
+                }}
+                placeholder="http://192.168.1.175:3487"
+                data-testid="android-qr-server-url-input"
+                className="flex-1 rounded-xl border border-zinc-700 bg-zinc-900 px-3.5 py-2 text-xs sm:text-sm font-mono text-white focus:border-[#00ff66] focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={() => handleCopy('server-url-inline', activeServerUrl)}
+                className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-[#00ff66]/50 bg-[#00ff66]/15 hover:bg-[#00ff66]/25 px-3.5 py-2 text-xs font-mono font-bold text-[#00ff66] transition-colors whitespace-nowrap min-h-[38px]"
+              >
+                {copiedKey === 'server-url-inline' ? (
+                  <>
+                    <Check className="w-3.5 h-3.5" />
+                    <span>Copied!</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>Copy Server URL</span>
+                  </>
+                )}
+              </button>
+            </div>
+
+            {/* Temporary Connection Token Row */}
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-3 flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+              <div className="flex items-center gap-2 min-w-0">
+                <KeyRound className="w-4 h-4 text-[#00ff66] shrink-0" />
+                <span className="text-zinc-400">Temp Connection Token:</span>
+                <code
+                  data-testid="android-temp-token-value"
+                  className="text-[#00ff66] font-bold truncate"
+                >
+                  {tempToken}
+                </code>
+                {pairInfo?.expiresInSeconds !== undefined && (
+                  <span className="text-[10px] text-zinc-400">
+                    (valid {Math.ceil(pairInfo.expiresInSeconds / 60)}m)
+                  </span>
+                )}
               </div>
-
-              {/* 1. Choose Server Address Encoded in QR */}
-              <div className="space-y-2">
-                <label className="block text-xs font-mono font-bold uppercase text-zinc-300">
-                  1. Server Address for Your Phone
-                </label>
-                <div className="grid grid-cols-3 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setUrlMode('origin')}
-                    className={`rounded-xl border px-3 py-2 text-xs font-mono font-bold flex items-center justify-center gap-1.5 transition-colors ${
-                      urlMode === 'origin'
-                        ? 'border-[#00ff66] bg-[#00ff66]/15 text-[#00ff66]'
-                        : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white'
-                    }`}
-                  >
-                    <Globe className="w-3.5 h-3.5 shrink-0" />
-                    <span>Current URL</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setUrlMode('lan')}
-                    className={`rounded-xl border px-3 py-2 text-xs font-mono font-bold flex items-center justify-center gap-1.5 transition-colors ${
-                      urlMode === 'lan'
-                        ? 'border-[#00ff66] bg-[#00ff66]/15 text-[#00ff66]'
-                        : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white'
-                    }`}
-                  >
-                    <Wifi className="w-3.5 h-3.5 shrink-0" />
-                    <span>Home LAN IP</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setUrlMode('custom')}
-                    className={`rounded-xl border px-3 py-2 text-xs font-mono font-bold flex items-center justify-center gap-1.5 transition-colors ${
-                      urlMode === 'custom'
-                        ? 'border-[#00ff66] bg-[#00ff66]/15 text-[#00ff66]'
-                        : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white'
-                    }`}
-                  >
-                    <Code2 className="w-3.5 h-3.5 shrink-0" />
-                    <span>Custom Domain</span>
-                  </button>
-                </div>
-
-                <input
-                  type="text"
-                  value={
-                    urlMode === 'custom' ? customServerUrl : activeServerUrl
-                  }
-                  onChange={(e) => {
-                    setUrlMode('custom');
-                    setCustomServerUrl(e.target.value);
-                  }}
-                  placeholder="https://music.flockingreeds.farm or http://192.168.1.175:3487"
-                  data-testid="android-qr-server-url-input"
-                  className="w-full rounded-xl border border-zinc-700 bg-zinc-900 px-3.5 py-2 text-xs sm:text-sm font-mono text-white focus:border-[#00ff66] focus:outline-none"
-                />
-              </div>
-
-              {/* 2. Choose QR Format (JSON vs Deep Link URI) */}
-              <div className="space-y-2">
-                <label className="block text-xs font-mono font-bold uppercase text-zinc-300">
-                  2. QR Payload Format for Your Android Scanner
-                </label>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setPayloadFormat('json')}
-                    className={`rounded-xl border px-3 py-2 text-xs font-mono font-bold transition-colors ${
-                      payloadFormat === 'json'
-                        ? 'border-[#00ff66] bg-[#00ff66] text-zinc-950'
-                        : 'border-zinc-800 bg-zinc-900 text-zinc-300 hover:text-white'
-                    }`}
-                  >
-                    JSON Object (Recommended)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setPayloadFormat('deeplink')}
-                    className={`rounded-xl border px-3 py-2 text-xs font-mono font-bold transition-colors ${
-                      payloadFormat === 'deeplink'
-                        ? 'border-[#00ff66] bg-[#00ff66] text-zinc-950'
-                        : 'border-zinc-800 bg-zinc-900 text-zinc-300 hover:text-white'
-                    }`}
-                  >
-                    Deep Link (brokeify://pair)
-                  </button>
-                </div>
-              </div>
-
-              {/* API Key + Rotate */}
-              <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-3 flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
-                <div className="flex items-center gap-2 min-w-0">
-                  <KeyRound className="w-4 h-4 text-[#00ff66] shrink-0" />
-                  <span className="text-zinc-400">API Key:</span>
-                  <code className="text-white truncate">
-                    {pairInfo?.apiKey || 'Loading...'}
-                  </code>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleCopy('apikey', pairInfo?.apiKey || '')
-                    }
-                    className="rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-1 text-[11px] text-zinc-300 hover:text-white"
-                  >
-                    {copiedKey === 'apikey' ? 'Copied!' : 'Copy Key'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleRegenerateToken}
-                    disabled={regeneratingKey}
-                    title="Generate new API key"
-                    className="rounded-lg border border-zinc-700 bg-zinc-950 p-1.5 text-zinc-400 hover:text-[#00ff66]"
-                  >
-                    <RefreshCw
-                      className={`w-3.5 h-3.5 ${regeneratingKey ? 'animate-spin' : ''}`}
-                    />
-                  </button>
-                </div>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => handleCopy('temptoken', tempToken)}
+                  className="rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-1 text-[11px] text-zinc-300 hover:text-white"
+                >
+                  {copiedKey === 'temptoken' ? 'Copied!' : 'Copy Token'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleRegenerateToken}
+                  disabled={regeneratingKey}
+                  data-testid="refresh-temp-token-btn"
+                  title="Generate new temporary connection token"
+                  className="inline-flex items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-1 text-[11px] text-zinc-300 hover:text-[#00ff66]"
+                >
+                  <RefreshCw
+                    className={`w-3 h-3 ${regeneratingKey ? 'animate-spin' : ''}`}
+                  />
+                  <span>New Token</span>
+                </button>
               </div>
             </div>
           </div>
+        </div>
+      </div>
 
-          {/* Live Connected Android Devices Status Box */}
-          <div className="rounded-2xl border border-zinc-800 bg-zinc-900/50 p-4 space-y-3">
+      {/* Live Connected Android Devices + JSON Payload Preview */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Connected Android Devices Status Box */}
+        <div className="rounded-2xl border border-zinc-800 bg-zinc-950/70 p-4 space-y-3 flex flex-col justify-between">
+          <div className="space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2 text-xs font-mono font-bold text-white">
                 <CheckCircle2
@@ -419,8 +482,8 @@ export const AndroidQrPairingModal: React.FC<AndroidQrPairingModalProps> = ({
                 />
                 <span>
                   {pairedDevices.length > 0
-                    ? `Connected Android Devices (${pairedDevices.length})`
-                    : 'Waiting for Android App Camera Scan (GET/POST /api/mobile/verify)...'}
+                    ? `Linked Android Devices (${pairedDevices.length})`
+                    : 'Waiting for Android Camera Scan...'}
                 </span>
               </div>
 
@@ -436,16 +499,16 @@ export const AndroidQrPairingModal: React.FC<AndroidQrPairingModalProps> = ({
                 ) : (
                   <Smartphone className="w-3 h-3" />
                 )}
-                <span>Test /api/mobile/verify Handshake</span>
+                <span>Test Camera Handshake</span>
               </button>
             </div>
 
-            {pairedDevices.length > 0 && (
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {pairedDevices.length > 0 ? (
+              <div className="space-y-2 pt-1">
                 {pairedDevices.map((dev) => (
                   <div
                     key={dev.id}
-                    className="rounded-xl border border-emerald-500/40 bg-emerald-950/20 px-3.5 py-2.5 text-xs font-mono flex items-center justify-between gap-2"
+                    className="rounded-xl border border-emerald-500/40 bg-emerald-950/20 px-3.5 py-2 text-xs font-mono flex items-center justify-between gap-2"
                   >
                     <div className="min-w-0">
                       <div className="font-bold text-[#00ff66] truncate">
@@ -457,57 +520,207 @@ export const AndroidQrPairingModal: React.FC<AndroidQrPairingModalProps> = ({
                       </div>
                     </div>
                     <span className="rounded bg-[#00ff66]/20 px-2 py-0.5 text-[10px] font-bold text-[#00ff66]">
-                      PAIRED
+                      LINKED
                     </span>
                   </div>
                 ))}
               </div>
+            ) : (
+              <p className="text-xs font-mono text-zinc-400 leading-relaxed">
+                As soon as your Android app scans the QR code and calls{' '}
+                <code className="text-white">POST /api/mobile/verify</code>,
+                your phone will appear here as linked.
+              </p>
             )}
           </div>
 
-          {/* Exact QR Payload Preview for Android Studio Camera Parser */}
-          <div className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 space-y-2.5">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <span className="text-xs font-mono font-bold uppercase text-cyan-300">
-                Exact QR Payload Encoded Above (For Your Android Camera Parser)
-              </span>
+          <div className="flex items-center justify-between pt-2 border-t border-zinc-800/80 text-[11px] font-mono text-zinc-400">
+            <span>Payload Mode:</span>
+            <div className="flex items-center gap-1.5">
               <button
                 type="button"
-                onClick={() => handleCopy('payload', qrPayloadString)}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 hover:bg-cyan-500/20 px-2.5 py-1 text-[11px] font-mono font-bold text-cyan-300"
+                onClick={() => setPayloadFormat('json')}
+                className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                  payloadFormat === 'json'
+                    ? 'bg-[#00ff66] text-zinc-950'
+                    : 'bg-zinc-900 text-zinc-400'
+                }`}
               >
-                {copiedKey === 'payload' ? (
-                  <>
-                    <Check className="w-3 h-3" />
-                    <span>Copied Payload!</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-3 h-3" />
-                    <span>Copy QR Payload</span>
-                  </>
-                )}
+                JSON
+              </button>
+              <button
+                type="button"
+                onClick={() => setPayloadFormat('deeplink')}
+                className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                  payloadFormat === 'deeplink'
+                    ? 'bg-[#00ff66] text-zinc-950'
+                    : 'bg-zinc-900 text-zinc-400'
+                }`}
+              >
+                brokeify://
               </button>
             </div>
-            <pre className="rounded-xl border border-zinc-800 bg-zinc-950 p-3 text-[11px] font-mono text-emerald-300 overflow-x-auto leading-relaxed">
-              {payloadFormat === 'json'
-                ? JSON.stringify(JSON.parse(qrPayloadString), null, 2)
-                : qrPayloadString}
-            </pre>
           </div>
+        </div>
 
-          <div className="flex items-center justify-end gap-3 pt-1">
+        {/* Exact JSON Payload Encoded in the QR Code */}
+        <div className="rounded-2xl border border-zinc-800 bg-zinc-950/70 p-4 space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-xs font-mono font-bold uppercase text-cyan-300">
+              Encoded QR JSON Payload (Android Scanner Schema)
+            </span>
             <button
               type="button"
-              onClick={onClose}
-              className="rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-5 py-2.5 text-xs font-mono font-bold text-zinc-950 transition-colors"
+              onClick={() => handleCopy('payload', qrPayloadString)}
+              data-testid="copy-qr-json-payload-btn"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 hover:bg-cyan-500/20 px-2.5 py-1 text-[11px] font-mono font-bold text-cyan-300"
             >
-              Done
+              {copiedKey === 'payload' ? (
+                <>
+                  <Check className="w-3 h-3" />
+                  <span>Copied JSON!</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-3 h-3" />
+                  <span>Copy JSON Payload</span>
+                </>
+              )}
             </button>
           </div>
+          <pre
+            data-testid="qr-json-payload-preview"
+            className="rounded-xl border border-zinc-800 bg-black/80 p-3 text-[11px] font-mono text-emerald-300 overflow-x-auto max-h-40 leading-relaxed"
+          >
+            {payloadFormat === 'json'
+              ? JSON.stringify(JSON.parse(qrPayloadString), null, 2)
+              : qrPayloadString}
+          </pre>
+        </div>
+      </div>
+
+      {isModal && onClose && (
+        <div className="flex items-center justify-end gap-3 pt-1">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-5 py-2.5 text-xs font-mono font-bold text-zinc-950 transition-colors"
+          >
+            Done
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+interface AndroidQrPairingModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+}
+
+export const AndroidQrPairingModal: React.FC<AndroidQrPairingModalProps> = ({
+  isOpen,
+  onClose,
+}) => {
+  if (!isOpen) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md p-3 sm:p-6 overflow-y-auto"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="android-qr-modal-title"
+      data-testid="android-qr-pairing-modal"
+    >
+      <div className="w-full max-w-4xl winamp-bezel rounded-3xl border-2 border-[#00ff66]/50 bg-zinc-950 overflow-hidden shadow-2xl my-auto text-left">
+        <div className="winamp-titlebar px-5 py-3.5 flex items-center justify-between border-b border-zinc-700/80">
+          <div className="flex items-center gap-2.5">
+            <QrCode className="w-5 h-5 text-[#00ff66]" />
+            <h3
+              id="android-qr-modal-title"
+              className="text-xs sm:text-sm font-mono font-bold uppercase tracking-wider text-white"
+            >
+              CONNECT ANDROID APP // QR CAMERA SCANNER PAIRING
+            </h3>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close Connect Android App Modal"
+            data-testid="close-android-qr-modal-btn"
+            className="rounded-lg p-1.5 text-zinc-300 hover:bg-zinc-800 hover:text-white transition-colors"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="p-5 sm:p-6 max-h-[85vh] overflow-y-auto">
+          <AndroidQrPairingPanel isModal={true} onClose={onClose} />
         </div>
       </div>
     </div>
+  );
+};
+
+/**
+ * Inline 'Connect Android App' Section for the Settings tab that displays the
+ * large, high-contrast QR code, 'Copy Server URL' button, temporary connection token,
+ * and step-by-step instructions for the Android app's built-in camera scanner.
+ */
+export const ConnectAndroidAppSection: React.FC = () => {
+  const [showPopup, setShowPopup] = useState(false);
+
+  return (
+    <section
+      aria-labelledby="connect-android-app-heading"
+      data-testid="connect-android-app-section"
+      className="rounded-2xl border-2 border-[#00ff66]/50 bg-zinc-900/60 p-5 sm:p-6 space-y-5 shadow-xl"
+    >
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-zinc-800/80 pb-4">
+        <div className="space-y-1">
+          <div className="flex items-center gap-2.5">
+            <QrCode className="w-5 h-5 text-[#00ff66] shrink-0" />
+            <h2
+              id="connect-android-app-heading"
+              className="text-lg sm:text-xl font-bold text-white tracking-tight font-mono"
+            >
+              Connect Android App
+            </h2>
+            <span className="rounded-full bg-[#00ff66]/15 border border-[#00ff66]/40 px-2.5 py-0.5 text-[10px] font-mono font-bold uppercase text-[#00ff66]">
+              Camera QR Pairing
+            </span>
+          </div>
+          <p className="text-xs sm:text-sm text-zinc-300 max-w-3xl">
+            Scan this high-contrast QR code using your Brokeify Android
+            app&apos;s built-in camera scanner to link your phone to this Docker
+            server and stream your library on the go.
+          </p>
+        </div>
+
+        <div className="shrink-0">
+          <button
+            type="button"
+            onClick={() => setShowPopup(true)}
+            data-testid="open-fullscreen-qr-modal-btn"
+            className="inline-flex items-center gap-2 rounded-xl border border-[#00ff66]/50 bg-[#00ff66]/15 hover:bg-[#00ff66]/25 px-4 py-2 text-xs font-mono font-bold text-[#00ff66] transition-colors whitespace-nowrap min-h-[40px]"
+          >
+            <Maximize2 className="w-4 h-4" />
+            <span>Open Fullscreen QR Popup</span>
+          </button>
+        </div>
+      </div>
+
+      <AndroidQrPairingPanel
+        isModal={false}
+        onOpenPopupModal={() => setShowPopup(true)}
+      />
+
+      <AndroidQrPairingModal
+        isOpen={showPopup}
+        onClose={() => setShowPopup(false)}
+      />
+    </section>
   );
 };
 
@@ -535,9 +748,6 @@ export const PWAInstallButton: React.FC = () => {
   );
 };
 
-/**
- * Removed WebAPK install banner per user request (building native Android app instead).
- */
 export const MobilePixelInstallBanner: React.FC = () => {
   return null;
 };

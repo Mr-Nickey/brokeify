@@ -715,6 +715,35 @@ interface PairedAndroidDevice {
 
 const pairedAndroidDevices: PairedAndroidDevice[] = [];
 
+const TEMP_TOKEN_TTL_MS = 15 * 60 * 1000; // 15 minutes
+let activeTempPairingToken: { token: string; expiresAt: number } | null = null;
+
+function ensureTempPairingToken(forceNew = false): {
+  token: string;
+  expiresAt: string;
+  expiresInSeconds: number;
+} {
+  const now = Date.now();
+  if (
+    forceNew ||
+    !activeTempPairingToken ||
+    activeTempPairingToken.expiresAt <= now + 30_000
+  ) {
+    activeTempPairingToken = {
+      token: `pair_${crypto.randomBytes(12).toString('hex')}`,
+      expiresAt: now + TEMP_TOKEN_TTL_MS,
+    };
+  }
+  return {
+    token: activeTempPairingToken.token,
+    expiresAt: new Date(activeTempPairingToken.expiresAt).toISOString(),
+    expiresInSeconds: Math.max(
+      0,
+      Math.round((activeTempPairingToken.expiresAt - now) / 1000)
+    ),
+  };
+}
+
 function ensureMobileApiToken(forceNew = false): string {
   const cfg = readServerConfig();
   let currentToken = String(cfg.auth?.apiToken || '').trim();
@@ -735,9 +764,10 @@ function ensureMobileApiToken(forceNew = false): string {
   return currentToken;
 }
 
-// GET /api/mobile/pair-info -> Returns QR pairing payload, LAN IP, API token, and connected Android devices
+// GET /api/mobile/pair-info -> Returns QR pairing payload, LAN IP, temporary connection token, API token, and connected Android devices
 app.get('/api/mobile/pair-info', (req, res) => {
   const apiToken = ensureMobileApiToken(false);
+  const tempInfo = ensureTempPairingToken(false);
   const port = Number(process.env.PORT || 3487);
   const lanIp = detectLanIpv4();
   const lanUrl = `http://${lanIp}:${port}`;
@@ -757,8 +787,13 @@ app.get('/api/mobile/pair-info', (req, res) => {
     app: 'brokeify',
     version: '3.0.0-standalone',
     serverUrl: detectedOriginUrl,
+    localUrl: lanUrl,
     lanUrl,
     port,
+    token: tempInfo.token,
+    tempToken: tempInfo.token,
+    expiresAt: tempInfo.expiresAt,
+    expiresInSeconds: tempInfo.expiresInSeconds,
     apiKey: apiToken,
     libraryStats: counts,
     driveStatus,
@@ -778,19 +813,26 @@ app.get('/api/mobile/pair-info', (req, res) => {
   });
 });
 
-// POST /api/mobile/regenerate-token -> Rotates the Android API key
-app.post('/api/mobile/regenerate-token', (_req, res) => {
-  const apiToken = ensureMobileApiToken(true);
+// POST /api/mobile/regenerate-token -> Rotates the temporary connection token (and optionally the API key)
+app.post('/api/mobile/regenerate-token', (req, res) => {
+  const rotatePermanent = Boolean(req.body?.rotateApiKey);
+  const apiToken = ensureMobileApiToken(rotatePermanent);
+  const tempInfo = ensureTempPairingToken(true);
   res.json({
     ok: true,
+    token: tempInfo.token,
+    tempToken: tempInfo.token,
+    expiresAt: tempInfo.expiresAt,
+    expiresInSeconds: tempInfo.expiresInSeconds,
     apiKey: apiToken,
-    message: 'Generated new Android pairing API key!',
+    message: 'Generated new temporary connection token!',
   });
 });
 
 // GET or POST /api/mobile/verify -> Called by the Android app after scanning the QR code to verify connection
 app.all('/api/mobile/verify', (req, res) => {
-  const expectedToken = ensureMobileApiToken(false);
+  const expectedApiKey = ensureMobileApiToken(false);
+  const currentTemp = ensureTempPairingToken(false);
   const authHeader = String(req.headers.authorization || '').replace(
     /^Bearer\s+/i,
     ''
@@ -798,17 +840,24 @@ app.all('/api/mobile/verify', (req, res) => {
   const providedToken = String(
     authHeader ||
       req.headers['x-api-key'] ||
-      req.query.apiKey ||
       req.query.token ||
-      req.body?.apiKey ||
+      req.query.tempToken ||
+      req.query.apiKey ||
       req.body?.token ||
+      req.body?.tempToken ||
+      req.body?.apiKey ||
       ''
   ).trim();
 
-  if (providedToken && providedToken !== expectedToken) {
+  if (
+    providedToken &&
+    providedToken !== expectedApiKey &&
+    providedToken !== currentTemp.token
+  ) {
     return res.status(401).json({
       ok: false,
-      error: 'Invalid Brokeify API key. Please re-scan the QR code.',
+      error:
+        'Invalid or expired Brokeify connection token. Please re-scan the QR code.',
     });
   }
 
@@ -855,6 +904,7 @@ app.all('/api/mobile/verify', (req, res) => {
     authenticated: true,
     server: 'Brokeify Native Engine',
     version: '3.0.0-standalone',
+    apiKey: expectedApiKey,
     device: deviceRecord,
     libraryStats: counts,
     endpoints: {

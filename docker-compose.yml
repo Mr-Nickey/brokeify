@@ -15,7 +15,15 @@ services:
       # Optional downloader & scrobbler integrations (can also be configured in the Web UI Settings):
       # - SLSKD_URL=http://192.168.1.175:5030
       # - SLSKD_API_KEY=your_key_here
+      # - LIDARR_URL=http://192.168.1.175:8686
+      # - LIDARR_API_KEY=your_lidarr_key_here
       # - LISTENBRAINZ_USER=your_user_here
+      # - LISTENBRAINZ_TOKEN=your_token_here
     volumes:
+      # Persistent SQLite database (/data/brokeify.db), cover art cache (/data/covers), and config.json:
       - ./data:/data
+      # Mount your local hard drive or NAS music folder to /music inside the container:
+      # Example (Windows / WSL2): /d/Message:/music:rw
+      # Example (Linux / NAS):    /mnt/nas/music:/music:rw
       - /path/to/your/music:/music:rw
+
