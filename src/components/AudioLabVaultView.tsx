@@ -347,7 +347,7 @@ export const AudioLabVaultView: React.FC<AudioLabVaultViewProps> = ({
             <div className="flex items-start justify-between gap-4 rounded-xl border border-zinc-800/90 bg-zinc-950/70 p-4">
               <div className="space-y-1">
                 <div className="text-sm font-semibold text-white">
-                  Jellyfin / Subsonic LUFS GainNode
+                  ReplayGain / LUFS GainNode
                 </div>
                 <p className="text-xs text-zinc-400 leading-relaxed">
                   Applies per-track `NormalizationGain` tags. Current:{' '}
@@ -362,7 +362,7 @@ export const AudioLabVaultView: React.FC<AudioLabVaultViewProps> = ({
                 checked={lufsNormalizationEnabled}
                 onChange={onToggleLufsNormalization}
                 label={lufsNormalizationEnabled ? 'ON' : 'OFF'}
-                ariaLabel="Toggle Jellyfin Subsonic LUFS GainNode"
+                ariaLabel="Toggle ReplayGain LUFS GainNode"
                 testId="audiolab-toggle-lufs"
               />
             </div>

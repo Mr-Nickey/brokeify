@@ -34,6 +34,10 @@ import {
   ConnectAndroidAppSection,
   PWAInstallButton,
 } from './PWAInstallButton';
+import {
+  SecurityAndUsersManagerSection,
+  type AuthenticatedSessionUser,
+} from './SecurityGateAndAccess';
 import { VersionChecker } from './VersionChecker';
 
 interface SourcesHubViewProps {
@@ -53,6 +57,11 @@ interface SourcesHubViewProps {
   onUpdateServerIntegrations?: (next: BrokeifyServerIntegrations) => void;
   onSaveServerConfigNow?: () => Promise<void>;
   onLockDeviceForLogin?: () => void;
+  currentUser?: AuthenticatedSessionUser | null;
+  requireLogin?: boolean;
+  onAuthConfigChanged?: (nextRequireLogin: boolean) => void;
+  onLockAndSignOut?: () => void;
+  onShowToast?: (msg: string) => void;
 }
 
 export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
@@ -66,6 +75,11 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
   serverConfigPath = '/app/data/config.json',
   onUpdateServerIntegrations,
   onSaveServerConfigNow,
+  currentUser = null,
+  requireLogin = false,
+  onAuthConfigChanged,
+  onLockAndSignOut,
+  onShowToast,
 }) => {
   const [isSavingConfigFile, setIsSavingConfigFile] = useState<boolean>(false);
   const [isTestingLidarr, setIsTestingLidarr] = useState<boolean>(false);
@@ -1381,8 +1395,24 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
         </section>
       )}
 
-      {/* Section 1: Connect Android App (Inline High-Contrast QR Code, Copy Server URL, Temporary Token & Camera Scanner Instructions) */}
+      {/* Section 1: Connect Android App (6-Digit Quick Connect, High-Contrast QR Code, Auto-Detected Browser URL) */}
       <ConnectAndroidAppSection />
+
+      {/* Section 1B: Public Domain Security Gate, Friends & Family Accounts & Anti-Bot Shield */}
+      <SecurityAndUsersManagerSection
+        currentUser={currentUser || null}
+        requireLogin={Boolean(requireLogin)}
+        onAuthConfigChanged={(next) => {
+          if (onAuthConfigChanged) onAuthConfigChanged(next);
+        }}
+        onLockAndSignOut={() => {
+          if (onLockAndSignOut) onLockAndSignOut();
+        }}
+        onShowToast={(msg) => {
+          if (onShowToast) onShowToast(msg);
+          else showSavedCard('top', msg);
+        }}
+      />
 
       {/* Section 2: Disk-Backed Artwork Cache & Browser Storage Persistence */}
       <section

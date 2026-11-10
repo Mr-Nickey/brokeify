@@ -321,7 +321,7 @@ export const MaintainerrStatsView: React.FC<MaintainerrStatsViewProps> = ({
               {neverPlayedTracks.length}
             </div>
             <p className="text-[11px] text-zinc-400 mt-1">
-              0 plays in Jellyfin &amp; Brokeify
+              0 plays in Brokeify Library
             </p>
           </button>
 
@@ -426,14 +426,14 @@ export const MaintainerrStatsView: React.FC<MaintainerrStatsViewProps> = ({
               <div className="space-y-1 text-xs">
                 <div className="font-bold text-white font-mono">
                   ⚠️ Maintainerr Disk Cleanup: Permanently delete{' '}
-                  {selectedTrackObjects.length} audio file(s) from your Jellyfin
+                  {selectedTrackObjects.length} audio file(s) from your /music
                   hard drive?
                 </div>
                 <p className="text-rose-200">
                   Unlike deleting a playlist (which never touches your files),
-                  this action calls{' '}
-                  <code className="text-white">DELETE /Items/:id</code> on your
-                  Jellyfin server to free up approximately{' '}
+                  this action removes the audio file(s) from{' '}
+                  <code className="text-white">/music</code> and{' '}
+                  <code className="text-white">/data/brokeify.db</code> to free up approximately{' '}
                   <strong>{formatBytes(selectedTotalBytes)}</strong> of storage.
                 </p>
               </div>

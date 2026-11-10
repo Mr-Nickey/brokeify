@@ -1459,11 +1459,13 @@ export function useAudioEngine(initialQueue: Track[]) {
   const togglePlayPauseRef = useRef(togglePlayPause);
   const playNextRef = useRef(playNext);
   const playPreviousRef = useRef(playPrevious);
+  const seekToRef = useRef(seekTo);
   useEffect(() => {
     togglePlayPauseRef.current = togglePlayPause;
     playNextRef.current = playNext;
     playPreviousRef.current = playPrevious;
-  }, [togglePlayPause, playNext, playPrevious]);
+    seekToRef.current = seekTo;
+  }, [togglePlayPause, playNext, playPrevious, seekTo]);
 
   // 1. Register Android Auto MediaSession Transport Action Handlers ONCE (Zero thrashing!)
   // Explicitly registers nexttrack (Skip Song) and previoustrack, and clears seekforward/seekbackward/seekto
@@ -1489,9 +1491,11 @@ export function useAudioEngine(initialQueue: Track[]) {
         // Clear all seek/scrub handlers so Android Auto's compact split-screen bar below Google Maps
         // dedicates its action slots strictly to Play/Pause and Skip Song (nexttrack)!
         try {
-          navigator.mediaSession.setActionHandler('seekbackward', null);
-          navigator.mediaSession.setActionHandler('seekforward', null);
-          navigator.mediaSession.setActionHandler('seekto', null);
+          navigator.mediaSession.setActionHandler('seekto', (details) => {
+            if (typeof details.seekTime === 'number') {
+              seekToRef.current(details.seekTime);
+            }
+          });
         } catch {}
       } catch {}
     };
@@ -1499,8 +1503,7 @@ export function useAudioEngine(initialQueue: Track[]) {
     registerHandlers();
   }, [currentTrack?.id, isPlaying]);
 
-  // 2. Update Android Auto MediaMetadata ONLY when the track changes (NOT 4x/sec on currentTime!)
-  // Uses bitmap PNG icons so Android's native MediaNotification decoder never stalls on SVG data URIs.
+  // 2. Update Mobile Lock-Screen & Bluetooth MediaMetadata when the track changes
   useEffect(() => {
     if (
       typeof navigator === 'undefined' ||
@@ -1510,14 +1513,21 @@ export function useAudioEngine(initialQueue: Track[]) {
       return;
     }
     try {
-      const hasHttpArtwork =
-        Boolean(currentTrack.artworkUrl) &&
-        /^https?:\/\//i.test(currentTrack.artworkUrl);
+      const rawArt = currentTrack.artworkUrl || '';
+      const isUsableArt =
+        Boolean(rawArt) &&
+        !rawArt.startsWith('data:image/svg') &&
+        (/^https?:\/\//i.test(rawArt) || rawArt.startsWith('/'));
 
-      const artworkList: MediaImage[] = hasHttpArtwork
+      const resolvedArtUrl =
+        isUsableArt && rawArt.startsWith('/') && typeof window !== 'undefined'
+          ? `${window.location.origin}${rawArt}`
+          : rawArt;
+
+      const artworkList: MediaImage[] = isUsableArt
         ? [
             {
-              src: currentTrack.artworkUrl,
+              src: resolvedArtUrl,
               sizes: '512x512',
               type: 'image/jpeg',
             },
@@ -1555,15 +1565,26 @@ export function useAudioEngine(initialQueue: Track[]) {
     currentTrack?.artworkUrl,
   ]);
 
-  // 3. Update Android Auto PlaybackState ONLY when play/pause toggles
+  // 3. Update Mobile Lock-Screen PlaybackState & PositionState
   useEffect(() => {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) {
       return;
     }
     try {
       navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+      if (
+        'setPositionState' in navigator.mediaSession &&
+        duration > 0 &&
+        Number.isFinite(duration)
+      ) {
+        navigator.mediaSession.setPositionState({
+          duration: Math.max(1, duration),
+          playbackRate: 1,
+          position: Math.max(0, Math.min(duration, currentTime)),
+        });
+      }
     } catch {}
-  }, [isPlaying]);
+  }, [isPlaying, Math.floor(currentTime), Math.floor(duration)]);
 
   // Sample 24-band frequency spectrum + 64-point oscilloscope waveform for 90s/2000s visualizer
   useEffect(() => {

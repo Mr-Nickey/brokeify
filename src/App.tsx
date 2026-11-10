@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ArrowDownToLine,
@@ -54,6 +54,9 @@ import {
   ArrowLeft,
   Clock,
   Layers,
+  Lock,
+  Heart,
+  Moon,
 } from 'lucide-react';
 import { BrokeifyLogo } from './components/BrokeifyLogo';
 import { SlidingToggle } from './components/SlidingToggle';
@@ -68,6 +71,8 @@ import { NowPlayingDrawer } from './components/NowPlayingDrawer';
 import { BrokeifyOnboardingModal } from './components/BrokeifyOnboardingModal';
 import { WinampVisualizer } from './components/WinampVisualizer';
 import { PlaylistDetailView } from './components/PlaylistDetailView';
+import { LikedSongsView } from './components/LikedSongsView';
+import { MadeForYouShelf } from './components/MadeForYouShelf';
 import {
   SpotifyPlaylistImporterModal,
   AddToPlaylistModal,
@@ -79,6 +84,10 @@ import {
   PWAInstallButton,
   MobilePixelInstallBanner,
 } from './components/PWAInstallButton';
+import {
+  BrokeifyLoginGateScreen,
+  type AuthenticatedSessionUser,
+} from './components/SecurityGateAndAccess';
 import { useAudioEngine } from './hooks/useAudioEngine';
 import { MusicProviderManager } from './services/MusicProviderManager';
 import type {
@@ -101,6 +110,7 @@ import type {
   TrackPlayStatRecord,
 } from './types/music';
 import {
+  buildClientInstantMix,
   compileUserCustomThemeCss,
   dedupeAndSpreadTracks,
   DEFAULT_CUSTOM_THEME,
@@ -122,11 +132,12 @@ import { createAlbumArtworkDataUri } from './utils/artworkGenerator';
 import { CachedArtworkImage, preloadArtworkBatch } from './utils/artworkCache';
 
 type CoreTab = 'library' | 'discover' | 'nowplaying' | 'settings';
-type LibrarySubTab = 'playlists' | 'songs' | 'albums' | 'artists' | 'stats';
+type LibrarySubTab = 'playlists' | 'liked' | 'songs' | 'albums' | 'artists' | 'stats';
 type SettingsSectionTab = 'sources' | 'audiolab' | 'themes' | 'debug';
 
 const PINNED_PLAYLIST_STORAGE_KEY = 'brokeify_pinned_playlist_id_v1';
 const RECENT_TRACKS_STORAGE_KEY = 'brokeify_recent_track_ids_v1';
+const LIKED_TRACKS_STORAGE_KEY = 'brokeify_liked_tracks_v1';
 const DEVICE_VERIFIED_STORAGE_KEY = 'brokeify_device_verified_v1';
 const DEVICE_ID_STORAGE_KEY = 'brokeify_device_id_v1';
 
@@ -245,6 +256,38 @@ export default function App() {
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [dismissedJellyfinAlert, setDismissedJellyfinAlert] =
     useState<boolean>(false);
+
+  // Liked Songs ❤️ (Favorites synced between localStorage & /api/library/likes)
+  const [likedTrackIds, setLikedTrackIds] = useState<Set<string>>(() => {
+    try {
+      const raw = localStorage.getItem(LIKED_TRACKS_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return new Set(parsed.map(String));
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return new Set();
+  });
+  const [likedGenreFilter, setLikedGenreFilter] = useState<string>('ALL');
+
+  // Sleep Timer (Auto-Pause Playback after N minutes)
+  const [sleepTimerMinutes, setSleepTimerMinutes] = useState<number | null>(
+    null
+  );
+  const [sleepTimerRemainingSec, setSleepTimerRemainingSec] = useState<
+    number | null
+  >(null);
+
+  const handleReturnToMainLibrary = useCallback(() => {
+    setActiveTab('library');
+    setSelectedPlaylistId(null);
+    setSearchQuery('');
+    setIsDrawerOpen(false);
+  }, []);
 
   // Zero-Logout Persistent Storage & Jellyfin Cloud Sync State
   const [storagePersistStatus, setStoragePersistStatus] = useState<{
@@ -419,6 +462,62 @@ export default function App() {
   const [openMenuArtistName, setOpenMenuArtistName] = useState<string | null>(
     null
   );
+
+  // Front-End Security Gate & Multi-User Session State
+  const [authSession, setAuthSession] = useState<{
+    checked: boolean;
+    authenticated: boolean;
+    requireLogin: boolean;
+    isDefaultPassword: boolean;
+    detectedHost: string;
+    user: AuthenticatedSessionUser | null;
+    manualLockScreen: boolean;
+  }>({
+    checked: false,
+    authenticated: true,
+    requireLogin: false,
+    isDefaultPassword: true,
+    detectedHost: '',
+    user: null,
+    manualLockScreen: false,
+  });
+
+  const refreshAuthStatus = async () => {
+    try {
+      const resp = await fetch('/api/auth/status');
+      if (resp.ok) {
+        const data = await resp.json();
+        setAuthSession((prev) => ({
+          checked: true,
+          authenticated: Boolean(data.authenticated),
+          requireLogin: Boolean(data.requireLogin),
+          isDefaultPassword: Boolean(data.isDefaultPassword),
+          detectedHost: String(data.detectedHost || ''),
+          user: data.user || null,
+          manualLockScreen: prev.manualLockScreen,
+        }));
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  useEffect(() => {
+    refreshAuthStatus();
+  }, []);
+
+  const handleLockAndSignOut = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // ignore
+    }
+    setAuthSession((prev) => ({
+      ...prev,
+      authenticated: false,
+      manualLockScreen: true,
+    }));
+  };
 
   // Global outside click & escape handler to close any open dropdown menus
   useEffect(() => {
@@ -2049,6 +2148,178 @@ export default function App() {
     return Array.from(map.values());
   }, [allTracks]);
 
+  // Sync Liked Songs from server on mount
+  useEffect(() => {
+    fetch('/api/library/likes')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (data?.ok && Array.isArray(data.likedTrackIds)) {
+          setLikedTrackIds((prev) => {
+            const merged = new Set([...prev, ...data.likedTrackIds.map(String)]);
+            try {
+              localStorage.setItem(
+                LIKED_TRACKS_STORAGE_KEY,
+                JSON.stringify(Array.from(merged))
+              );
+            } catch {}
+            return merged;
+          });
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  const handleToggleLikeTrack = useCallback((track: Track) => {
+    if (!track?.id) return;
+    setLikedTrackIds((prev) => {
+      const next = new Set(prev);
+      const willLike = !next.has(track.id);
+      if (willLike) {
+        next.add(track.id);
+      } else {
+        next.delete(track.id);
+      }
+      try {
+        localStorage.setItem(
+          LIKED_TRACKS_STORAGE_KEY,
+          JSON.stringify(Array.from(next))
+        );
+      } catch {}
+      fetch('/api/library/likes/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ trackId: track.id, liked: willLike }),
+      }).catch(() => {});
+      setToastMessage(
+        willLike
+          ? `❤️ Added "${track.title}" to Liked Songs`
+          : `Removed "${track.title}" from Liked Songs`
+      );
+      return next;
+    });
+  }, []);
+
+  // Start Spotify-style Song Radio seeded by a track
+  const handleStartTrackRadio = useCallback(
+    (seedTrack: Track) => {
+      const radioMix = buildClientInstantMix(
+        seedTrack,
+        allTracks.length > 0 ? allTracks : [seedTrack],
+        25
+      );
+      audio.playSpecificTrack(radioMix[0] || seedTrack, radioMix);
+      setToastMessage(
+        `📻 Started Song Radio for "${seedTrack.title}" (${radioMix.length} tracks queued)`
+      );
+    },
+    [allTracks, audio]
+  );
+
+  // Sleep Timer Countdown Effect
+  const handleSetSleepTimerMinutes = useCallback((minutes: number | null) => {
+    setSleepTimerMinutes(minutes);
+    setSleepTimerRemainingSec(minutes ? minutes * 60 : null);
+    if (minutes) {
+      setToastMessage(
+        `🌙 Sleep Timer set for ${minutes} minutes — playback will pause automatically`
+      );
+    } else {
+      setToastMessage('🌙 Sleep Timer turned off');
+    }
+  }, []);
+
+  useEffect(() => {
+    if (sleepTimerRemainingSec === null) return;
+    if (sleepTimerRemainingSec <= 0) {
+      if (audio.isPlaying) {
+        audio.togglePlayPause();
+      }
+      setSleepTimerMinutes(null);
+      setSleepTimerRemainingSec(null);
+      setToastMessage('🌙 Sleep Timer finished — playback paused');
+      return;
+    }
+    const timer = setInterval(() => {
+      setSleepTimerRemainingSec((prev) =>
+        prev !== null ? Math.max(0, prev - 1) : null
+      );
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [sleepTimerRemainingSec, audio]);
+
+  // Derived Liked Songs & Spotify-Style Smart Mixes ("Made For You")
+  const likedTracks = useMemo(
+    () => allTracks.filter((t) => likedTrackIds.has(t.id)),
+    [allTracks, likedTrackIds]
+  );
+
+  const likedGenres = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const t of likedTracks) {
+      const g = (t.genre || '').trim();
+      if (g && g.toLowerCase() !== 'unknown') {
+        counts.set(g, (counts.get(g) || 0) + 1);
+      }
+    }
+    return Array.from(counts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6)
+      .map(([genre]) => genre);
+  }, [likedTracks]);
+
+  const filteredLikedTracks = useMemo(() => {
+    let list = likedTracks;
+    if (likedGenreFilter !== 'ALL') {
+      list = list.filter(
+        (t) => (t.genre || '').toLowerCase() === likedGenreFilter.toLowerCase()
+      );
+    }
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase().trim();
+      list = list.filter(
+        (t) =>
+          t.title.toLowerCase().includes(q) ||
+          t.artist.toLowerCase().includes(q) ||
+          t.album.toLowerCase().includes(q)
+      );
+    }
+    return list;
+  }, [likedTracks, likedGenreFilter, searchQuery]);
+
+  // Spotify-style "On Repeat" Mix (Most played + recently played + liked)
+  const onRepeatTracks = useMemo(() => {
+    if (allTracks.length === 0) return [];
+    const recentSet = new Set(recentTrackIds);
+    return [...allTracks]
+      .sort((a, b) => {
+        const scoreA =
+          (a.playCount || 0) * 3 +
+          (recentSet.has(a.id) ? 5 : 0) +
+          (likedTrackIds.has(a.id) ? 4 : 0);
+        const scoreB =
+          (b.playCount || 0) * 3 +
+          (recentSet.has(b.id) ? 5 : 0) +
+          (likedTrackIds.has(b.id) ? 4 : 0);
+        return scoreB - scoreA;
+      })
+      .slice(0, 25);
+  }, [allTracks, recentTrackIds, likedTrackIds]);
+
+  // Spotify-style "Daily Mix 1" (Seeded by top liked or top artist + smart affinity)
+  const dailyMixTracks = useMemo(() => {
+    if (allTracks.length === 0) return [];
+    const seed = likedTracks[0] || recentlyPlayedTracks[0] || allTracks[0];
+    return seed ? buildClientInstantMix(seed, allTracks, 25) : [];
+  }, [allTracks, likedTracks, recentlyPlayedTracks]);
+
+  // Spotify-style "Time Capsule / Deep Cuts" (Unplayed & hidden gems)
+  const timeCapsuleTracks = useMemo(() => {
+    if (allTracks.length === 0) return [];
+    return [...allTracks]
+      .sort((a, b) => (a.playCount || 0) - (b.playCount || 0))
+      .slice(0, 25);
+  }, [allTracks]);
+
   // Dynamic source filter tabs
   const activeFilterTabs = useMemo(() => {
     const tabs: Array<{ id: ProviderType | 'all'; label: string }> = [
@@ -2074,6 +2345,31 @@ export default function App() {
   const headerTagline =
     customTheme.customTagline?.trim() ||
     `'99 RETRO DECK // ${activeVisualSkin.name.toUpperCase()}`;
+
+  if (
+    (authSession.checked &&
+      authSession.requireLogin &&
+      !authSession.authenticated) ||
+    authSession.manualLockScreen
+  ) {
+    return (
+      <BrokeifyLoginGateScreen
+        detectedHost={authSession.detectedHost}
+        isDefaultPassword={authSession.isDefaultPassword}
+        onLoginSuccess={({ user }) => {
+          setAuthSession((prev) => ({
+            ...prev,
+            authenticated: true,
+            user,
+            manualLockScreen: false,
+          }));
+          setToastMessage(
+            `🔓 Signed in as ${user.displayName || user.username} (${user.role.toUpperCase()})`
+          );
+        }}
+      />
+    );
+  }
 
   return (
     <div
@@ -2170,8 +2466,9 @@ export default function App() {
           <div className="flex flex-wrap items-center gap-3 min-w-0">
             <button
               type="button"
-              onClick={() => setActiveTab('library')}
-              className="flex items-center gap-2.5 text-left shrink-0 group"
+              onClick={handleReturnToMainLibrary}
+              title="Return to Main Library"
+              className="flex items-center gap-2.5 text-left shrink-0 group cursor-pointer"
             >
               <BrokeifyLogo size={28} />
               <div className="leading-none">
@@ -2191,7 +2488,7 @@ export default function App() {
             >
               <button
                 type="button"
-                onClick={() => setActiveTab('library')}
+                onClick={handleReturnToMainLibrary}
                 data-testid="tab-library"
                 className={`px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap ${
                   activeTab === 'library'
@@ -2246,9 +2543,32 @@ export default function App() {
             </nav>
           </div>
 
-          {/* Right: PWA Install to Phone 📱, Car Mode 🚗 and Settings ⚙️ */}
+          {/* Right: PWA Install to Phone 📱, Lock/Security 🔒, Car Mode 🚗 and Settings ⚙️ */}
           <div className="flex items-center gap-2 shrink-0 ml-auto">
             <PWAInstallButton />
+
+            <button
+              type="button"
+              onClick={handleLockAndSignOut}
+              data-testid="navbar-lock-security-btn"
+              title={
+                authSession.requireLogin
+                  ? `Lock Session (${authSession.user?.displayName || authSession.user?.username || 'Protected'})`
+                  : 'Lock Screen / Open Login Gate'
+              }
+              className={`inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-mono font-semibold transition-colors whitespace-nowrap shrink-0 min-h-[36px] ${
+                authSession.requireLogin
+                  ? 'border-[#00ff66]/50 bg-[#00ff66]/10 text-[#00ff66] hover:bg-[#00ff66]/20'
+                  : 'border-zinc-700 bg-zinc-900 text-zinc-300 hover:text-white hover:border-zinc-500'
+              }`}
+            >
+              <Lock className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">
+                {authSession.user?.role === 'listener'
+                  ? authSession.user.displayName
+                  : 'Lock'}
+              </span>
+            </button>
 
             <button
               type="button"
@@ -2428,6 +2748,68 @@ export default function App() {
                 </div>
 
                 <div className="p-3.5 flex items-stretch gap-3 overflow-x-auto">
+                  {/* Spotify-Style Liked Songs ❤️ Quick Launch Card */}
+                  <div
+                    data-testid="quicklaunch-liked-songs-card"
+                    className="w-[235px] max-w-[235px] rounded-xl border border-rose-500/50 bg-gradient-to-br from-rose-950/60 via-zinc-900/95 to-purple-950/50 p-3 flex flex-col justify-between gap-2.5 shrink-0 overflow-hidden shadow-lg"
+                  >
+                    <div className="flex items-start justify-between gap-2 min-w-0">
+                      <div className="min-w-0 flex-1 overflow-hidden">
+                        <span className="inline-flex items-center gap-1 text-[10px] font-mono uppercase tracking-wider text-rose-300">
+                          <Heart className="w-3 h-3 fill-rose-500 text-rose-500 shrink-0" />
+                          <span className="truncate">Favorites Collection</span>
+                        </span>
+                        <h3 className="text-xs font-bold text-white truncate block max-w-full mt-0.5">
+                          Liked Songs ❤️
+                        </h3>
+                        <div className="text-[10px] font-mono text-zinc-400 truncate block max-w-full">
+                          {likedTracks.length > 0
+                            ? `${likedTracks.length} saved songs`
+                            : 'Tap ♥ on any song'}
+                        </div>
+                      </div>
+                      <span className="text-[10px] font-mono text-rose-300 shrink-0 font-bold">
+                        {likedTracks.length}tr
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setLibrarySubTab('liked');
+                          if (likedTracks.length > 0) {
+                            audio.playSpecificTrack(likedTracks[0], likedTracks);
+                          }
+                        }}
+                        className="flex-1 inline-flex items-center justify-center gap-1 rounded-lg bg-[#00ff66] hover:bg-emerald-400 py-1.5 px-2.5 text-[11px] font-mono font-bold text-zinc-950 transition-colors min-h-[32px]"
+                      >
+                        <Play className="w-3 h-3 fill-current" />
+                        <span>{likedTracks.length > 0 ? 'Play' : 'Open'}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setLibrarySubTab('liked');
+                          if (likedTracks.length > 0) {
+                            const shuffled = smartAntiRepeatShuffle(
+                              likedTracks,
+                              audio.smartAntiRepeatEnabled
+                            );
+                            audio.playSpecificTrack(shuffled[0], shuffled);
+                            setToastMessage(
+                              `🔀 Shuffling ${shuffled.length} Liked Songs`
+                            );
+                          }
+                        }}
+                        className="flex-1 inline-flex items-center justify-center gap-1 rounded-lg bg-rose-500 hover:bg-rose-400 py-1.5 px-2.5 text-[11px] font-mono font-bold text-white transition-colors min-h-[32px]"
+                      >
+                        <Shuffle className="w-3 h-3" />
+                        <span>Shuffle</span>
+                      </button>
+                    </div>
+                  </div>
+
                   {pinnedFavoritePlaylist && (
                     <div
                       data-testid="quicklaunch-pinned-playlist-card"
@@ -2551,6 +2933,26 @@ export default function App() {
                 >
                   <ListMusic className="w-3.5 h-3.5" />
                   <span>Playlists ({visiblePlaylists.length})</span>
+                </button>
+
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={librarySubTab === 'liked'}
+                  onClick={() => setLibrarySubTab('liked')}
+                  data-testid="subtab-liked"
+                  className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold transition-colors whitespace-nowrap min-h-[34px] ${
+                    librarySubTab === 'liked'
+                      ? 'bg-rose-500 text-white shadow-sm'
+                      : 'text-rose-300 hover:text-white'
+                  }`}
+                >
+                  <Heart
+                    className={`w-3.5 h-3.5 ${
+                      librarySubTab === 'liked' ? 'fill-white' : 'fill-rose-500 text-rose-400'
+                    }`}
+                  />
+                  <span>Liked Songs ({likedTracks.length})</span>
                 </button>
 
                 <button
@@ -2896,9 +3298,64 @@ export default function App() {
                     handleSavePlaylistNameDirect(pl, newName);
                   }}
                   onShowToast={(msg) => setToastMessage(msg)}
+                  likedTrackIds={likedTrackIds}
+                  onToggleLikeTrack={handleToggleLikeTrack}
+                  onStartTrackRadio={handleStartTrackRadio}
                 />
               ) : (
-                <section aria-label="Unified Playlists Grid" className="space-y-4">
+                <section aria-label="Unified Playlists Grid" className="space-y-5">
+                  <MadeForYouShelf
+                    likedTracks={likedTracks}
+                    onRepeatTracks={onRepeatTracks}
+                    dailyMixTracks={dailyMixTracks}
+                    timeCapsuleTracks={timeCapsuleTracks}
+                    onOpenLikedSongs={() => setLibrarySubTab('liked')}
+                    onShuffleLikedSongs={() => {
+                      const shuffled = smartAntiRepeatShuffle(
+                        likedTracks,
+                        audio.smartAntiRepeatEnabled
+                      );
+                      audio.playSpecificTrack(shuffled[0], shuffled);
+                      setToastMessage(
+                        `❤️ Shuffling ${shuffled.length} Liked Songs`
+                      );
+                    }}
+                    onPlayOnRepeat={() => {
+                      if (onRepeatTracks.length > 0) {
+                        audio.playSpecificTrack(
+                          onRepeatTracks[0],
+                          onRepeatTracks
+                        );
+                        setToastMessage(
+                          `🔥 Playing On Repeat (${onRepeatTracks.length} heavy-rotation tracks)`
+                        );
+                      }
+                    }}
+                    onPlayDailyMix={() => {
+                      if (dailyMixTracks.length > 0) {
+                        audio.playSpecificTrack(
+                          dailyMixTracks[0],
+                          dailyMixTracks
+                        );
+                        setToastMessage(
+                          `⚡ Playing Daily Mix 1 (${dailyMixTracks.length} tracks)`
+                        );
+                      }
+                    }}
+                    onPlayTimeCapsule={() => {
+                      if (timeCapsuleTracks.length > 0) {
+                        const shuffled = smartAntiRepeatShuffle(
+                          timeCapsuleTracks,
+                          audio.smartAntiRepeatEnabled
+                        );
+                        audio.playSpecificTrack(shuffled[0], shuffled);
+                        setToastMessage(
+                          `🕰️ Playing Time Capsule (${shuffled.length} deep cuts)`
+                        );
+                      }
+                    }}
+                  />
+
                   {visiblePlaylists.length === 0 ? (
                     <div className="winamp-bezel rounded-2xl border border-zinc-800/90 p-8 text-center space-y-3">
                       <p className="text-sm font-semibold text-zinc-200">
@@ -3418,6 +3875,63 @@ export default function App() {
               </div>
             )}
 
+            {/* SUB-TAB 1.5: LIKED SONGS (SPOTIFY-STYLE FAVORITES COLLECTION) */}
+            {librarySubTab === 'liked' && (
+              <LikedSongsView
+                likedTracks={likedTracks}
+                filteredLikedTracks={filteredLikedTracks}
+                likedGenres={likedGenres}
+                likedGenreFilter={likedGenreFilter}
+                onSetLikedGenreFilter={setLikedGenreFilter}
+                currentTrackId={audio.currentTrack?.id}
+                isPlaying={audio.isPlaying}
+                cachedTrackIds={audio.cachedTrackIds}
+                onPlayAll={() => {
+                  if (filteredLikedTracks.length > 0) {
+                    audio.playSpecificTrack(
+                      filteredLikedTracks[0],
+                      filteredLikedTracks
+                    );
+                    setToastMessage(
+                      `❤️ Playing ${filteredLikedTracks.length} Liked Songs`
+                    );
+                  }
+                }}
+                onShuffleAll={() => {
+                  if (filteredLikedTracks.length > 0) {
+                    const shuffled = smartAntiRepeatShuffle(
+                      filteredLikedTracks,
+                      audio.smartAntiRepeatEnabled
+                    );
+                    audio.playSpecificTrack(shuffled[0], shuffled);
+                    setToastMessage(
+                      `🔀 Shuffling ${shuffled.length} Liked Songs`
+                    );
+                  }
+                }}
+                onSaveOffline={async () => {
+                  for (const t of filteredLikedTracks.slice(0, 25)) {
+                    await preloadTrackToVault(t);
+                  }
+                  await audio.refreshVaultState();
+                  setToastMessage(
+                    `💾 Cached ${Math.min(25, filteredLikedTracks.length)} Liked Songs to Offline Vault`
+                  );
+                }}
+                onBrowseAllSongs={() => setLibrarySubTab('songs')}
+                onToggleLikeTrack={handleToggleLikeTrack}
+                onStartTrackRadio={handleStartTrackRadio}
+                onPlayOrPauseTrack={(track) => {
+                  if (audio.currentTrack?.id === track.id) {
+                    audio.togglePlayPause();
+                  } else {
+                    audio.playSpecificTrack(track, filteredLikedTracks);
+                  }
+                }}
+                formatDuration={formatDuration}
+              />
+            )}
+
             {/* SUB-TAB 2: SONGS LIST */}
             {librarySubTab === 'songs' && (
               <section
@@ -3742,7 +4256,36 @@ export default function App() {
                               </div>
                             </div>
 
-                            <div className="flex items-center gap-2 shrink-0">
+                            <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => handleToggleLikeTrack(track)}
+                                data-testid={`like-song-btn-${track.id}`}
+                                aria-label={
+                                  likedTrackIds.has(track.id)
+                                    ? `Remove ${track.title} from Liked Songs`
+                                    : `Save ${track.title} to Liked Songs`
+                                }
+                                title={
+                                  likedTrackIds.has(track.id)
+                                    ? 'Liked — click to remove'
+                                    : 'Save to Liked Songs'
+                                }
+                                className={`p-2 rounded-xl border transition-colors min-h-[36px] min-w-[36px] flex items-center justify-center ${
+                                  likedTrackIds.has(track.id)
+                                    ? 'border-rose-500/50 bg-rose-500/15 text-rose-400'
+                                    : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-rose-400 hover:border-rose-500/40'
+                                }`}
+                              >
+                                <Heart
+                                  className={`w-4 h-4 ${
+                                    likedTrackIds.has(track.id)
+                                      ? 'fill-rose-500 text-rose-400'
+                                      : ''
+                                  }`}
+                                />
+                              </button>
+
                               <button
                                 type="button"
                                 onClick={() => audio.queueTrackNext(track)}
@@ -3805,6 +4348,18 @@ export default function App() {
                                     data-dropdown-menu="true"
                                     className="absolute right-0 top-10 z-40 w-60 rounded-2xl border border-zinc-700 bg-zinc-950/95 p-1.5 shadow-2xl backdrop-blur-md space-y-1 text-xs font-mono"
                                   >
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        handleStartTrackRadio(track);
+                                        setOpenMenuSongId(null);
+                                      }}
+                                      className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-purple-300"
+                                    >
+                                      <Radio className="w-3.5 h-3.5 text-purple-400" />
+                                      <span>Start Song Radio</span>
+                                    </button>
+
                                     <button
                                       type="button"
                                       onClick={() => {
@@ -4530,6 +5085,56 @@ export default function App() {
                           {audio.currentTrack.album}
                         </p>
                         <div className="pt-1 flex flex-wrap items-center justify-center sm:justify-start gap-2 text-[11px] font-mono text-zinc-300">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              audio.currentTrack &&
+                              handleToggleLikeTrack(audio.currentTrack)
+                            }
+                            data-testid="nowplaying-like-btn"
+                            className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 font-bold transition-colors ${
+                              likedTrackIds.has(audio.currentTrack.id)
+                                ? 'border-rose-500/60 bg-rose-500/20 text-rose-300'
+                                : 'border-zinc-700 bg-zinc-900 text-zinc-300 hover:text-rose-300'
+                            }`}
+                          >
+                            <Heart
+                              className={`w-3.5 h-3.5 ${
+                                likedTrackIds.has(audio.currentTrack.id)
+                                  ? 'fill-rose-500 text-rose-400'
+                                  : ''
+                              }`}
+                            />
+                            <span>
+                              {likedTrackIds.has(audio.currentTrack.id)
+                                ? 'Liked'
+                                : 'Like'}
+                            </span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() =>
+                              audio.currentTrack &&
+                              handleStartTrackRadio(audio.currentTrack)
+                            }
+                            data-testid="nowplaying-radio-btn"
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-purple-500/40 bg-purple-950/30 hover:bg-purple-900/50 px-2.5 py-1 font-bold text-purple-300 transition-colors"
+                          >
+                            <Radio className="w-3.5 h-3.5" />
+                            <span>Song Radio</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => setIsDrawerOpen(true)}
+                            data-testid="nowplaying-lyrics-btn"
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-950/30 hover:bg-emerald-900/40 px-2.5 py-1 font-bold text-[#00ff66] transition-colors"
+                          >
+                            <Sparkles className="w-3.5 h-3.5" />
+                            <span>Lyrics &amp; Sleep Timer</span>
+                          </button>
+
                           <span className="rounded bg-zinc-900 border border-zinc-700 px-2 py-0.5 text-[#00ff66]">
                             {audio.stabilizationProfile.profileLabel}
                           </span>
@@ -4539,6 +5144,15 @@ export default function App() {
                               ? `${audio.crossfadeSeconds}s`
                               : 'OFF'}
                           </span>
+                          {sleepTimerMinutes !== null && (
+                            <span className="rounded bg-indigo-950/80 border border-indigo-500/40 px-2 py-0.5 text-indigo-300 inline-flex items-center gap-1">
+                              <Moon className="w-3 h-3" />
+                              Sleep:{' '}
+                              {sleepTimerRemainingSec !== null
+                                ? `${Math.ceil(sleepTimerRemainingSec / 60)}m`
+                                : `${sleepTimerMinutes}m`}
+                            </span>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -4564,15 +5178,18 @@ export default function App() {
                         onChange={(e) =>
                           audio.seekTo(parseFloat(e.target.value))
                         }
-                        className="w-full cursor-pointer"
+                        className="w-full h-2 accent-[#00ff66] cursor-pointer"
                       />
                       <div className="flex justify-between text-xs font-mono tabular-nums text-[#00ff66]">
                         <span>{formatDuration(audio.currentTime)}</span>
+                        <span className="text-zinc-400">
+                          -{formatDuration(Math.max(0, audio.duration - audio.currentTime))} left
+                        </span>
                         <span>{formatDuration(audio.duration)}</span>
                       </div>
                     </div>
 
-                    <div className="flex items-center justify-between gap-4">
+                    <div className="flex items-center justify-between gap-2 sm:gap-4">
                       <button
                         type="button"
                         onClick={audio.toggleShuffle}
@@ -4586,21 +5203,31 @@ export default function App() {
                         <Shuffle className="w-5 h-5" />
                       </button>
 
-                      <div className="flex items-center gap-4">
+                      <div className="flex items-center gap-2 sm:gap-3">
                         <button
                           type="button"
                           onClick={audio.playPrevious}
                           aria-label="Previous Track"
-                          className="p-3.5 rounded-2xl border border-zinc-700 bg-zinc-900 text-white hover:bg-zinc-800 min-h-[48px] min-w-[48px] flex items-center justify-center"
+                          className="p-3 sm:p-3.5 rounded-2xl border border-zinc-700 bg-zinc-900 text-white hover:bg-zinc-800 min-h-[46px] min-w-[46px] flex items-center justify-center"
                         >
-                          <SkipBack className="w-6 h-6" />
+                          <SkipBack className="w-5 h-5 sm:w-6 sm:h-6" />
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => audio.seekTo(Math.max(0, audio.currentTime - 10))}
+                          aria-label="Rewind 10 seconds"
+                          title="Rewind 10 seconds"
+                          className="px-2.5 py-2 rounded-xl border border-zinc-800 bg-zinc-950 text-zinc-300 hover:text-white font-mono text-xs font-bold min-h-[44px]"
+                        >
+                          -10s
                         </button>
 
                         <button
                           type="button"
                           onClick={audio.togglePlayPause}
                           aria-label={audio.isPlaying ? 'Pause' : 'Play'}
-                          className="w-16 h-16 rounded-2xl bg-[#00ff66] hover:bg-emerald-400 text-zinc-950 flex items-center justify-center shadow-lg"
+                          className="w-15 h-15 sm:w-16 sm:h-16 rounded-2xl bg-[#00ff66] hover:bg-emerald-400 text-zinc-950 flex items-center justify-center shadow-lg"
                         >
                           {audio.isPlaying ? (
                             <Pause className="w-7 h-7 fill-current" />
@@ -4611,11 +5238,25 @@ export default function App() {
 
                         <button
                           type="button"
+                          onClick={() =>
+                            audio.seekTo(
+                              Math.min(Math.max(1, audio.duration), audio.currentTime + 10)
+                            )
+                          }
+                          aria-label="Fast-forward 10 seconds"
+                          title="Fast-forward 10 seconds"
+                          className="px-2.5 py-2 rounded-xl border border-zinc-800 bg-zinc-950 text-zinc-300 hover:text-white font-mono text-xs font-bold min-h-[44px]"
+                        >
+                          +10s
+                        </button>
+
+                        <button
+                          type="button"
                           onClick={audio.playNext}
                           aria-label="Next Track"
-                          className="p-3.5 rounded-2xl border border-zinc-700 bg-zinc-900 text-white hover:bg-zinc-800 min-h-[48px] min-w-[48px] flex items-center justify-center"
+                          className="p-3 sm:p-3.5 rounded-2xl border border-zinc-700 bg-zinc-900 text-white hover:bg-zinc-800 min-h-[46px] min-w-[46px] flex items-center justify-center"
                         >
-                          <SkipForward className="w-6 h-6" />
+                          <SkipForward className="w-5 h-5 sm:w-6 sm:h-6" />
                         </button>
                       </div>
 
@@ -4861,16 +5502,31 @@ export default function App() {
                     return (
                       <div
                         key={`${qTrack.id}-np-${idx}`}
-                        className={`py-2.5 px-2 rounded-xl flex items-center justify-between gap-2 ${
-                          isCurrent ? 'bg-emerald-500/15' : ''
+                        className={`py-2.5 px-2.5 rounded-xl flex items-center justify-between gap-2 transition-colors ${
+                          isCurrent
+                            ? 'bg-emerald-500/15 border border-emerald-500/40'
+                            : 'hover:bg-zinc-900/60'
                         }`}
                       >
                         <div className="min-w-0 flex-1">
-                          <div className="text-xs font-mono font-semibold text-white truncate">
-                            {isCurrent
-                              ? '▶ '
-                              : `${String(idx + 1).padStart(2, '0')}. `}
-                            {qTrack.title}
+                          <div className="text-xs font-mono font-semibold text-white truncate flex items-center gap-1.5">
+                            {isCurrent ? (
+                              <span className="inline-flex items-center gap-1 text-[#00ff66] font-bold">
+                                <span
+                                  className={`w-2 h-2 rounded-full bg-[#00ff66] ${
+                                    audio.isPlaying ? 'animate-pulse' : ''
+                                  }`}
+                                />
+                                NOW:
+                              </span>
+                            ) : (
+                              <span className="text-zinc-500">
+                                {String(idx + 1).padStart(2, '0')}.
+                              </span>
+                            )}
+                            <span className={isCurrent ? 'text-[#00ff66]' : 'text-white'}>
+                              {qTrack.title}
+                            </span>
                           </div>
                           <div className="text-[11px] text-zinc-400 flex items-center gap-1.5 mt-0.5">
                             <span className="truncate">{qTrack.artist}</span>
@@ -4894,11 +5550,57 @@ export default function App() {
                         <div className="flex items-center gap-1.5 shrink-0">
                           <button
                             type="button"
-                            onClick={() => audio.playSpecificTrack(qTrack)}
-                            className="rounded-lg bg-zinc-800 hover:bg-[#00ff66] hover:text-zinc-950 px-2.5 py-1 text-xs font-mono font-semibold text-zinc-200 transition-colors min-h-[32px]"
+                            onClick={() => handleToggleLikeTrack(qTrack)}
+                            aria-label={
+                              likedTrackIds.has(qTrack.id)
+                                ? `Unlike ${qTrack.title}`
+                                : `Like ${qTrack.title}`
+                            }
+                            className={`p-1.5 rounded-lg border transition-colors min-h-[32px] min-w-[32px] flex items-center justify-center ${
+                              likedTrackIds.has(qTrack.id)
+                                ? 'border-rose-500/50 bg-rose-500/15 text-rose-400'
+                                : 'border-zinc-800 bg-zinc-950 text-zinc-500 hover:text-rose-400'
+                            }`}
                           >
-                            Play
+                            <Heart
+                              className={`w-3.5 h-3.5 ${
+                                likedTrackIds.has(qTrack.id)
+                                  ? 'fill-rose-500 text-rose-400'
+                                  : ''
+                              }`}
+                            />
                           </button>
+
+                          {isCurrent ? (
+                            <button
+                              type="button"
+                              onClick={audio.togglePlayPause}
+                              data-testid="nowplaying-current-track-badge"
+                              title={
+                                audio.isPlaying
+                                  ? 'Currently playing — click to pause'
+                                  : 'Currently paused — click to resume'
+                              }
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/60 bg-emerald-500/20 hover:bg-emerald-500/30 px-2.5 py-1 text-xs font-mono font-bold text-[#00ff66] transition-colors min-h-[32px]"
+                            >
+                              <span
+                                className={`w-2 h-2 rounded-full bg-[#00ff66] ${
+                                  audio.isPlaying ? 'animate-pulse' : 'opacity-60'
+                                }`}
+                              />
+                              <span>
+                                {audio.isPlaying ? 'Now Playing' : 'Paused · Resume'}
+                              </span>
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => audio.playSpecificTrack(qTrack)}
+                              className="rounded-lg bg-zinc-800 hover:bg-[#00ff66] hover:text-zinc-950 px-2.5 py-1 text-xs font-mono font-semibold text-zinc-200 transition-colors min-h-[32px]"
+                            >
+                              Play
+                            </button>
+                          )}
                         </div>
                       </div>
                     );
@@ -5047,6 +5749,16 @@ export default function App() {
                   );
                 }}
                 onLockDeviceForLogin={handleLockDeviceForLogin}
+                currentUser={authSession.user}
+                requireLogin={authSession.requireLogin}
+                onAuthConfigChanged={(nextRequireLogin) => {
+                  setAuthSession((prev) => ({
+                    ...prev,
+                    requireLogin: nextRequireLogin,
+                  }));
+                }}
+                onLockAndSignOut={handleLockAndSignOut}
+                onShowToast={(msg) => setToastMessage(msg)}
               />
             )}
 
@@ -5135,7 +5847,8 @@ export default function App() {
 
       {/* Persistent Bottom Player Bar + Mobile 4-Tab Navigation */}
       <div className="fixed bottom-0 inset-x-0 z-40 border-t border-zinc-700/80 winamp-titlebar backdrop-blur-lg">
-        <div className="w-full h-0.5 bg-zinc-950">
+        {/* Interactive Mobile + Desktop Touch Scrubber Bar at Top of Dock */}
+        <div className="relative w-full h-1.5 sm:h-1 bg-zinc-950 group">
           <div
             className="h-full bg-[#00ff66] transition-all duration-150"
             style={{
@@ -5145,23 +5858,33 @@ export default function App() {
               )}%`,
             }}
           />
+          <input
+            type="range"
+            min={0}
+            max={Math.max(1, audio.duration)}
+            value={audio.currentTime}
+            aria-label="Mobile quick track scrubber"
+            onChange={(e) => audio.seekTo(parseFloat(e.target.value))}
+            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+          />
         </div>
 
-        <div className="w-full max-w-[1920px] mx-auto px-3 sm:px-6 xl:px-10 py-1.5 sm:py-2.5 flex items-center justify-between gap-3">
+        <div className="w-full max-w-[1920px] mx-auto px-3 sm:px-6 xl:px-10 py-1.5 sm:py-2.5 flex items-center justify-between gap-2 sm:gap-3">
           {/* Current Track Info */}
           <button
             type="button"
             onClick={() => setIsDrawerOpen(true)}
-            className="flex items-center gap-3 min-w-0 flex-1 sm:flex-initial sm:w-80 text-left group"
+            data-testid="bottombar-open-drawer-btn"
+            className="flex items-center gap-2.5 sm:gap-3 min-w-0 flex-1 sm:flex-initial sm:w-80 text-left group"
           >
             {audio.currentTrack && (
               <CachedArtworkImage
                 src={audio.currentTrack.artworkUrl}
                 alt={audio.currentTrack.title}
                 fallbackTitle={audio.currentTrack?.title || 'Brokeify'}
-                fallbackArtist={audio.currentTrack?.artist || 'Jellyfin'}
+                fallbackArtist={audio.currentTrack?.artist || 'Brokeify'}
                 fallbackAccent={audio.currentTrack?.accentColor || '#10b981'}
-                className="w-9 h-9 sm:w-11 sm:h-11 rounded-xl border border-zinc-700 object-cover shrink-0"
+                className="w-10 h-10 sm:w-11 sm:h-11 rounded-xl border border-zinc-700 object-cover shrink-0"
               />
             )}
             <div className="min-w-0 flex-1 overflow-hidden">
@@ -5190,9 +5913,53 @@ export default function App() {
                   )
                 )}
               </div>
+              {/* Mobile Elapsed / Duration Readout */}
+              {audio.currentTrack && (
+                <div className="lg:hidden text-[10px] font-mono tabular-nums text-[#00ff66]/90 mt-0.5 flex items-center gap-1.5">
+                  <span>
+                    {formatDuration(audio.currentTime)} /{' '}
+                    {formatDuration(audio.duration)}
+                  </span>
+                  <span className="text-zinc-500">· Tap for Full Player</span>
+                </div>
+              )}
             </div>
             <ChevronUp className="w-4 h-4 text-zinc-400 group-hover:text-white shrink-0" />
           </button>
+
+          {/* 1-Tap Heart Like Button in Persistent Bottom Bar */}
+          {audio.currentTrack && (
+            <button
+              type="button"
+              onClick={() =>
+                audio.currentTrack && handleToggleLikeTrack(audio.currentTrack)
+              }
+              data-testid="bottombar-like-btn"
+              aria-label={
+                likedTrackIds.has(audio.currentTrack.id)
+                  ? `Remove ${audio.currentTrack.title} from Liked Songs`
+                  : `Save ${audio.currentTrack.title} to Liked Songs`
+              }
+              title={
+                likedTrackIds.has(audio.currentTrack.id)
+                  ? 'Liked — tap to remove'
+                  : 'Save to Liked Songs'
+              }
+              className={`p-2 rounded-xl border transition-colors min-h-[40px] min-w-[40px] flex items-center justify-center shrink-0 ${
+                likedTrackIds.has(audio.currentTrack.id)
+                  ? 'border-rose-500/50 bg-rose-500/15 text-rose-400'
+                  : 'border-zinc-800 bg-zinc-900/80 text-zinc-400 hover:text-rose-400'
+              }`}
+            >
+              <Heart
+                className={`w-4 h-4 ${
+                  likedTrackIds.has(audio.currentTrack.id)
+                    ? 'fill-rose-500 text-rose-400'
+                    : ''
+                }`}
+              />
+            </button>
+          )}
 
           {/* Center Transport Controls: Prev, Play/Pause, Prominent Skip Song, and Shuffle */}
           <div className="flex items-center gap-1.5 sm:gap-2">
@@ -5200,7 +5967,7 @@ export default function App() {
               type="button"
               onClick={audio.playPrevious}
               aria-label="Previous track"
-              className="p-2 rounded-xl text-zinc-300 hover:bg-zinc-900 hover:text-white min-h-[38px] min-w-[38px] flex items-center justify-center"
+              className="p-2 rounded-xl text-zinc-300 hover:bg-zinc-900 hover:text-white min-h-[40px] min-w-[40px] flex items-center justify-center"
             >
               <SkipBack className="w-4 h-4 sm:w-5 sm:h-5" />
             </button>
@@ -5224,7 +5991,7 @@ export default function App() {
               aria-label="Skip Song"
               title="Skip Song"
               data-testid="bottombar-skip-song-btn"
-              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-emerald-500/50 bg-zinc-900/90 hover:bg-zinc-800 text-[#00ff66] font-mono text-xs font-bold min-h-[38px]"
+              className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-2 rounded-xl border border-emerald-500/50 bg-zinc-900/90 hover:bg-zinc-800 text-[#00ff66] font-mono text-xs font-bold min-h-[40px]"
             >
               <SkipForward className="w-4 h-4 sm:w-5 sm:h-5" />
               <span className="hidden xs:inline sm:inline">Skip</span>
@@ -5243,7 +6010,7 @@ export default function App() {
               aria-label="Toggle Shuffle Queue"
               title="Mix / Shuffle Queue"
               data-testid="bottombar-shuffle-btn"
-              className={`inline-flex items-center gap-1 px-2.5 py-2 rounded-xl border font-mono text-xs font-bold min-h-[38px] transition-colors ${
+              className={`inline-flex items-center gap-1 px-2.5 py-2 rounded-xl border font-mono text-xs font-bold min-h-[40px] transition-colors ${
                 audio.shuffleEnabled
                   ? 'border-purple-500/70 bg-purple-500/20 text-purple-300'
                   : 'border-zinc-800 bg-zinc-900/80 text-zinc-300 hover:text-white'
@@ -5322,7 +6089,7 @@ export default function App() {
         >
           <button
             type="button"
-            onClick={() => setActiveTab('library')}
+            onClick={handleReturnToMainLibrary}
             className={`flex flex-col items-center justify-center min-h-[44px] ${
               activeTab === 'library' ? 'text-[#00ff66]' : 'text-zinc-400'
             }`}
@@ -5393,6 +6160,12 @@ export default function App() {
         offlinePreloadCount={audio.offlinePreloadCount}
         onChangeOfflinePreloadCount={audio.setOfflinePreloadCount}
         eqPreset={audio.eqPreset}
+        onApplyEqPreset={(preset) => {
+          if (preset !== 'Custom') {
+            audio.applyEqPreset(preset);
+          }
+        }}
+        onRefreshVaultState={audio.refreshVaultState}
         cachedTrackIds={audio.cachedTrackIds}
         preloadingTrackIds={audio.preloadingTrackIds}
         frequencyData={audio.frequencyData}
@@ -5414,6 +6187,12 @@ export default function App() {
           setActiveTab('settings');
           setSettingsSubTab('audiolab');
         }}
+        likedTrackIds={likedTrackIds}
+        onToggleLikeTrack={handleToggleLikeTrack}
+        onStartTrackRadio={handleStartTrackRadio}
+        sleepTimerMinutes={sleepTimerMinutes}
+        sleepTimerRemainingSec={sleepTimerRemainingSec}
+        onSetSleepTimerMinutes={handleSetSleepTimerMinutes}
       />
 
       {/* 1-Tap Giant High-Contrast Car Mode Overlay */}

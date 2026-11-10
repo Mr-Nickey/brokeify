@@ -158,6 +158,7 @@ export interface TrackRow {
   play_count: number;
   last_played_at: string | null;
   musicbrainz_id?: string | null;
+  file_mtime_ms?: number | null;
 }
 
 export interface PlaylistGhostItem {
@@ -198,6 +199,7 @@ interface PersistedDatabaseSchema {
   playlists: PlaylistRow[];
   playlistTracks: Record<string, string[]>;
   scrobbles: ScrobbleRow[];
+  likedTrackIds?: string[];
 }
 
 class BrokeifyEmbeddedDatabase {
@@ -208,6 +210,7 @@ class BrokeifyEmbeddedDatabase {
   playlists = new Map<string, PlaylistRow>();
   playlistTracks = new Map<string, string[]>(); // playlist_id -> ordered track_id[]
   scrobbles: ScrobbleRow[] = [];
+  likedTrackIds = new Set<string>();
 
   constructor() {
     this.loadFromDisk();
@@ -271,6 +274,14 @@ class BrokeifyEmbeddedDatabase {
       if (Array.isArray(parsed.scrobbles)) {
         this.scrobbles = parsed.scrobbles.slice(-2000);
       }
+      if (Array.isArray(parsed.likedTrackIds)) {
+        for (const tid of parsed.likedTrackIds) {
+          if (tid) this.likedTrackIds.add(String(tid));
+        }
+      }
+      console.log(
+        `[Brokeify][DB][INFO] Restored persistent database from ${DB_PATH}: ${this.tracks.size} tracks, ${this.albums.size} albums, ${this.artists.size} artists, ${this.playlists.size} playlists intact.`
+      );
     } catch (err) {
       console.warn('[Brokeify DB] Starting with fresh embedded database index:', err);
     }
@@ -288,6 +299,7 @@ class BrokeifyEmbeddedDatabase {
         playlists: Array.from(this.playlists.values()),
         playlistTracks: Object.fromEntries(this.playlistTracks.entries()),
         scrobbles: this.scrobbles.slice(-2000),
+        likedTrackIds: Array.from(this.likedTrackIds),
       };
       const json = JSON.stringify(payload);
       const tmpPath = `${DB_PATH}.tmp`;
@@ -304,6 +316,7 @@ class BrokeifyEmbeddedDatabase {
           playlists: Array.from(this.playlists.values()),
           playlistTracks: Object.fromEntries(this.playlistTracks.entries()),
           scrobbles: this.scrobbles.slice(-2000),
+          likedTrackIds: Array.from(this.likedTrackIds),
         };
         fs.writeFileSync(DB_PATH, JSON.stringify(payload), 'utf-8');
       } catch {}
@@ -783,13 +796,45 @@ function parseFallbackFromFilePath(filePath: string): {
   return { artist, album, title, trackNumber, discNumber, year };
 }
 
-export async function indexAudioFile(filePath: string): Promise<string | null> {
+export async function indexAudioFile(
+  filePath: string,
+  options?: { forceReparse?: boolean }
+): Promise<string | null> {
   try {
     const resolvedPath = path.resolve(filePath);
     if (!fs.existsSync(resolvedPath)) return null;
 
     if (!isSupportedAudioFile(resolvedPath)) return null;
     const ext = path.extname(resolvedPath).toLowerCase();
+
+    let fileMtimeMs: number | null = null;
+    try {
+      const st = fs.statSync(resolvedPath);
+      fileMtimeMs = Math.round(st.mtimeMs);
+    } catch {}
+
+    const existingTrackId = db.tracksByPath.get(resolvedPath);
+    const existingTrack = existingTrackId
+      ? db.tracks.get(existingTrackId)
+      : undefined;
+
+    // Fast path: if track already exists in /data/brokeify.db and file mtime hasn't changed, keep existing DB entry intact
+    if (
+      !options?.forceReparse &&
+      existingTrack &&
+      existingTrack.album_id &&
+      existingTrack.artist_id &&
+      db.albums.has(existingTrack.album_id) &&
+      db.artists.has(existingTrack.artist_id) &&
+      (!existingTrack.file_mtime_ms ||
+        !fileMtimeMs ||
+        existingTrack.file_mtime_ms === fileMtimeMs)
+    ) {
+      if (!existingTrack.file_mtime_ms && fileMtimeMs) {
+        existingTrack.file_mtime_ms = fileMtimeMs;
+      }
+      return existingTrack.id;
+    }
 
     const fallback = parseFallbackFromFilePath(resolvedPath);
 
@@ -808,6 +853,7 @@ export async function indexAudioFile(filePath: string): Promise<string | null> {
     let embeddedPicture: { data: Uint8Array; format?: string } | null = null;
     let mbAlbumId: string | null = null;
     let mbArtistId: string | null = null;
+    let mbRecordingId: string | null = null;
 
     try {
       const metadata = await parseFile(resolvedPath, { duration: true });
@@ -867,6 +913,7 @@ export async function indexAudioFile(filePath: string): Promise<string | null> {
       if (Array.isArray(c.musicbrainz_artistid) && c.musicbrainz_artistid[0]) {
         mbArtistId = c.musicbrainz_artistid[0];
       }
+      if (c.musicbrainz_recordingid) mbRecordingId = c.musicbrainz_recordingid;
     } catch {
       // Fallback metadata from path already populated
     }
@@ -924,14 +971,10 @@ export async function indexAudioFile(filePath: string): Promise<string | null> {
       musicbrainz_id: mbAlbumId || existingAlbum?.musicbrainz_id || null,
     });
 
-    const existingTrackId = db.tracksByPath.get(resolvedPath);
-    const existingTrack = existingTrackId
-      ? db.tracks.get(existingTrackId)
-      : db.tracks.get(trackId);
-
-    const preservedLufs = existingTrack?.loudness_lufs ?? null;
+    const resolvedExistingTrack = existingTrack || db.tracks.get(trackId);
+    const preservedLufs = resolvedExistingTrack?.loudness_lufs ?? null;
     const preservedGain =
-      existingTrack?.replaygain_track_gain ?? replayGainDb ?? null;
+      resolvedExistingTrack?.replaygain_track_gain ?? replayGainDb ?? null;
 
     db.tracks.set(trackId, {
       id: trackId,
@@ -947,8 +990,11 @@ export async function indexAudioFile(filePath: string): Promise<string | null> {
       sample_rate: sampleRate,
       loudness_lufs: preservedLufs,
       replaygain_track_gain: preservedGain,
-      play_count: existingTrack?.play_count ?? 0,
-      last_played_at: existingTrack?.last_played_at ?? null,
+      play_count: resolvedExistingTrack?.play_count ?? 0,
+      last_played_at: resolvedExistingTrack?.last_played_at ?? null,
+      musicbrainz_id:
+        mbRecordingId || resolvedExistingTrack?.musicbrainz_id || null,
+      file_mtime_ms: fileMtimeMs,
     });
     db.tracksByPath.set(resolvedPath, trackId);
 
@@ -2174,3 +2220,28 @@ export async function updateTrackMetadataInDb(params: {
   return queryTracks().find((t) => t.id === trackRow.id) || null;
 }
 
+export function getLikedTrackIds(): string[] {
+  return Array.from(db.likedTrackIds);
+}
+
+export function toggleLikedTrack(
+  trackId: string,
+  liked?: boolean
+): { liked: boolean; likedTrackIds: string[] } {
+  const id = String(trackId || '').trim();
+  if (!id) {
+    return { liked: false, likedTrackIds: Array.from(db.likedTrackIds) };
+  }
+  const shouldLike =
+    typeof liked === 'boolean' ? liked : !db.likedTrackIds.has(id);
+  if (shouldLike) {
+    db.likedTrackIds.add(id);
+  } else {
+    db.likedTrackIds.delete(id);
+  }
+  syncDatabaseToPersistentDisk();
+  return {
+    liked: shouldLike,
+    likedTrackIds: Array.from(db.likedTrackIds),
+  };
+}

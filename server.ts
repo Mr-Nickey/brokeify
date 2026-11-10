@@ -52,6 +52,8 @@ import {
   handleServeCover,
   enrichTrackFromMusicBrainz,
   updateTrackMetadataInDb,
+  getLikedTrackIds,
+  toggleLikedTrack,
 } from './src/server/libraryEngine.ts';
 
 const execFileAsync = promisify(execFile);
@@ -280,6 +282,11 @@ const DEFAULT_SERVER_CONFIG = {
     username: process.env.BROKEIFY_USERNAME || 'admin',
     password: process.env.BROKEIFY_PASSWORD || 'brokeify',
     apiToken: process.env.BROKEIFY_API_TOKEN || 'brokeify-standalone-token',
+    requireLogin:
+      process.env.BROKEIFY_REQUIRE_LOGIN === 'true' ||
+      Boolean(process.env.BROKEIFY_PASSWORD),
+    autoLockPublicDomain: true,
+    guestUsers: [],
   },
   integrations: {
     jellyfinUrl: '',
@@ -392,6 +399,9 @@ function readServerConfig() {
       auth: {
         ...DEFAULT_SERVER_CONFIG.auth,
         ...(parsed.auth || {}),
+        guestUsers: Array.isArray(parsed.auth?.guestUsers)
+          ? parsed.auth.guestUsers
+          : [],
       },
       integrations: {
         ...DEFAULT_SERVER_CONFIG.integrations,
@@ -449,6 +459,15 @@ function writeServerConfig(nextConfig) {
       ...nextConfig,
       updatedAt: new Date().toISOString(),
     };
+    if (nextConfig.auth) {
+      merged.auth = {
+        ...current.auth,
+        ...nextConfig.auth,
+        guestUsers: Array.isArray(nextConfig.auth.guestUsers)
+          ? nextConfig.auth.guestUsers
+          : current.auth?.guestUsers || [],
+      };
+    }
     if (nextConfig.integrations) {
       merged.integrations = {
         ...current.integrations,
@@ -569,6 +588,93 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
+// GET /api/library/likes -> Returns array of liked track IDs persisted in /data/brokeify.db
+app.get('/api/library/likes', (_req, res) => {
+  res.json({
+    ok: true,
+    likedTrackIds: getLikedTrackIds(),
+  });
+});
+
+// POST /api/library/likes/toggle -> Toggles or sets liked state for a trackId
+app.post('/api/library/likes/toggle', (req, res) => {
+  const trackId = String(req.body?.trackId || '').trim();
+  const liked =
+    typeof req.body?.liked === 'boolean' ? req.body.liked : undefined;
+  if (!trackId) {
+    return res
+      .status(400)
+      .json({ ok: false, error: 'Missing trackId in request body' });
+  }
+  const result = toggleLikedTrack(trackId, liked);
+  res.json({
+    ok: true,
+    ...result,
+  });
+});
+
+// GET /api/lyrics -> Fetches synchronized (.lrc) and plain lyrics from LRCLIB for Spotify-style Sing-Along Lyrics
+app.get('/api/lyrics', async (req, res) => {
+  const title = String(req.query.title || '').trim();
+  const artist = String(req.query.artist || '').trim();
+  const album = String(req.query.album || '').trim();
+  const duration = Number(req.query.duration || 0);
+
+  if (!title) {
+    return res.status(400).json({ ok: false, error: 'Missing track title' });
+  }
+
+  try {
+    const searchParams = new URLSearchParams({
+      track_name: title,
+      artist_name: artist,
+    });
+    if (album) searchParams.set('album_name', album);
+
+    const resp = await fetch(
+      `https://lrclib.net/api/search?${searchParams.toString()}`,
+      {
+        headers: {
+          'User-Agent': 'Brokeify/3.0.0 (https://github.com/mr-nickey/brokeify)',
+        },
+        signal: AbortSignal.timeout(7000),
+      }
+    );
+
+    if (resp.ok) {
+      const items = await resp.json();
+      if (Array.isArray(items) && items.length > 0) {
+        const best =
+          items.find((it) => it.syncedLyrics) ||
+          items.find((it) => it.plainLyrics) ||
+          items[0];
+        return res.json({
+          ok: true,
+          source: 'LRCLIB',
+          trackName: best.trackName || title,
+          artistName: best.artistName || artist,
+          instrumental: Boolean(best.instrumental),
+          syncedLyrics: best.syncedLyrics || null,
+          plainLyrics: best.plainLyrics || null,
+          duration: best.duration || duration,
+        });
+      }
+    }
+  } catch {
+    // Fallback if offline or LRCLIB unreachable
+  }
+
+  return res.json({
+    ok: true,
+    source: 'fallback',
+    trackName: title,
+    artistName: artist,
+    instrumental: false,
+    syncedLyrics: null,
+    plainLyrics: null,
+  });
+});
+
 // GET /api/storage/drive-status -> Inspects current mounted music drive / NAS folder
 app.get('/api/storage/drive-status', (_req, res) => {
   const driveStatus = inspectMusicDrive();
@@ -641,42 +747,648 @@ app.post('/api/storage/connect-drive', async (req, res) => {
   }
 });
 
-// POST /api/auth/login -> Authenticates client and returns session token
-app.post('/api/auth/login', (req, res) => {
+// ============================================================================
+// 1B. ANTI-BOT / ANTI-SCRAPER SHIELD, RATE LIMITER & MULTI-USER SECURITY GATE
+// ============================================================================
+
+const BOT_SCRAPER_UA_REGEX =
+  /(masscan|zgrab|nmap|sqlmap|nikto|nuclei|dirbuster|gobuster|wfuzz|ffuf|censys|shodan|ahrefsbot|semrushbot|mj12bot|dotbot|bytespider|gptbot|ccbot|claudebot|anthropic-ai|petalbot|barkrowler|blexbot|megaindex|seznambot|yandexbot|baiduspider|sogou|exabot)/i;
+
+const securityStats = {
+  blockedBotsCount: 0,
+  blockedBruteForceCount: 0,
+  lastBlockedBotUa: null as string | null,
+  lastBlockedAt: null as string | null,
+};
+
+interface RateLimitEntry {
+  failures: number;
+  firstFailureAt: number;
+  blockedUntil: number;
+}
+
+const authRateLimitMap = new Map<string, RateLimitEntry>();
+const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+const RATE_LIMIT_LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
+const MAX_AUTH_FAILURES = 5;
+
+function getClientIp(req): string {
+  return String(
+    req.headers['cf-connecting-ip'] ||
+      req.headers['x-real-ip'] ||
+      req.headers['x-forwarded-for'] ||
+      req.socket?.remoteAddress ||
+      'unknown'
+  )
+    .split(',')[0]
+    .trim();
+}
+
+function checkIpRateLimit(ip: string): {
+  allowed: boolean;
+  retryAfterSeconds: number;
+} {
+  const now = Date.now();
+  const entry = authRateLimitMap.get(ip);
+  if (!entry) return { allowed: true, retryAfterSeconds: 0 };
+
+  if (entry.blockedUntil > now) {
+    return {
+      allowed: false,
+      retryAfterSeconds: Math.ceil((entry.blockedUntil - now) / 1000),
+    };
+  }
+
+  if (now - entry.firstFailureAt > RATE_LIMIT_WINDOW_MS) {
+    authRateLimitMap.delete(ip);
+  }
+  return { allowed: true, retryAfterSeconds: 0 };
+}
+
+function recordAuthFailure(ip: string, reason: string) {
+  const now = Date.now();
+  const existing = authRateLimitMap.get(ip);
+  if (!existing || now - existing.firstFailureAt > RATE_LIMIT_WINDOW_MS) {
+    authRateLimitMap.set(ip, {
+      failures: 1,
+      firstFailureAt: now,
+      blockedUntil: 0,
+    });
+    return;
+  }
+
+  existing.failures += 1;
+  if (existing.failures >= MAX_AUTH_FAILURES) {
+    existing.blockedUntil = now + RATE_LIMIT_LOCKOUT_MS;
+    securityStats.blockedBruteForceCount += 1;
+    securityStats.lastBlockedAt = new Date().toISOString();
+    pushServerLog(
+      'warn',
+      'system',
+      `[Security Shield] Locked out IP ${ip} for 15 minutes after ${existing.failures} failed auth attempts (${reason}).`
+    );
+  }
+}
+
+function clearAuthFailures(ip: string) {
+  authRateLimitMap.delete(ip);
+}
+
+// Strict /robots.txt to keep search engines, AI crawlers, and web scrapers out
+app.get('/robots.txt', (_req, res) => {
+  res
+    .type('text/plain')
+    .set(
+      'X-Robots-Tag',
+      'noindex, nofollow, noarchive, nosnippet, noimageindex'
+    )
+    .send(
+      'User-agent: *\nDisallow: /\n\nUser-agent: GPTBot\nDisallow: /\n\nUser-agent: CCBot\nDisallow: /\n'
+    );
+});
+
+// Global Security Headers & Bot/Scraper Blocker Middleware
+app.use((req, res, next) => {
+  res.setHeader(
+    'X-Robots-Tag',
+    'noindex, nofollow, noarchive, nosnippet, noimageindex'
+  );
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'same-origin');
+
+  const ua = String(req.headers['user-agent'] || '');
+  if (ua && BOT_SCRAPER_UA_REGEX.test(ua)) {
+    securityStats.blockedBotsCount += 1;
+    securityStats.lastBlockedBotUa = ua.slice(0, 120);
+    securityStats.lastBlockedAt = new Date().toISOString();
+    const ip = getClientIp(req);
+    console.warn(
+      `[Brokeify][SECURITY][WARN] Blocked web scraper / scanner bot from ${ip} (UA: ${ua.slice(
+        0,
+        80
+      )})`
+    );
+    return res.status(403).send('Forbidden');
+  }
+  next();
+});
+
+function parseCookies(req): Record<string, string> {
+  const header = String(req.headers.cookie || '');
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  for (const part of header.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx > 0) {
+      const k = part.slice(0, idx).trim();
+      const v = decodeURIComponent(part.slice(idx + 1).trim());
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+function computeUserSessionToken(
+  username: string,
+  password: string,
+  role: string
+): string {
+  return crypto
+    .createHash('sha256')
+    .update(`brokeify-session:${username.toLowerCase()}:${password}:${role}`)
+    .digest('hex');
+}
+
+function isPublicInternetDomain(req): boolean {
+  const host = String(
+    req.headers['x-forwarded-host'] || req.headers.host || ''
+  )
+    .split(',')[0]
+    .split(':')[0]
+    .trim()
+    .toLowerCase();
+  if (!host) return false;
+  if (
+    host === 'localhost' ||
+    host === '127.0.0.1' ||
+    host === '0.0.0.0' ||
+    host.startsWith('192.168.') ||
+    host.startsWith('10.') ||
+    host.startsWith('100.') ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(host) ||
+    host.endsWith('.local') ||
+    host.endsWith('.lan') ||
+    host.endsWith('.run.app')
+  ) {
+    return false;
+  }
+  return true;
+}
+
+interface AuthenticatedUser {
+  id: string;
+  username: string;
+  displayName: string;
+  role: 'admin' | 'listener';
+}
+
+function resolveRequestAuth(req): {
+  authenticated: boolean;
+  user: AuthenticatedUser | null;
+} {
   const cfg = readServerConfig();
-  const username = String(
-    req.body?.username || cfg.auth?.username || 'admin'
+  const authHeader = String(req.headers.authorization || '').replace(
+    /^Bearer\s+/i,
+    ''
+  );
+  const cookies = parseCookies(req);
+  const providedToken = String(
+    authHeader ||
+      req.headers['x-api-key'] ||
+      req.query.apiKey ||
+      req.query.token ||
+      cookies.brokeify_session ||
+      ''
   ).trim();
-  const password = String(req.body?.password || '').trim();
-  const expectedPass = String(cfg.auth?.password || 'brokeify').trim();
+
+  if (!providedToken) {
+    return { authenticated: false, user: null };
+  }
+
+  const adminUser = String(cfg.auth?.username || 'admin').trim();
+  const adminPass = String(cfg.auth?.password || 'brokeify').trim();
+  const adminApiToken = String(cfg.auth?.apiToken || '').trim();
+  const adminSessionToken = computeUserSessionToken(
+    adminUser,
+    adminPass,
+    'admin'
+  );
 
   if (
-    password &&
-    password !== expectedPass &&
-    password !== cfg.auth?.apiToken
+    (adminApiToken && providedToken === adminApiToken) ||
+    providedToken === adminSessionToken
   ) {
+    return {
+      authenticated: true,
+      user: {
+        id: 'usr-brokeify-admin',
+        username: adminUser,
+        displayName: adminUser,
+        role: 'admin',
+      },
+    };
+  }
+
+  const guestUsers = Array.isArray(cfg.auth?.guestUsers)
+    ? cfg.auth.guestUsers
+    : [];
+  for (const guest of guestUsers) {
+    if (!guest?.username || !guest?.password) continue;
+    const guestRole = guest.role === 'admin' ? 'admin' : 'listener';
+    const guestToken = computeUserSessionToken(
+      guest.username,
+      guest.password,
+      guestRole
+    );
+    if (providedToken === guestToken || providedToken === guest.apiToken) {
+      return {
+        authenticated: true,
+        user: {
+          id: guest.id || `usr-${guest.username}`,
+          username: guest.username,
+          displayName: guest.displayName || guest.username,
+          role: guestRole,
+        },
+      };
+    }
+  }
+
+  return { authenticated: false, user: null };
+}
+
+// API Auth & Role Enforcement Middleware
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) return next();
+
+  // Always allow public handshake / login / health check endpoints
+  if (
+    req.path === '/api/auth/status' ||
+    req.path === '/api/auth/login' ||
+    req.path === '/api/auth/logout' ||
+    req.path === '/api/health' ||
+    req.path === '/api/mobile/verify' ||
+    req.path.startsWith('/api/mobile/quick-connect')
+  ) {
+    return next();
+  }
+
+  const cfg = readServerConfig();
+  const requireLogin = Boolean(cfg.auth?.requireLogin);
+  const authResult = resolveRequestAuth(req);
+
+  if (requireLogin && !authResult.authenticated) {
     return res.status(401).json({
       ok: false,
-      error: 'Invalid Brokeify server credentials.',
+      requiresLogin: true,
+      error:
+        'Authentication required. Please log in to access this Brokeify server.',
     });
   }
 
-  const token =
-    cfg.auth?.apiToken ||
-    crypto.createHash('sha256').update(`${username}:brokeify`).digest('hex');
+  // If logged in as a Friends & Family 'listener' account, protect admin settings & file deletion
+  if (authResult.authenticated && authResult.user?.role === 'listener') {
+    const isAdminOnlyRoute =
+      (req.path === '/api/config' && req.method !== 'GET') ||
+      req.path.startsWith('/api/storage/') ||
+      req.path.startsWith('/api/auth/security-config') ||
+      req.path.startsWith('/api/mobile/regenerate-token') ||
+      (req.path.startsWith('/api/library/tracks') && req.method === 'DELETE') ||
+      req.path === '/api/library/tracks/bulk-delete';
+
+    if (isAdminOnlyRoute) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          'Admin privileges required. Friends & Family listener accounts cannot modify server settings or delete files.',
+      });
+    }
+  }
+
+  next();
+});
+
+// GET /api/auth/status -> Checks current session, whether login gate is active, and public domain status
+app.get('/api/auth/status', (req, res) => {
+  const cfg = readServerConfig();
+  const authResult = resolveRequestAuth(req);
+  const requireLogin = Boolean(cfg.auth?.requireLogin);
+  const publicDomainDetected = isPublicInternetDomain(req);
+  const host = String(
+    req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3487'
+  ).split(',')[0];
+  const isDefaultPassword =
+    String(cfg.auth?.password || 'brokeify') === 'brokeify';
+
+  res.json({
+    ok: true,
+    authenticated: authResult.authenticated || !requireLogin,
+    strictAuthenticated: authResult.authenticated,
+    requireLogin,
+    autoLockPublicDomain: cfg.auth?.autoLockPublicDomain !== false,
+    publicDomainDetected,
+    detectedHost: host,
+    isDefaultPassword,
+    user: authResult.user || {
+      id: 'usr-brokeify-admin',
+      username: cfg.auth?.username || 'admin',
+      displayName: cfg.auth?.username || 'admin',
+      role: 'admin',
+    },
+    securityStats: {
+      ...securityStats,
+      guestUsersCount: Array.isArray(cfg.auth?.guestUsers)
+        ? cfg.auth.guestUsers.length
+        : 0,
+    },
+  });
+});
+
+// POST /api/auth/login -> Authenticates Admin or Friends & Family user and sets HttpOnly session cookie
+app.post('/api/auth/login', (req, res) => {
+  const clientIp = getClientIp(req);
+  const rateCheck = checkIpRateLimit(clientIp);
+  if (!rateCheck.allowed) {
+    return res.status(429).json({
+      ok: false,
+      error: `Too many failed login attempts from your IP. Please try again in ${Math.ceil(
+        rateCheck.retryAfterSeconds / 60
+      )} minute(s).`,
+    });
+  }
+
+  const cfg = readServerConfig();
+  const inputUser = String(req.body?.username || '').trim();
+  const inputPass = String(req.body?.password || '').trim();
+
+  const adminUser = String(cfg.auth?.username || 'admin').trim();
+  const adminPass = String(cfg.auth?.password || 'brokeify').trim();
+
+  // 1. Check Admin account
+  if (
+    (!inputUser || inputUser.toLowerCase() === adminUser.toLowerCase()) &&
+    (inputPass === adminPass || inputPass === cfg.auth?.apiToken)
+  ) {
+    clearAuthFailures(clientIp);
+    const sessionToken = computeUserSessionToken(adminUser, adminPass, 'admin');
+    res.setHeader(
+      'Set-Cookie',
+      `brokeify_session=${encodeURIComponent(
+        sessionToken
+      )}; Path=/; Max-Age=2592000; SameSite=Lax; HttpOnly`
+    );
+    pushServerLog(
+      'info',
+      'system',
+      `[Security] Admin "${adminUser}" signed in from ${clientIp}`
+    );
+    return res.json({
+      ok: true,
+      token: sessionToken,
+      apiKey: ensureMobileApiToken(false),
+      user: {
+        id: 'usr-brokeify-admin',
+        username: adminUser,
+        displayName: adminUser,
+        role: 'admin',
+      },
+      server: 'Brokeify Native Engine',
+      mode: 'standalone',
+    });
+  }
+
+  // 2. Check Friends & Family (guestUsers) accounts
+  const guestUsers = Array.isArray(cfg.auth?.guestUsers)
+    ? cfg.auth.guestUsers
+    : [];
+  const matchedGuest = guestUsers.find(
+    (g) =>
+      String(g.username || '').toLowerCase() === inputUser.toLowerCase() &&
+      String(g.password || '') === inputPass
+  );
+
+  if (matchedGuest) {
+    clearAuthFailures(clientIp);
+    const guestRole = matchedGuest.role === 'admin' ? 'admin' : 'listener';
+    const sessionToken = computeUserSessionToken(
+      matchedGuest.username,
+      matchedGuest.password,
+      guestRole
+    );
+    matchedGuest.lastLoginAt = new Date().toISOString();
+    writeServerConfig({ auth: { ...cfg.auth, guestUsers } });
+
+    res.setHeader(
+      'Set-Cookie',
+      `brokeify_session=${encodeURIComponent(
+        sessionToken
+      )}; Path=/; Max-Age=2592000; SameSite=Lax; HttpOnly`
+    );
+    pushServerLog(
+      'info',
+      'system',
+      `[Security] Friends & Family user "${matchedGuest.username}" (${guestRole}) signed in from ${clientIp}`
+    );
+    return res.json({
+      ok: true,
+      token: sessionToken,
+      user: {
+        id: matchedGuest.id || `usr-${matchedGuest.username}`,
+        username: matchedGuest.username,
+        displayName: matchedGuest.displayName || matchedGuest.username,
+        role: guestRole,
+      },
+      server: 'Brokeify Native Engine',
+      mode: 'standalone',
+    });
+  }
+
+  recordAuthFailure(clientIp, `Failed login for user "${inputUser || 'admin'}"`);
+  return res.status(401).json({
+    ok: false,
+    error: 'Invalid username or password.',
+  });
+});
+
+// POST /api/auth/logout -> Clears session cookie
+app.post('/api/auth/logout', (_req, res) => {
+  res.setHeader(
+    'Set-Cookie',
+    'brokeify_session=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly'
+  );
+  res.json({ ok: true, message: 'Signed out successfully.' });
+});
+
+// GET /api/auth/security-config -> Returns security settings, guest users, and anti-bot stats
+app.get('/api/auth/security-config', (req, res) => {
+  const cfg = readServerConfig();
+  const guestUsers = (cfg.auth?.guestUsers || []).map((g) => ({
+    id: g.id,
+    username: g.username,
+    displayName: g.displayName || g.username,
+    role: g.role || 'listener',
+    createdAt: g.createdAt,
+    lastLoginAt: g.lastLoginAt || null,
+  }));
+
+  const blockedIps: Array<{ ip: string; failures: number; unblockInSec: number }> =
+    [];
+  const now = Date.now();
+  for (const [ip, entry] of authRateLimitMap.entries()) {
+    if (entry.blockedUntil > now) {
+      blockedIps.push({
+        ip,
+        failures: entry.failures,
+        unblockInSec: Math.ceil((entry.blockedUntil - now) / 1000),
+      });
+    }
+  }
+
+  res.json({
+    ok: true,
+    requireLogin: Boolean(cfg.auth?.requireLogin),
+    autoLockPublicDomain: cfg.auth?.autoLockPublicDomain !== false,
+    adminUsername: cfg.auth?.username || 'admin',
+    isDefaultPassword: String(cfg.auth?.password || 'brokeify') === 'brokeify',
+    publicDomainDetected: isPublicInternetDomain(req),
+    guestUsers,
+    pairedDevices: pairedAndroidDevices,
+    securityStats,
+    blockedIps,
+  });
+});
+
+// POST /api/auth/security-config -> Updates admin password, login gate toggle, or Friends & Family accounts
+app.post('/api/auth/security-config', (req, res) => {
+  const cfg = readServerConfig();
+  const action = String(req.body?.action || 'update-settings');
+  const nextAuth = {
+    ...cfg.auth,
+    guestUsers: Array.isArray(cfg.auth?.guestUsers)
+      ? [...cfg.auth.guestUsers]
+      : [],
+  };
+
+  if (action === 'add-guest') {
+    const username = String(req.body?.username || '')
+      .trim()
+      .replace(/\s+/g, '');
+    const password = String(req.body?.password || '').trim();
+    const displayName = String(req.body?.displayName || username).trim();
+    const role = req.body?.role === 'admin' ? 'admin' : 'listener';
+
+    if (!username || !password) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Username and password are required for Friends & Family accounts.',
+      });
+    }
+    if (
+      username.toLowerCase() ===
+        String(nextAuth.username || 'admin').toLowerCase() ||
+      nextAuth.guestUsers.some(
+        (g) => String(g.username).toLowerCase() === username.toLowerCase()
+      )
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: `User "${username}" already exists.`,
+      });
+    }
+
+    const newGuest = {
+      id: `usr-${Date.now().toString(36)}`,
+      username,
+      displayName,
+      password,
+      role,
+      apiToken: `brk_guest_${crypto.randomBytes(12).toString('hex')}`,
+      createdAt: new Date().toISOString(),
+      lastLoginAt: null,
+    };
+    nextAuth.guestUsers.push(newGuest);
+    writeServerConfig({ auth: nextAuth });
+    pushServerLog(
+      'info',
+      'system',
+      `[Security] Created Friends & Family account "${username}" (${role})`
+    );
+    return res.json({
+      ok: true,
+      message: `Added Friends & Family account "${displayName}" (@${username})!`,
+      guestUsers: nextAuth.guestUsers.map((g) => ({
+        id: g.id,
+        username: g.username,
+        displayName: g.displayName,
+        role: g.role,
+        createdAt: g.createdAt,
+        lastLoginAt: g.lastLoginAt,
+      })),
+    });
+  }
+
+  if (action === 'remove-guest') {
+    const guestId = String(req.body?.id || req.body?.username || '').trim();
+    nextAuth.guestUsers = nextAuth.guestUsers.filter(
+      (g) => g.id !== guestId && g.username !== guestId
+    );
+    writeServerConfig({ auth: nextAuth });
+    return res.json({
+      ok: true,
+      message: 'Removed Friends & Family account.',
+      guestUsers: nextAuth.guestUsers.map((g) => ({
+        id: g.id,
+        username: g.username,
+        displayName: g.displayName,
+        role: g.role,
+        createdAt: g.createdAt,
+        lastLoginAt: g.lastLoginAt,
+      })),
+    });
+  }
+
+  if (action === 'unblock-ip') {
+    const ipToUnblock = String(req.body?.ip || '').trim();
+    if (ipToUnblock) authRateLimitMap.delete(ipToUnblock);
+    return res.json({
+      ok: true,
+      message: `Unblocked IP ${ipToUnblock}.`,
+    });
+  }
+
+  // Default: update admin credentials and/or requireLogin toggle
+  if (typeof req.body?.requireLogin === 'boolean') {
+    nextAuth.requireLogin = req.body.requireLogin;
+  }
+  if (typeof req.body?.autoLockPublicDomain === 'boolean') {
+    nextAuth.autoLockPublicDomain = req.body.autoLockPublicDomain;
+  }
+  if (req.body?.adminUsername && String(req.body.adminUsername).trim()) {
+    nextAuth.username = String(req.body.adminUsername).trim();
+  }
+  if (req.body?.adminPassword && String(req.body.adminPassword).trim()) {
+    nextAuth.password = String(req.body.adminPassword).trim();
+  }
+
+  writeServerConfig({ auth: nextAuth });
+
+  // Issue fresh admin session cookie so the admin stays logged in after enabling the lock or changing password
+  const sessionToken = computeUserSessionToken(
+    nextAuth.username,
+    nextAuth.password,
+    'admin'
+  );
+  res.setHeader(
+    'Set-Cookie',
+    `brokeify_session=${encodeURIComponent(
+      sessionToken
+    )}; Path=/; Max-Age=2592000; SameSite=Lax; HttpOnly`
+  );
 
   return res.json({
     ok: true,
-    token,
-    user: {
-      id: 'usr-brokeify-admin',
-      username,
-      role: 'admin',
-    },
-    server: 'Brokeify Native Engine',
-    mode: 'standalone',
+    requireLogin: Boolean(nextAuth.requireLogin),
+    adminUsername: nextAuth.username,
+    isDefaultPassword: nextAuth.password === 'brokeify',
+    token: sessionToken,
+    message: nextAuth.requireLogin
+      ? '🔒 Front-End Security Gate enabled & credentials saved!'
+      : 'Security settings updated.',
   });
 });
+
+// ============================================================================
+// 1C. ANDROID QR PAIRING & JELLYFIN-STYLE 6-DIGIT QUICK CONNECT ENGINE
+// ============================================================================
 
 // Helper to detect host LAN IPv4 address for Android QR code pairing
 function detectLanIpv4(): string {
@@ -714,12 +1426,68 @@ interface PairedAndroidDevice {
   model: string;
   clientIp: string;
   connectedAt: string;
+  method?: 'qr' | 'quick-connect-6digit';
 }
 
 const pairedAndroidDevices: PairedAndroidDevice[] = [];
 
 const TEMP_TOKEN_TTL_MS = 15 * 60 * 1000; // 15 minutes
 let activeTempPairingToken: { token: string; expiresAt: number } | null = null;
+let activeQuickConnectPin: { code: string; expiresAt: number } | null = null;
+
+interface PhoneInitiatedQuickConnect {
+  code: string;
+  secret: string;
+  deviceName: string;
+  model: string;
+  clientIp: string;
+  createdAt: number;
+  expiresAt: number;
+  authorized: boolean;
+  apiKey?: string;
+}
+
+const phoneQuickConnectRequests = new Map<string, PhoneInitiatedQuickConnect>();
+
+function generateSixDigitCode(): string {
+  return String(crypto.randomInt(100000, 999999));
+}
+
+function formatSixDigitCode(code: string): string {
+  const clean = String(code || '').replace(/\D/g, '');
+  if (clean.length === 6) {
+    return `${clean.slice(0, 3)} ${clean.slice(3)}`;
+  }
+  return clean;
+}
+
+function ensureQuickConnectPin(forceNew = false): {
+  code: string;
+  formattedCode: string;
+  expiresAt: string;
+  expiresInSeconds: number;
+} {
+  const now = Date.now();
+  if (
+    forceNew ||
+    !activeQuickConnectPin ||
+    activeQuickConnectPin.expiresAt <= now + 30_000
+  ) {
+    activeQuickConnectPin = {
+      code: generateSixDigitCode(),
+      expiresAt: now + TEMP_TOKEN_TTL_MS,
+    };
+  }
+  return {
+    code: activeQuickConnectPin.code,
+    formattedCode: formatSixDigitCode(activeQuickConnectPin.code),
+    expiresAt: new Date(activeQuickConnectPin.expiresAt).toISOString(),
+    expiresInSeconds: Math.max(
+      0,
+      Math.round((activeQuickConnectPin.expiresAt - now) / 1000)
+    ),
+  };
+}
 
 function ensureTempPairingToken(forceNew = false): {
   token: string;
@@ -767,32 +1535,104 @@ function ensureMobileApiToken(forceNew = false): string {
   return currentToken;
 }
 
-// GET /api/mobile/pair-info -> Returns QR pairing payload, LAN IP, temporary connection token, API token, and connected Android devices
+function registerPairedAndroidDevice(
+  req,
+  method: 'qr' | 'quick-connect-6digit' = 'qr',
+  overrideName?: string,
+  overrideModel?: string
+): PairedAndroidDevice {
+  const deviceName = String(
+    overrideName ||
+      req.body?.deviceName ||
+      req.query?.deviceName ||
+      req.headers['x-device-name'] ||
+      'Android Phone'
+  ).trim();
+  const model = String(
+    overrideModel ||
+      req.body?.model ||
+      req.query?.model ||
+      req.headers['user-agent'] ||
+      'Brokeify Android Client'
+  )
+    .slice(0, 80)
+    .trim();
+  const clientIp = getClientIp(req);
+
+  const existingIdx = pairedAndroidDevices.findIndex(
+    (d) => d.deviceName === deviceName && d.clientIp === clientIp
+  );
+  const deviceRecord: PairedAndroidDevice = {
+    id: `android-${Date.now().toString(36)}`,
+    deviceName,
+    model,
+    clientIp,
+    connectedAt: new Date().toISOString(),
+    method,
+  };
+  if (existingIdx >= 0) {
+    pairedAndroidDevices[existingIdx] = deviceRecord;
+  } else {
+    pairedAndroidDevices.unshift(deviceRecord);
+    if (pairedAndroidDevices.length > 10) pairedAndroidDevices.pop();
+  }
+  return deviceRecord;
+}
+
+// GET /api/mobile/pair-info -> Returns 6-digit Quick Connect code, QR pairing payload, detected Browser/Domain URL, LAN IP, and connected Android devices
 app.get('/api/mobile/pair-info', (req, res) => {
   const apiToken = ensureMobileApiToken(false);
   const tempInfo = ensureTempPairingToken(false);
+  const qcPin = ensureQuickConnectPin(false);
   const port = Number(process.env.PORT || 3487);
   const lanIp = detectLanIpv4();
   const lanUrl = `http://${lanIp}:${port}`;
   const proto =
-    String(req.headers['x-forwarded-proto'] || req.protocol || 'http').split(
-      ','
-    )[0];
+    String(req.headers['x-forwarded-proto'] || req.protocol || 'http')
+      .split(',')[0]
+      .trim();
   const host = String(
     req.headers['x-forwarded-host'] || req.headers.host || `${lanIp}:${port}`
-  ).split(',')[0];
+  )
+    .split(',')[0]
+    .trim();
   const detectedOriginUrl = `${proto}://${host}`;
   const counts = getLocalLibraryStats();
   const driveStatus = inspectMusicDrive();
 
+  // Prune expired phone-initiated requests
+  const now = Date.now();
+  const pendingPhoneRequests: Array<{
+    code: string;
+    formattedCode: string;
+    deviceName: string;
+    clientIp: string;
+  }> = [];
+  for (const [k, item] of phoneQuickConnectRequests.entries()) {
+    if (item.expiresAt <= now) {
+      phoneQuickConnectRequests.delete(k);
+    } else if (!item.authorized) {
+      pendingPhoneRequests.push({
+        code: item.code,
+        formattedCode: formatSixDigitCode(item.code),
+        deviceName: item.deviceName,
+        clientIp: item.clientIp,
+      });
+    }
+  }
+
   res.json({
     ok: true,
     app: 'brokeify',
-    version: '0.1.2-beta',
+    version: '0.1.3-beta',
     serverUrl: detectedOriginUrl,
+    detectedBrowserUrl: detectedOriginUrl,
+    publicDomainDetected: isPublicInternetDomain(req),
     localUrl: lanUrl,
     lanUrl,
     port,
+    quickConnectCode: qcPin.code,
+    quickConnectFormatted: qcPin.formattedCode,
     token: tempInfo.token,
     tempToken: tempInfo.token,
     expiresAt: tempInfo.expiresAt,
@@ -801,8 +1641,13 @@ app.get('/api/mobile/pair-info', (req, res) => {
     libraryStats: counts,
     driveStatus,
     pairedDevices: pairedAndroidDevices,
+    pendingPhoneRequests,
     endpoints: {
       verify: '/api/mobile/verify',
+      quickConnect: '/api/mobile/quick-connect',
+      quickConnectInitiate: '/api/mobile/quick-connect/initiate',
+      quickConnectPoll: '/api/mobile/quick-connect/poll',
+      quickConnectAuthorize: '/api/mobile/quick-connect/authorize',
       health: '/api/health',
       tracks: '/api/library/tracks',
       albums: '/api/library/albums',
@@ -816,30 +1661,210 @@ app.get('/api/mobile/pair-info', (req, res) => {
   });
 });
 
-// POST /api/mobile/regenerate-token -> Rotates the temporary connection token (and optionally the API key)
+// POST /api/mobile/regenerate-token -> Rotates the 6-digit Quick Connect code & temporary connection token
 app.post('/api/mobile/regenerate-token', (req, res) => {
   const rotatePermanent = Boolean(req.body?.rotateApiKey);
   const apiToken = ensureMobileApiToken(rotatePermanent);
   const tempInfo = ensureTempPairingToken(true);
+  const qcPin = ensureQuickConnectPin(true);
   res.json({
     ok: true,
+    quickConnectCode: qcPin.code,
+    quickConnectFormatted: qcPin.formattedCode,
     token: tempInfo.token,
     tempToken: tempInfo.token,
     expiresAt: tempInfo.expiresAt,
     expiresInSeconds: tempInfo.expiresInSeconds,
     apiKey: apiToken,
-    message: 'Generated new temporary connection token!',
+    message: `Generated new 6-digit Quick Connect code (${qcPin.formattedCode}) & token!`,
   });
 });
 
-// GET or POST /api/mobile/verify -> Called by the Android app after scanning the QR code to verify connection
-app.all('/api/mobile/verify', (req, res) => {
+// POST /api/mobile/quick-connect/initiate -> Jellyfin-style: Android phone requests a 6-digit code to display on the phone screen
+app.post('/api/mobile/quick-connect/initiate', (req, res) => {
+  const code = generateSixDigitCode();
+  const secret = crypto.randomBytes(16).toString('hex');
+  const now = Date.now();
+  const deviceName = String(
+    req.body?.deviceName || req.headers['x-device-name'] || 'Android Phone'
+  ).trim();
+  const model = String(
+    req.body?.model || req.headers['user-agent'] || 'Brokeify Android App'
+  )
+    .slice(0, 80)
+    .trim();
+
+  phoneQuickConnectRequests.set(code, {
+    code,
+    secret,
+    deviceName,
+    model,
+    clientIp: getClientIp(req),
+    createdAt: now,
+    expiresAt: now + TEMP_TOKEN_TTL_MS,
+    authorized: false,
+  });
+
+  res.json({
+    ok: true,
+    code,
+    formattedCode: formatSixDigitCode(code),
+    secret,
+    expiresInSeconds: 900,
+    message:
+      'Enter this 6-digit code in your Brokeify Web UI under Connect Android App -> Authorize Phone Code.',
+  });
+});
+
+// GET /api/mobile/quick-connect/poll -> Android phone polls with ?secret=... or ?code=... until authorized in Web UI
+app.get('/api/mobile/quick-connect/poll', (req, res) => {
+  const secret = String(req.query.secret || '').trim();
+  const code = String(req.query.code || '').replace(/\D/g, '');
+  let found: PhoneInitiatedQuickConnect | undefined;
+
+  for (const item of phoneQuickConnectRequests.values()) {
+    if ((secret && item.secret === secret) || (code && item.code === code)) {
+      found = item;
+      break;
+    }
+  }
+
+  if (!found || found.expiresAt <= Date.now()) {
+    return res.status(404).json({
+      ok: false,
+      authorized: false,
+      error: 'Quick Connect code expired or not found.',
+    });
+  }
+
+  if (!found.authorized) {
+    return res.json({
+      ok: true,
+      authorized: false,
+      code: found.code,
+      formattedCode: formatSixDigitCode(found.code),
+    });
+  }
+
+  const counts = getLocalLibraryStats();
+  return res.json({
+    ok: true,
+    authorized: true,
+    authenticated: true,
+    server: 'Brokeify Native Engine',
+    apiKey: found.apiKey || ensureMobileApiToken(false),
+    libraryStats: counts,
+    endpoints: {
+      tracks: '/api/library/tracks',
+      albums: '/api/library/albums',
+      artists: '/api/library/artists',
+      playlists: '/api/playlists',
+      stream: '/api/stream/{trackId}',
+      cover: '/api/covers/{albumId}',
+      scrobble: '/api/scrobble',
+    },
+  });
+});
+
+// POST /api/mobile/quick-connect/authorize -> Web UI authorizes a 6-digit code shown on the user's Android phone
+app.post('/api/mobile/quick-connect/authorize', (req, res) => {
+  const rawCode = String(req.body?.code || '').replace(/\D/g, '');
+  if (rawCode.length !== 6) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Please enter a valid 6-digit Quick Connect code.',
+    });
+  }
+
+  const apiKey = ensureMobileApiToken(false);
+  const phoneReq = phoneQuickConnectRequests.get(rawCode);
+
+  if (phoneReq && phoneReq.expiresAt > Date.now()) {
+    phoneReq.authorized = true;
+    phoneReq.apiKey = apiKey;
+    const dev = registerPairedAndroidDevice(
+      req,
+      'quick-connect-6digit',
+      phoneReq.deviceName,
+      phoneReq.model
+    );
+    pushServerLog(
+      'info',
+      'system',
+      `[Quick Connect] Authorized Android phone "${dev.deviceName}" via 6-digit code ${formatSixDigitCode(
+        rawCode
+      )}`
+    );
+    return res.json({
+      ok: true,
+      authorized: true,
+      device: dev,
+      message: `✅ Connected "${dev.deviceName}" via 6-digit Quick Connect code ${formatSixDigitCode(
+        rawCode
+      )}!`,
+    });
+  }
+
+  // Also support verifying the server's active 6-digit code directly for instant testing/linking
+  const serverPin = ensureQuickConnectPin(false);
+  if (rawCode === serverPin.code) {
+    const dev = registerPairedAndroidDevice(
+      req,
+      'quick-connect-6digit',
+      req.body?.deviceName || 'Android Phone (Quick Connect)',
+      '6-Digit Quick Connect PIN'
+    );
+    pushServerLog(
+      'info',
+      'system',
+      `[Quick Connect] Linked Android device "${dev.deviceName}" using server 6-digit PIN ${serverPin.formattedCode}`
+    );
+    return res.json({
+      ok: true,
+      authorized: true,
+      apiKey,
+      device: dev,
+      message: `✅ Linked "${dev.deviceName}" using 6-digit Quick Connect code ${serverPin.formattedCode}!`,
+    });
+  }
+
+  return res.status(404).json({
+    ok: false,
+    error: `No active phone request found for code ${formatSixDigitCode(
+      rawCode
+    )}. Check the 6-digit code and try again.`,
+  });
+});
+
+// ALL /api/mobile/verify & /api/mobile/quick-connect -> Called by the Android app using EITHER the 6-digit Quick Connect code OR QR code token
+const handleMobileVerifyOrQuickConnect = (req, res) => {
+  const clientIp = getClientIp(req);
+  const rateCheck = checkIpRateLimit(clientIp);
+  if (!rateCheck.allowed) {
+    return res.status(429).json({
+      ok: false,
+      error: `Too many failed pairing attempts. Try again in ${Math.ceil(
+        rateCheck.retryAfterSeconds / 60
+      )}m.`,
+    });
+  }
+
   const expectedApiKey = ensureMobileApiToken(false);
   const currentTemp = ensureTempPairingToken(false);
+  const currentPin = ensureQuickConnectPin(false);
+
   const authHeader = String(req.headers.authorization || '').replace(
     /^Bearer\s+/i,
     ''
   );
+  const providedCode = String(
+    req.body?.code ||
+      req.body?.quickConnectCode ||
+      req.query?.code ||
+      req.query?.pin ||
+      ''
+  ).replace(/\D/g, '');
+
   const providedToken = String(
     authHeader ||
       req.headers['x-api-key'] ||
@@ -852,59 +1877,35 @@ app.all('/api/mobile/verify', (req, res) => {
       ''
   ).trim();
 
-  if (
-    providedToken &&
-    providedToken !== expectedApiKey &&
-    providedToken !== currentTemp.token
-  ) {
+  const cleanProvidedTokenDigits = providedToken.replace(/\D/g, '');
+  const matchedSixDigitPin =
+    (providedCode && providedCode === currentPin.code) ||
+    (cleanProvidedTokenDigits.length === 6 &&
+      cleanProvidedTokenDigits === currentPin.code);
+
+  const matchedToken =
+    providedToken === expectedApiKey || providedToken === currentTemp.token;
+
+  if (!matchedSixDigitPin && !matchedToken) {
+    recordAuthFailure(clientIp, 'Invalid mobile QR token or 6-digit code');
     return res.status(401).json({
       ok: false,
       error:
-        'Invalid or expired Brokeify connection token. Please re-scan the QR code.',
+        'Invalid or expired 6-digit Quick Connect code or QR token. Please check the code on your Brokeify server.',
     });
   }
 
-  const deviceName = String(
-    req.body?.deviceName ||
-      req.query.deviceName ||
-      req.headers['x-device-name'] ||
-      'Android Phone'
-  ).trim();
-  const model = String(
-    req.body?.model ||
-      req.query.model ||
-      req.headers['user-agent'] ||
-      'Brokeify Android Client'
-  )
-    .slice(0, 80)
-    .trim();
-  const clientIp = String(
-    req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown'
-  )
-    .split(',')[0]
-    .trim();
-
-  const existingIdx = pairedAndroidDevices.findIndex(
-    (d) => d.deviceName === deviceName && d.clientIp === clientIp
+  clearAuthFailures(clientIp);
+  const deviceRecord = registerPairedAndroidDevice(
+    req,
+    matchedSixDigitPin ? 'quick-connect-6digit' : 'qr'
   );
-  const deviceRecord: PairedAndroidDevice = {
-    id: `android-${Date.now().toString(36)}`,
-    deviceName,
-    model,
-    clientIp,
-    connectedAt: new Date().toISOString(),
-  };
-  if (existingIdx >= 0) {
-    pairedAndroidDevices[existingIdx] = deviceRecord;
-  } else {
-    pairedAndroidDevices.unshift(deviceRecord);
-    if (pairedAndroidDevices.length > 10) pairedAndroidDevices.pop();
-  }
 
   const counts = getLocalLibraryStats();
   return res.json({
     ok: true,
     authenticated: true,
+    method: matchedSixDigitPin ? 'quick-connect-6digit' : 'qr',
     server: 'Brokeify Native Engine',
     version: '3.0.0-standalone',
     apiKey: expectedApiKey,
@@ -920,7 +1921,10 @@ app.all('/api/mobile/verify', (req, res) => {
       scrobble: '/api/scrobble',
     },
   });
-});
+};
+
+app.all('/api/mobile/verify', handleMobileVerifyOrQuickConnect);
+app.all('/api/mobile/quick-connect', handleMobileVerifyOrQuickConnect);
 
 // GET /api/library/artists -> Returns all indexed artists
 app.get('/api/library/artists', (req, res) => {

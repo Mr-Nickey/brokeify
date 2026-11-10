@@ -9,6 +9,7 @@ import {
   Clock,
   Disc,
   ExternalLink,
+  Heart,
   Layers,
   Link2,
   ListPlus,
@@ -68,6 +69,9 @@ interface PlaylistDetailViewProps {
   onRetryGhostTrackDownload: (ghost: PlaylistGhostTrack) => void;
   onSavePlaylistName: (playlist: Playlist, nextName: string) => void;
   onShowToast: (msg: string) => void;
+  likedTrackIds?: Set<string>;
+  onToggleLikeTrack?: (track: Track) => void;
+  onStartTrackRadio?: (track: Track) => void;
 }
 
 export interface UnifiedPlaylistItem {
@@ -105,6 +109,9 @@ export const PlaylistDetailView: React.FC<PlaylistDetailViewProps> = ({
   onRetryGhostTrackDownload,
   onSavePlaylistName,
   onShowToast,
+  likedTrackIds,
+  onToggleLikeTrack,
+  onStartTrackRadio,
 }) => {
   // Inline rename state
   const [isEditingName, setIsEditingName] = useState(false);
@@ -921,29 +928,62 @@ export const PlaylistDetailView: React.FC<PlaylistDetailViewProps> = ({
                         </div>
                       )
                     ) : item.libraryTrack ? (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          onPlayTrack(item.libraryTrack as Track, readyTracks)
-                        }
-                        className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-xs font-mono font-bold transition-colors min-h-[34px] ${
-                          isCurrent && isPlaying
-                            ? 'bg-[#00ff66] text-zinc-950'
-                            : 'bg-zinc-800 hover:bg-[#00ff66] hover:text-zinc-950 text-white'
-                        }`}
-                      >
-                        {isCurrent && isPlaying ? (
-                          <>
-                            <Pause className="w-3.5 h-3.5 fill-current" />
-                            <span>Pause</span>
-                          </>
-                        ) : (
-                          <>
-                            <Play className="w-3.5 h-3.5 fill-current" />
-                            <span>Play</span>
-                          </>
+                      <>
+                        {onToggleLikeTrack && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onToggleLikeTrack(item.libraryTrack as Track)
+                            }
+                            aria-label={
+                              likedTrackIds?.has(item.libraryTrack.id)
+                                ? 'Remove from Liked Songs'
+                                : 'Add to Liked Songs'
+                            }
+                            title={
+                              likedTrackIds?.has(item.libraryTrack.id)
+                                ? 'Liked — click to remove'
+                                : 'Save to Liked Songs'
+                            }
+                            className={`rounded-xl border p-2 transition-colors min-h-[34px] min-w-[34px] flex items-center justify-center ${
+                              likedTrackIds?.has(item.libraryTrack.id)
+                                ? 'border-rose-500/50 bg-rose-500/15 text-rose-400'
+                                : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-rose-400'
+                            }`}
+                          >
+                            <Heart
+                              className={`w-3.5 h-3.5 ${
+                                likedTrackIds?.has(item.libraryTrack.id)
+                                  ? 'fill-rose-500 text-rose-400'
+                                  : ''
+                              }`}
+                            />
+                          </button>
                         )}
-                      </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onPlayTrack(item.libraryTrack as Track, readyTracks)
+                          }
+                          className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-xs font-mono font-bold transition-colors min-h-[34px] ${
+                            isCurrent && isPlaying
+                              ? 'bg-[#00ff66] text-zinc-950'
+                              : 'bg-zinc-800 hover:bg-[#00ff66] hover:text-zinc-950 text-white'
+                          }`}
+                        >
+                          {isCurrent && isPlaying ? (
+                            <>
+                              <Pause className="w-3.5 h-3.5 fill-current" />
+                              <span>Pause</span>
+                            </>
+                          ) : (
+                            <>
+                              <Play className="w-3.5 h-3.5 fill-current" />
+                              <span>Play</span>
+                            </>
+                          )}
+                        </button>
+                      </>
                     ) : null}
 
                     {/* Three Dots (⋯) Menu Trigger */}
@@ -967,6 +1007,48 @@ export const PlaylistDetailView: React.FC<PlaylistDetailViewProps> = ({
                         >
                           {!item.isGhost && item.libraryTrack && (
                             <>
+                              {onToggleLikeTrack && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    onToggleLikeTrack(
+                                      item.libraryTrack as Track
+                                    );
+                                    setOpenMenuTrackKey(null);
+                                  }}
+                                  className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-rose-300"
+                                >
+                                  <Heart
+                                    className={`w-3.5 h-3.5 ${
+                                      likedTrackIds?.has(item.libraryTrack.id)
+                                        ? 'fill-rose-500 text-rose-400'
+                                        : 'text-rose-400'
+                                    }`}
+                                  />
+                                  <span>
+                                    {likedTrackIds?.has(item.libraryTrack.id)
+                                      ? 'Remove from Liked Songs'
+                                      : 'Save to Liked Songs'}
+                                  </span>
+                                </button>
+                              )}
+
+                              {onStartTrackRadio && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    onStartTrackRadio(
+                                      item.libraryTrack as Track
+                                    );
+                                    setOpenMenuTrackKey(null);
+                                  }}
+                                  className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-purple-300"
+                                >
+                                  <Radio className="w-3.5 h-3.5 text-purple-400" />
+                                  <span>Start Song Radio</span>
+                                </button>
+                              )}
+
                               <button
                                 type="button"
                                 onClick={() => {

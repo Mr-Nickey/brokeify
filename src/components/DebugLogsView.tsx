@@ -290,7 +290,7 @@ export const DebugLogsView: React.FC<DebugLogsViewProps> = ({
             </h2>
             <p className="text-xs text-zinc-300 max-w-3xl leading-relaxed">
               Whenever Brokeify talks to{' '}
-              <strong className="text-white">Jellyfin</strong>,{' '}
+              <strong className="text-white">SQLite Library</strong>,{' '}
               <strong className="text-white">slskd</strong>,{' '}
               <strong className="text-white">Lidarr</strong>,{' '}
               <strong className="text-white">ListenBrainz</strong>,{' '}
@@ -583,7 +583,7 @@ export const DebugLogsView: React.FC<DebugLogsViewProps> = ({
             {(
               [
                 { id: 'all', label: 'All Services' },
-                { id: 'jellyfin', label: 'Jellyfin' },
+                { id: 'jellyfin', label: 'SQLite Library' },
                 { id: 'slskd', label: 'slskd' },
                 { id: 'lidarr', label: 'Lidarr' },
                 { id: 'spotify', label: 'Spotify' },
