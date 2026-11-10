@@ -65,10 +65,24 @@ export interface Track {
   lastPlayedAt?: string;
   dateAdded?: string;
   fileSizeBytes?: number;
+  year?: number | null;
+  filePath?: string;
+  musicbrainzId?: string | null;
+  artistMusicbrainzId?: string | null;
+  albumMusicbrainzId?: string | null;
 }
 
 export type AutopilotSyncSchedule = 'off' | 'daily' | 'weekly' | 'monthly';
 export type AutopilotScheduleInterval = 'off' | 'daily' | 'weekly' | 'monthly';
+
+export interface PlaylistGhostTrack {
+  id: string;
+  title: string;
+  artist: string;
+  album?: string;
+  durationSec?: number;
+  matchedTrackId?: string | null;
+}
 
 export interface Playlist {
   id: string;
@@ -77,6 +91,7 @@ export interface Playlist {
   description: string;
   source: ProviderType | 'mixed' | 'spotify-resolved';
   trackIds: string[];
+  ghostTracks?: PlaylistGhostTrack[];
   createdAt: string;
   coverAccent: string;
   linkedSpotifyUrl?: string;
@@ -344,6 +359,9 @@ export interface SlskdGrabJob {
   id: string;
   type: 'album' | 'track' | 'playlist';
   sourceEngine?: 'slskd' | 'lidarr' | 'youtube' | 'archive';
+  playlistId?: string | null;
+  ghostTrackId?: string | null;
+  queuePosition?: number;
   label: string;
   artist: string;
   title: string;

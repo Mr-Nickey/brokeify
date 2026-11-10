@@ -43,6 +43,7 @@ import {
   indexAudioFile,
   removeAudioFileFromIndex,
   importM3uPlaylistFile,
+  reconcilePlaylistsWithLibrary,
   queryTracks,
   queryArtists,
   queryAlbums,
@@ -50,6 +51,7 @@ import {
   handleStreamTrack,
   handleServeCover,
   enrichTrackFromMusicBrainz,
+  updateTrackMetadataInDb,
 } from './src/server/libraryEngine.ts';
 
 const execFileAsync = promisify(execFile);
@@ -158,6 +160,19 @@ function pushServerLog(level, category, message, extra = {}) {
         ? inferServerHint(category, message, extra.statusCode)
         : undefined),
   };
+
+  // Emit structured real-time log line to stdout/stderr for Dozzle & Docker logs
+  const tag = `[Brokeify][${String(entry.category).toUpperCase()}][${String(
+    entry.level
+  ).toUpperCase()}]`;
+  const endpointSuffix = entry.endpoint ? ` (${entry.endpoint})` : '';
+  if (entry.level === 'error') {
+    console.error(`${tag} ${entry.message}${endpointSuffix}`);
+  } else if (entry.level === 'warn') {
+    console.warn(`${tag} ${entry.message}${endpointSuffix}`);
+  } else {
+    console.log(`${tag} ${entry.message}${endpointSuffix}`);
+  }
 
   serverDebugLogs.unshift(entry);
   if (serverDebugLogs.length > MAX_SERVER_DEBUG_LOGS) {
@@ -1057,6 +1072,11 @@ app.post('/api/playlists', (req, res) => {
     const trackIds = Array.isArray(req.body?.trackIds)
       ? req.body.trackIds.map(String)
       : [];
+    const ghostTracks = Array.isArray(req.body?.ghostTracks)
+      ? req.body.ghostTracks
+      : undefined;
+    const spotifyUrl =
+      req.body?.linkedSpotifyUrl || req.body?.spotifyUrl || undefined;
 
     upsertPlaylistWithTracks({
       id,
@@ -1064,8 +1084,11 @@ app.post('/api/playlists', (req, res) => {
       description,
       isSmart,
       smartRulesJson,
+      ghostTracks,
+      spotifyUrl: spotifyUrl ? String(spotifyUrl).trim() : undefined,
       trackIds,
     });
+    reconcilePlaylistsWithLibrary();
 
     const created = queryPlaylists().find((p) => p.id === id);
     res.json({
@@ -1100,13 +1123,30 @@ app.put('/api/playlists/:id', (req, res) => {
     const trackIds = Array.isArray(req.body?.trackIds)
       ? req.body.trackIds.map(String)
       : undefined;
+    const ghostTracks = Array.isArray(req.body?.ghostTracks)
+      ? req.body.ghostTracks
+      : undefined;
+    const spotifyUrl =
+      req.body?.linkedSpotifyUrl !== undefined
+        ? req.body.linkedSpotifyUrl
+        : req.body?.spotifyUrl !== undefined
+          ? req.body.spotifyUrl
+          : undefined;
 
     upsertPlaylistWithTracks({
       id,
       name,
       description,
+      ghostTracks,
+      spotifyUrl:
+        spotifyUrl !== undefined
+          ? spotifyUrl
+            ? String(spotifyUrl).trim()
+            : null
+          : undefined,
       trackIds,
     });
+    reconcilePlaylistsWithLibrary();
 
     const updated = queryPlaylists().find((p) => p.id === id);
     res.json({
@@ -1135,6 +1175,104 @@ app.delete('/api/playlists/:id', (req, res) => {
     res.status(500).json({
       ok: false,
       error: err instanceof Error ? err.message : 'Failed to delete playlist.',
+    });
+  }
+});
+
+// Merge / Link multiple playlists into a target playlist (combines both library trackIds and Ghost Songs)
+app.post('/api/playlists/merge', (req, res) => {
+  try {
+    const sourcePlaylistIds = Array.isArray(req.body?.sourcePlaylistIds)
+      ? req.body.sourcePlaylistIds.map(String)
+      : [];
+    const targetPlaylistId = String(req.body?.targetPlaylistId || '').trim();
+    const newPlaylistName = String(req.body?.newPlaylistName || '').trim();
+
+    if (sourcePlaylistIds.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Select at least one playlist to merge/link.',
+      });
+    }
+
+    const allPl = queryPlaylists();
+    const existingTarget = targetPlaylistId
+      ? allPl.find((p) => p.id === targetPlaylistId)
+      : undefined;
+    const finalId =
+      existingTarget?.id ||
+      targetPlaylistId ||
+      `pl-merged-${Date.now().toString(36)}`;
+    const finalName =
+      newPlaylistName || existingTarget?.name || 'Merged Playlist';
+
+    const orderedPlaylistSet = existingTarget
+      ? [
+          existingTarget,
+          ...sourcePlaylistIds
+            .map((id) => allPl.find((p) => p.id === id))
+            .filter((p) => p && p.id !== existingTarget.id),
+        ]
+      : sourcePlaylistIds
+          .map((id) => allPl.find((p) => p.id === id))
+          .filter(Boolean);
+
+    const mergedTrackIds: string[] = [];
+    const seenTrackIds = new Set<string>();
+    const mergedGhosts: any[] = [];
+    const seenGhostKeys = new Set<string>();
+    let linkedSpotify = existingTarget?.linkedSpotifyUrl || null;
+
+    for (const pl of orderedPlaylistSet) {
+      if (!pl) continue;
+      if (!linkedSpotify && pl.linkedSpotifyUrl) {
+        linkedSpotify = pl.linkedSpotifyUrl;
+      }
+      for (const tid of pl.trackIds || []) {
+        if (tid && !seenTrackIds.has(tid)) {
+          seenTrackIds.add(tid);
+          mergedTrackIds.push(tid);
+        }
+      }
+      for (const gt of pl.ghostTracks || []) {
+        const key = `${normalizeText(gt.artist)}::${normalizeText(gt.title)}`;
+        if (gt.title && !seenGhostKeys.has(key)) {
+          seenGhostKeys.add(key);
+          mergedGhosts.push({ ...gt });
+        }
+      }
+    }
+
+    upsertPlaylistWithTracks({
+      id: finalId,
+      name: finalName,
+      description: `Combined Playlist (${mergedTrackIds.length} in library${
+        mergedGhosts.length > 0 ? ` · ${mergedGhosts.length} total songs` : ''
+      })`,
+      ghostTracks: mergedGhosts.length > 0 ? mergedGhosts : undefined,
+      spotifyUrl: linkedSpotify,
+      trackIds: mergedTrackIds,
+    });
+    reconcilePlaylistsWithLibrary();
+
+    const updatedPl = queryPlaylists().find((p) => p.id === finalId);
+    return res.json({
+      ok: true,
+      playlist: updatedPl,
+      playlists: queryPlaylists(),
+      message: `Linked & merged into "${finalName}" (${
+        updatedPl?.trackIds.length || 0
+      } library tracks${
+        updatedPl?.ghostTracks?.length
+          ? `, ${updatedPl.ghostTracks.length} total songs`
+          : ''
+      })!`,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        err instanceof Error ? err.message : 'Failed to merge playlists.',
     });
   }
 });
@@ -1246,12 +1384,22 @@ app.post('/api/config', (req, res) => {
           id: String(pl.id),
           name: String(pl.name),
           description: String(pl.description || ''),
+          ghostTracks: Array.isArray(pl.ghostTracks)
+            ? pl.ghostTracks
+            : undefined,
+          spotifyUrl:
+            pl.linkedSpotifyUrl !== undefined
+              ? pl.linkedSpotifyUrl
+              : pl.autopilotSpotifyUrl !== undefined
+                ? pl.autopilotSpotifyUrl
+                : undefined,
           trackIds: Array.isArray(pl.trackIds)
             ? pl.trackIds.map(String)
             : undefined,
           createdAt: pl.createdAt ? String(pl.createdAt) : undefined,
         });
       }
+      reconcilePlaylistsWithLibrary();
     }
 
     res.json({
@@ -1724,8 +1872,154 @@ app.get('/api/musicbrainz/album/:releaseGroupId', async (req, res) => {
 });
 
 // ============================================================================
-// 8. SPOTIFY PUBLIC PLAYLIST / ALBUM / TRACK URL IMPORTER
+// 8. SPOTIFY PUBLIC PLAYLIST / ALBUM / TRACK URL IMPORTER & GHOST TRACK ENGINE
 // ============================================================================
+
+function parseRawTracklistText(rawText: string) {
+  const lines = String(rawText || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 1 && !/^https?:\/\//i.test(l));
+
+  const parsed: Array<{
+    title: string;
+    artist: string;
+    album?: string;
+    durationSec?: number;
+  }> = [];
+
+  for (const line of lines) {
+    const cleaned = line.replace(/^\d+[\.\)\-\s]+/, '').trim();
+    if (!cleaned) continue;
+    const dashParts = cleaned.split(/\s+[-–—]\s+/);
+    if (dashParts.length >= 2) {
+      const artist = dashParts[0].trim();
+      const title = dashParts.slice(1).join(' - ').trim();
+      if (title) {
+        parsed.push({ title, artist: artist || 'Unknown Artist', durationSec: 210 });
+        continue;
+      }
+    }
+    const byParts = cleaned.split(/\s+by\s+/i);
+    if (byParts.length === 2) {
+      parsed.push({
+        title: byParts[0].trim(),
+        artist: byParts[1].trim() || 'Unknown Artist',
+        durationSec: 210,
+      });
+      continue;
+    }
+    parsed.push({
+      title: cleaned,
+      artist: 'Unknown Artist',
+      durationSec: 210,
+    });
+  }
+  return parsed;
+}
+
+async function fetchSpotifyTracksFromUrl(rawUrl: string) {
+  const cleanUrl = String(rawUrl || '').trim();
+  const match =
+    cleanUrl.match(
+      /open\.spotify\.com\/(?:intl-[a-z]+\/)?(playlist|album|track)\/([a-zA-Z0-9]+)/i
+    ) || cleanUrl.match(/spotify:(playlist|album|track):([a-zA-Z0-9]+)/i);
+
+  if (!match) {
+    throw new Error(
+      'Invalid Spotify link. Paste a link like https://open.spotify.com/playlist/... or album/... or track/...'
+    );
+  }
+
+  const entityType = match[1].toLowerCase();
+  const entityId = match[2];
+  const embedUrl = `https://open.spotify.com/embed/${entityType}/${entityId}`;
+
+  const resp = await fetch(embedUrl, {
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+      Accept: 'text/html,application/xhtml+xml',
+    },
+  });
+
+  if (!resp.ok) {
+    throw new Error(
+      `Spotify returned HTTP ${resp.status} for ${entityType} ${entityId}. Make sure the playlist is public.`
+    );
+  }
+
+  const html = await resp.text();
+  let title = `Imported Spotify ${entityType.charAt(0).toUpperCase() + entityType.slice(1)}`;
+  const tracks: Array<{
+    title: string;
+    artist: string;
+    album: string;
+    durationSec: number;
+  }> = [];
+
+  const nextDataMatch = html.match(
+    /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/i
+  );
+  if (nextDataMatch && nextDataMatch[1]) {
+    try {
+      const nextJson = JSON.parse(nextDataMatch[1]);
+      const entity =
+        nextJson?.props?.pageProps?.state?.data?.entity ||
+        nextJson?.props?.pageProps?.entity ||
+        null;
+      if (entity) {
+        if (entity.name || entity.title) {
+          title = entity.name || entity.title;
+        }
+        const trackList =
+          entity.trackList ||
+          entity.tracks?.items ||
+          (entity.type === 'track' ? [entity] : []);
+
+        for (const item of trackList) {
+          const tObj = item.track || item;
+          const trackTitle = tObj.title || tObj.name || '';
+          const trackArtist =
+            tObj.subtitle ||
+            (Array.isArray(tObj.artists)
+              ? tObj.artists.map((a: any) => a.name).join(', ')
+              : '') ||
+            entity.subtitle ||
+            'Unknown Artist';
+          const durationMs = Number(tObj.duration || tObj.duration_ms || 0);
+          if (trackTitle) {
+            tracks.push({
+              title: String(trackTitle).replace(/\u00a0/g, ' ').trim(),
+              artist: String(trackArtist).replace(/\u00a0/g, ' ').trim(),
+              album: entityType === 'album' ? title : '',
+              durationSec:
+                durationMs > 0 ? Math.round(durationMs / 1000) : 210,
+            });
+          }
+        }
+      }
+    } catch {}
+  }
+
+  if (tracks.length === 0) {
+    const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+    if (titleMatch && titleMatch[1]) {
+      const cleaned = titleMatch[1]
+        .replace(/\| Spotify.*$/i, '')
+        .replace(/- playlist by.*$/i, '')
+        .trim();
+      if (cleaned) title = cleaned;
+    }
+  }
+
+  return {
+    entityType,
+    entityId,
+    playlistTitle: title,
+    tracks,
+  };
+}
 
 app.post('/api/spotify/import-url', async (req, res) => {
   try {
@@ -1737,113 +2031,226 @@ app.post('/api/spotify/import-url', async (req, res) => {
       });
     }
 
-    const match =
-      rawUrl.match(
-        /open\.spotify\.com\/(?:intl-[a-z]+\/)?(playlist|album|track)\/([a-zA-Z0-9]+)/i
-      ) || rawUrl.match(/spotify:(playlist|album|track):([a-zA-Z0-9]+)/i);
-
-    if (!match) {
-      return res.status(400).json({
-        ok: false,
-        error:
-          'Invalid Spotify link. Paste a link like https://open.spotify.com/playlist/... or album/... or track/...',
-      });
-    }
-
-    const entityType = match[1].toLowerCase();
-    const entityId = match[2];
-    const embedUrl = `https://open.spotify.com/embed/${entityType}/${entityId}`;
-
-    const resp = await fetch(embedUrl, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml',
-      },
-    });
-
-    if (!resp.ok) {
-      return res.status(resp.status).json({
-        ok: false,
-        error: `Spotify returned HTTP ${resp.status} for ${entityType} ${entityId}. Make sure the playlist is public.`,
-      });
-    }
-
-    const html = await resp.text();
-    let title = `Imported Spotify ${entityType.charAt(0).toUpperCase() + entityType.slice(1)}`;
-    const tracks = [];
-
-    const nextDataMatch = html.match(
-      /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/i
-    );
-    if (nextDataMatch && nextDataMatch[1]) {
-      try {
-        const nextJson = JSON.parse(nextDataMatch[1]);
-        const entity =
-          nextJson?.props?.pageProps?.state?.data?.entity ||
-          nextJson?.props?.pageProps?.entity ||
-          null;
-        if (entity) {
-          if (entity.name || entity.title) {
-            title = entity.name || entity.title;
-          }
-          const trackList =
-            entity.trackList ||
-            entity.tracks?.items ||
-            (entity.type === 'track' ? [entity] : []);
-
-          for (const item of trackList) {
-            const tObj = item.track || item;
-            const trackTitle = tObj.title || tObj.name || '';
-            const trackArtist =
-              tObj.subtitle ||
-              (Array.isArray(tObj.artists)
-                ? tObj.artists.map((a) => a.name).join(', ')
-                : '') ||
-              entity.subtitle ||
-              'Unknown Artist';
-            const durationMs = Number(tObj.duration || tObj.duration_ms || 0);
-            if (trackTitle) {
-              tracks.push({
-                title: String(trackTitle).replace(/\u00a0/g, ' ').trim(),
-                artist: String(trackArtist).replace(/\u00a0/g, ' ').trim(),
-                album: entityType === 'album' ? title : '',
-                durationSec:
-                  durationMs > 0 ? Math.round(durationMs / 1000) : 210,
-              });
-            }
-          }
-        }
-      } catch {}
-    }
-
-    if (tracks.length === 0) {
-      const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
-      if (titleMatch && titleMatch[1]) {
-        const cleaned = titleMatch[1]
-          .replace(/\| Spotify.*$/i, '')
-          .replace(/- playlist by.*$/i, '')
-          .trim();
-        if (cleaned) title = cleaned;
-      }
-    }
+    const { entityType, entityId, playlistTitle, tracks } =
+      await fetchSpotifyTracksFromUrl(rawUrl);
 
     return res.json({
       ok: true,
       entityType,
       entityId,
-      playlistTitle: title,
+      playlistTitle,
       tracks,
       message:
         tracks.length > 0
-          ? `Loaded ${tracks.length} track(s) from "${title}"!`
-          : `Resolved "${title}", but Spotify hid the full tracklist. Paste the songs below or search directly.`,
+          ? `Loaded ${tracks.length} track(s) from "${playlistTitle}"!`
+          : `Resolved "${playlistTitle}", but Spotify hid the full tracklist. Paste the songs below or search directly.`,
+    });
+  } catch (err) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        err instanceof Error ? err.message : 'Failed to import Spotify URL.',
+    });
+  }
+});
+
+// Unified 1-step Spotify Playlist Importer -> Populates Playlist with Library Matches + Ghost Songs & Auto-Downloads Missing
+app.post('/api/playlists/import-spotify', async (req, res) => {
+  try {
+    const cfg = readServerConfig();
+    const rawUrl = String(
+      req.body?.spotifyUrl || req.body?.url || ''
+    ).trim();
+    const rawTracklist = String(req.body?.rawTracklist || '').trim();
+    const incomingTracks = Array.isArray(req.body?.tracks)
+      ? req.body.tracks
+      : [];
+    const targetPlaylistId = String(req.body?.playlistId || '').trim();
+    const requestedName = String(req.body?.playlistName || '').trim();
+    const autoDownloadMissing = req.body?.autoDownloadMissing !== false;
+    const sourceMode = String(
+      req.body?.sourceMode || cfg.integrations?.preferredDownloader || 'auto'
+    ).toLowerCase();
+    const schedule = String(req.body?.schedule || 'weekly').toLowerCase();
+    const ignoreFilters = Boolean(req.body?.ignoreFilters);
+
+    let resolvedTitle = requestedName || 'Spotify Playlist';
+    let importedTracks: Array<{
+      title: string;
+      artist: string;
+      album?: string;
+      durationSec?: number;
+    }> = [];
+
+    if (incomingTracks.length > 0) {
+      importedTracks = incomingTracks
+        .map((t: any) => ({
+          title: String(t?.title || '').trim(),
+          artist: String(t?.artist || 'Unknown Artist').trim(),
+          album: t?.album ? String(t.album).trim() : undefined,
+          durationSec: Number(t?.durationSec || 210),
+        }))
+        .filter((t: any) => Boolean(t.title));
+    }
+
+    if (rawUrl && importedTracks.length === 0) {
+      const spotifyData = await fetchSpotifyTracksFromUrl(rawUrl);
+      if (!requestedName && spotifyData.playlistTitle) {
+        resolvedTitle = spotifyData.playlistTitle;
+      }
+      importedTracks = spotifyData.tracks;
+    }
+
+    if (rawTracklist) {
+      const manualTracks = parseRawTracklistText(rawTracklist);
+      if (manualTracks.length > 0) {
+        importedTracks = [...importedTracks, ...manualTracks];
+      }
+    }
+
+    if (importedTracks.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          'No tracks found to import. Make sure the Spotify playlist is public or paste a list of "Artist - Song Title" lines.',
+      });
+    }
+
+    const existingPl = targetPlaylistId
+      ? queryPlaylists().find((p) => p.id === targetPlaylistId)
+      : undefined;
+    const playlistId =
+      existingPl?.id ||
+      targetPlaylistId ||
+      `pl-spotify-${Date.now().toString(36)}`;
+    const finalName =
+      requestedName || existingPl?.name || resolvedTitle || 'Spotify Playlist';
+
+    const existingGhosts = Array.isArray(existingPl?.ghostTracks)
+      ? [...existingPl.ghostTracks]
+      : [];
+    const seenKeys = new Set(
+      existingGhosts.map(
+        (g) => `${normalizeText(g.artist)}::${normalizeText(g.title)}`
+      )
+    );
+
+    const combinedGhosts = [...existingGhosts];
+    for (let i = 0; i < importedTracks.length; i++) {
+      const tr = importedTracks[i];
+      const key = `${normalizeText(tr.artist)}::${normalizeText(tr.title)}`;
+      if (!tr.title || seenKeys.has(key)) continue;
+      seenKeys.add(key);
+      combinedGhosts.push({
+        id: `ghost-${playlistId}-${combinedGhosts.length + 1}-${Math.random()
+          .toString(36)
+          .slice(2, 6)}`,
+        title: tr.title,
+        artist: tr.artist || 'Unknown Artist',
+        album: tr.album,
+        durationSec: tr.durationSec || 210,
+        matchedTrackId: null,
+      });
+    }
+
+    upsertPlaylistWithTracks({
+      id: playlistId,
+      name: finalName,
+      description: `Spotify Playlist (${combinedGhosts.length} tracks)`,
+      ghostTracks: combinedGhosts,
+      spotifyUrl: rawUrl || existingPl?.linkedSpotifyUrl || null,
+      trackIds: existingPl?.trackIds || [],
+    });
+
+    reconcilePlaylistsWithLibrary();
+
+    const updatedPlaylist = queryPlaylists().find((p) => p.id === playlistId);
+    const reconciledGhosts = Array.isArray(updatedPlaylist?.ghostTracks)
+      ? updatedPlaylist.ghostTracks
+      : combinedGhosts;
+
+    const matchedCount = reconciledGhosts.filter((g) =>
+      Boolean(g.matchedTrackId)
+    ).length;
+    const missingGhosts = reconciledGhosts.filter((g) => !g.matchedTrackId);
+
+    if (rawUrl && schedule !== 'off') {
+      const nextRules = Array.isArray(cfg.autopilotRules)
+        ? [...cfg.autopilotRules]
+        : [];
+      const existingIdx = nextRules.findIndex(
+        (r) => r.playlistId === playlistId
+      );
+      const ruleObj = {
+        id:
+          existingIdx !== -1
+            ? nextRules[existingIdx].id
+            : `ap-${Date.now()}`,
+        playlistId,
+        playlistName: finalName,
+        sourceUrl: rawUrl,
+        spotifyUrl: rawUrl,
+        schedule: schedule === 'daily' ? 'daily' : 'weekly',
+        interval: schedule === 'daily' ? 'daily' : 'weekly',
+        autoDownloadMissing: Boolean(autoDownloadMissing),
+        enabled: true,
+        lastSyncedAt: new Date().toISOString(),
+        lastAddedCount: matchedCount,
+        lastMissingQueuedCount: autoDownloadMissing ? missingGhosts.length : 0,
+        statusMessage: `Imported ${reconciledGhosts.length} tracks (${matchedCount} in library, ${missingGhosts.length} ghost tracks).`,
+      };
+      if (existingIdx !== -1) {
+        nextRules[existingIdx] = ruleObj;
+      } else {
+        nextRules.push(ruleObj);
+      }
+      writeServerConfig({ autopilotRules: nextRules });
+    }
+
+    const createdJobs: any[] = [];
+    if (autoDownloadMissing && missingGhosts.length > 0) {
+      const { slskdUrl, slskdApiKey } = getSlskdConfig(req.body || {});
+      const activeFilters = ignoreFilters ? null : cfg.discoveryFilters;
+
+      for (const ghost of missingGhosts) {
+        const job = createAndEnqueueTrackGrabJob({
+          artist: ghost.artist,
+          title: ghost.title,
+          album: ghost.album || '',
+          sourceMode,
+          slskdUrl,
+          slskdApiKey,
+          activeFilters,
+          ignoreFilters,
+          playlistId,
+          ghostTrackId: ghost.id,
+        });
+        createdJobs.push(job);
+      }
+    }
+
+    return res.json({
+      ok: true,
+      playlist: queryPlaylists().find((p) => p.id === playlistId),
+      playlists: queryPlaylists(),
+      jobs: createdJobs,
+      totalTracks: reconciledGhosts.length,
+      matchedCount,
+      missingCount: missingGhosts.length,
+      queuedCount: createdJobs.filter((j) => j.status !== 'filtered').length,
+      message: `Populated "${finalName}" with ${reconciledGhosts.length} tracks: ${matchedCount} already in library, ${missingGhosts.length} ghost tracks${
+        autoDownloadMissing && missingGhosts.length > 0
+          ? ` (${createdJobs.filter((j) => j.status !== 'filtered').length} queued in downloader)`
+          : ''
+      }!`,
     });
   } catch (err) {
     return res.status(500).json({
       ok: false,
       error:
-        err instanceof Error ? err.message : 'Failed to import Spotify URL.',
+        err instanceof Error
+          ? err.message
+          : 'Failed to import Spotify playlist.',
     });
   }
 });
@@ -2151,6 +2558,7 @@ async function executeYouTubeOrArchiveGrabJob(
         job.matchedPeer = 'YouTube Music (yt-dlp)';
         job.matchedFormat = audioFormat.toUpperCase();
         job.message = `Downloading "${job.label}" via YouTube Music (yt-dlp -> ${audioFormat.toUpperCase()})...`;
+        pushServerLog('info', 'youtube', job.message);
 
         await execFileAsync(
           'yt-dlp',
@@ -2173,6 +2581,7 @@ async function executeYouTubeOrArchiveGrabJob(
           `${safeFileBase}.${audioFormat}`
         );
         await indexAudioFile(finalFile);
+        reconcilePlaylistsWithLibrary();
 
         job.files = [
           {
@@ -2184,7 +2593,12 @@ async function executeYouTubeOrArchiveGrabJob(
         ];
         job.status = 'completed';
         job.completedAt = new Date().toISOString();
-        job.message = `${job.label} downloaded into /music & indexed in Brokeify SQLite!`;
+        job.message = `✓ Downloaded via YouTube Music (yt-dlp) & added to library!`;
+        pushServerLog(
+          'info',
+          'youtube',
+          `Completed yt-dlp download for "${job.label}" -> ${finalFile}`
+        );
 
         readyNotifications.unshift({
           id: `notif-${job.id}`,
@@ -2977,6 +3391,7 @@ async function executeSlskdGrabJob(
     job.sourceEngine = 'slskd';
     job.status = 'searching';
     job.message = `Searching slskd for "${job.searchText}"...`;
+    pushServerLog('info', 'slskd', `Searching slskd P2P for "${job.searchText}"`);
 
     const searchId = crypto.randomUUID();
     const startSearchResp = await fetch(`${slskdUrl}/api/v0/searches`, {
@@ -2993,6 +3408,11 @@ async function executeSlskdGrabJob(
 
     if (!startSearchResp.ok) {
       if (sourceMode === 'auto') {
+        pushServerLog(
+          'warn',
+          'slskd',
+          `slskd search returned HTTP ${startSearchResp.status} for "${job.label}" — falling back to Lidarr/YouTube`
+        );
         const lidarrOk = await executeLidarrGrabJob(job);
         if (lidarrOk) return;
         return executeYouTubeOrArchiveGrabJob(job, 'youtube');
@@ -3035,6 +3455,11 @@ async function executeSlskdGrabJob(
 
     if (!chosen || chosen.files.length === 0) {
       if (sourceMode === 'auto') {
+        pushServerLog(
+          'info',
+          'slskd',
+          `No matching peer on slskd for "${job.label}" — falling back to Lidarr/YouTube Music`
+        );
         const lidarrOk = await executeLidarrGrabJob(job);
         if (lidarrOk) return;
         job.message = `Not found on slskd — auto-falling back to YouTube Music for "${job.label}"...`;
@@ -3042,12 +3467,14 @@ async function executeSlskdGrabJob(
       }
       job.status = 'not_found';
       job.message = `Not found on slskd for "${job.searchText}".`;
+      pushServerLog('warn', 'slskd', job.message);
       return;
     }
 
     job.matchedPeer = chosen.username;
     job.matchedFormat = chosen.formatLabel;
     job.message = `Selected peer "${chosen.username}" (${chosen.formatLabel}) — queueing ${chosen.files.length} file(s)...`;
+    pushServerLog('info', 'slskd', `${job.label}: ${job.message}`);
 
     const payload = chosen.files.map((f) => ({
       filename: f.filename,
@@ -3157,6 +3584,181 @@ app.post('/api/playback-session', (req, res) => {
   }
 });
 
+// Concurrency-controlled Download Queue so playlist imports don't overwhelm slskd/Lidarr/yt-dlp
+interface PendingGrabQueueItem {
+  job: any;
+  slskdUrl: string;
+  slskdApiKey: string;
+  sourceMode: string;
+  filtersConfig: any;
+}
+
+const pendingGrabQueue: PendingGrabQueueItem[] = [];
+let activeGrabWorkers = 0;
+const MAX_CONCURRENT_GRAB_WORKERS = 2;
+
+function formatEngineChainLabel(sourceMode: string): string {
+  const mode = String(sourceMode || 'auto').toLowerCase();
+  if (mode === 'slskd') return 'slskd (Soulseek P2P)';
+  if (mode === 'lidarr') return 'Lidarr';
+  if (mode === 'youtube') return 'YouTube Music (yt-dlp)';
+  if (mode === 'archive') return 'Internet Archive';
+  return 'Auto (slskd → Lidarr → YouTube)';
+}
+
+function updatePendingQueuePositions() {
+  for (let i = 0; i < pendingGrabQueue.length; i++) {
+    const item = pendingGrabQueue[i];
+    if (item.job && item.job.status === 'queued') {
+      item.job.queuePosition = i + 1;
+      item.job.message = `Waiting in queue (#${i + 1}) · ${formatEngineChainLabel(item.sourceMode)}`;
+    }
+  }
+}
+
+function pumpGrabQueue() {
+  updatePendingQueuePositions();
+  while (
+    activeGrabWorkers < MAX_CONCURRENT_GRAB_WORKERS &&
+    pendingGrabQueue.length > 0
+  ) {
+    const nextItem = pendingGrabQueue.shift();
+    if (!nextItem) break;
+    updatePendingQueuePositions();
+    activeGrabWorkers += 1;
+    nextItem.job.queuePosition = undefined;
+    executeSlskdGrabJob(
+      nextItem.job,
+      nextItem.slskdUrl,
+      nextItem.slskdApiKey,
+      nextItem.sourceMode,
+      nextItem.filtersConfig
+    )
+      .catch(() => {})
+      .finally(() => {
+        activeGrabWorkers = Math.max(0, activeGrabWorkers - 1);
+        reconcilePlaylistsWithLibrary();
+        pumpGrabQueue();
+      });
+  }
+}
+
+function createAndEnqueueTrackGrabJob(params: {
+  artist: string;
+  title: string;
+  album?: string;
+  sourceMode: string;
+  slskdUrl: string;
+  slskdApiKey: string;
+  activeFilters: any;
+  ignoreFilters?: boolean;
+  playlistId?: string | null;
+  ghostTrackId?: string | null;
+}) {
+  const {
+    artist,
+    title,
+    album = '',
+    sourceMode,
+    slskdUrl,
+    slskdApiKey,
+    activeFilters,
+    ignoreFilters = false,
+    playlistId = null,
+    ghostTrackId = null,
+  } = params;
+
+  const jobLabel = artist && title ? `${artist} - ${title}` : title || artist;
+  const initialEngine =
+    sourceMode === 'youtube'
+      ? 'youtube'
+      : sourceMode === 'archive'
+        ? 'archive'
+        : sourceMode === 'lidarr'
+          ? 'lidarr'
+          : 'slskd';
+
+  // Deduplicate if there is already an active or queued job for the same track
+  const normSearch = normalizeText(`${artist} ${title}`);
+  for (const existingJob of slskdJobs.values()) {
+    if (
+      (existingJob.status === 'queued' ||
+        existingJob.status === 'searching' ||
+        existingJob.status === 'downloading') &&
+      normalizeText(existingJob.searchText) === normSearch
+    ) {
+      if (playlistId && !existingJob.playlistId) {
+        existingJob.playlistId = playlistId;
+      }
+      if (ghostTrackId && !existingJob.ghostTrackId) {
+        existingJob.ghostTrackId = ghostTrackId;
+      }
+      return existingJob;
+    }
+  }
+
+  if (!ignoreFilters && activeFilters) {
+    const check = evaluateServerDiscoveryFilter(
+      { title, artist, album },
+      activeFilters
+    );
+    if (check.excluded) {
+      const filteredJob = {
+        id: `job-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        type: 'track',
+        sourceEngine: initialEngine,
+        label: jobLabel,
+        artist,
+        title,
+        searchText: `${artist} ${title}`.trim(),
+        status: 'filtered',
+        message: check.reason || 'Skipped by Exclusion Filter',
+        matchedPeer: null,
+        matchedFormat: null,
+        files: [],
+        playlistId,
+        ghostTrackId,
+        createdAt: new Date().toISOString(),
+        completedAt: null,
+      };
+      slskdJobs.set(filteredJob.id, filteredJob);
+      return filteredJob;
+    }
+  }
+
+  const queuePos = pendingGrabQueue.length + 1;
+  const job = {
+    id: `job-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    type: 'track',
+    sourceEngine: initialEngine,
+    label: jobLabel,
+    artist,
+    title,
+    searchText: `${artist} ${title}`.trim(),
+    status: 'queued',
+    queuePosition: queuePos,
+    message: `Waiting in queue (#${queuePos}) · ${formatEngineChainLabel(sourceMode)}`,
+    matchedPeer: null,
+    matchedFormat: null,
+    files: [],
+    playlistId,
+    ghostTrackId,
+    createdAt: new Date().toISOString(),
+    completedAt: null,
+  };
+
+  slskdJobs.set(job.id, job);
+  pendingGrabQueue.push({
+    job,
+    slskdUrl,
+    slskdApiKey,
+    sourceMode,
+    filtersConfig: ignoreFilters ? null : activeFilters,
+  });
+  pumpGrabQueue();
+  return job;
+}
+
 // POST /api/slskd/grab
 app.post('/api/slskd/grab', async (req, res) => {
   try {
@@ -3168,6 +3770,12 @@ app.post('/api/slskd/grab', async (req, res) => {
     ).toLowerCase();
     const ignoreFilters = Boolean(req.body?.ignoreFilters);
     const activeFilters = req.body?.filters || cfg.discoveryFilters;
+    const playlistId = req.body?.playlistId
+      ? String(req.body.playlistId)
+      : null;
+    const ghostTrackId = req.body?.ghostTrackId
+      ? String(req.body.ghostTrackId)
+      : null;
 
     if (sourceMode === 'slskd' && !slskdUrl) {
       return res.status(400).json({
@@ -3194,78 +3802,28 @@ app.post('/api/slskd/grab', async (req, res) => {
       const createdJobs = [];
       let skippedCount = 0;
 
-      for (const tr of tracks.slice(0, 35)) {
-        const jobLabel = `${tr.artist} - ${tr.title}`;
-        if (!ignoreFilters) {
-          const check = evaluateServerDiscoveryFilter(tr, activeFilters);
-          if (check.excluded) {
-            skippedCount += 1;
-            const filteredJob = {
-              id: `job-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-              type: 'track',
-              sourceEngine:
-                sourceMode === 'youtube'
-                  ? 'youtube'
-                  : sourceMode === 'lidarr'
-                    ? 'lidarr'
-                    : 'slskd',
-              label: jobLabel,
-              artist: tr.artist,
-              title: tr.title,
-              searchText: `${tr.artist} ${tr.title}`,
-              status: 'filtered',
-              message: check.reason || 'Skipped by Exclusion Filter',
-              matchedPeer: null,
-              matchedFormat: null,
-              files: [],
-              createdAt: new Date().toISOString(),
-              completedAt: null,
-            };
-            slskdJobs.set(filteredJob.id, filteredJob);
-            createdJobs.push(filteredJob);
-            continue;
-          }
-        }
-
-        const job = {
-          id: `job-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-          type: 'track',
-          sourceEngine:
-            sourceMode === 'youtube'
-              ? 'youtube'
-              : sourceMode === 'archive'
-                ? 'archive'
-                : sourceMode === 'lidarr'
-                  ? 'lidarr'
-                  : 'slskd',
-          label: jobLabel,
-          artist: tr.artist,
-          title: tr.title,
-          searchText: `${tr.artist} ${tr.title}`,
-          status: 'searching',
-          message: `Queued search for ${jobLabel} (${sourceMode.toUpperCase()})`,
-          matchedPeer: null,
-          matchedFormat: null,
-          files: [],
-          createdAt: new Date().toISOString(),
-          completedAt: null,
-        };
-        slskdJobs.set(job.id, job);
-        createdJobs.push(job);
-        executeSlskdGrabJob(
-          job,
+      for (const tr of tracks.slice(0, 100)) {
+        const job = createAndEnqueueTrackGrabJob({
+          artist: String(tr.artist || 'Unknown Artist').trim(),
+          title: String(tr.title || '').trim(),
+          album: String(tr.album || '').trim(),
+          sourceMode,
           slskdUrl,
           slskdApiKey,
-          sourceMode,
-          ignoreFilters ? null : activeFilters
-        );
+          activeFilters,
+          ignoreFilters,
+          playlistId: tr.playlistId || playlistId,
+          ghostTrackId: tr.ghostTrackId || tr.id || null,
+        });
+        if (job.status === 'filtered') skippedCount += 1;
+        createdJobs.push(job);
       }
 
       const activeCount = createdJobs.length - skippedCount;
       return res.json({
         ok: true,
         jobs: createdJobs,
-        message: `Queued ${activeCount} track(s) via ${sourceMode.toUpperCase()}${
+        message: `Queued ${activeCount} track(s) via ${formatEngineChainLabel(sourceMode)}${
           skippedCount > 0
             ? ` (${skippedCount} skipped by Exclusion Filters)`
             : ''
@@ -3281,23 +3839,45 @@ app.post('/api/slskd/grab', async (req, res) => {
       });
     }
 
-    if (!ignoreFilters && type === 'track') {
-      const check = evaluateServerDiscoveryFilter(
-        { title, artist, album: req.body?.album || '' },
-        activeFilters
-      );
-      if (check.excluded) {
-        return res.status(400).json({
-          ok: false,
-          filtered: true,
-          error: `${check.reason}. Click "Override & Grab Anyway" or adjust your Exclusion Filters.`,
-        });
+    if (type === 'track') {
+      if (!ignoreFilters) {
+        const check = evaluateServerDiscoveryFilter(
+          { title, artist, album: req.body?.album || '' },
+          activeFilters
+        );
+        if (check.excluded) {
+          return res.status(400).json({
+            ok: false,
+            filtered: true,
+            error: `${check.reason}. Click "Override & Grab Anyway" or adjust your Exclusion Filters.`,
+          });
+        }
       }
+
+      const job = createAndEnqueueTrackGrabJob({
+        artist,
+        title,
+        album: String(req.body?.album || ''),
+        sourceMode,
+        slskdUrl,
+        slskdApiKey,
+        activeFilters,
+        ignoreFilters,
+        playlistId,
+        ghostTrackId,
+      });
+
+      return res.json({
+        ok: true,
+        job,
+        message: `Queued "${label}" via ${formatEngineChainLabel(sourceMode)}.`,
+      });
     }
 
+    // Album grab job
     const job = {
       id: `job-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      type: type === 'album' ? 'album' : 'track',
+      type: 'album',
       sourceEngine:
         sourceMode === 'youtube'
           ? 'youtube'
@@ -3311,28 +3891,32 @@ app.post('/api/slskd/grab', async (req, res) => {
       title,
       searchText: `${artist} ${title}`.trim(),
       expectedTracks: tracks,
-      status: 'searching',
-      message: `Searching ${sourceMode.toUpperCase()} for "${label}"...`,
+      status: 'queued',
+      queuePosition: pendingGrabQueue.length + 1,
+      message: `Waiting in queue · ${formatEngineChainLabel(sourceMode)}`,
       matchedPeer: null,
       matchedFormat: null,
       files: [],
+      playlistId,
+      ghostTrackId,
       createdAt: new Date().toISOString(),
       completedAt: null,
     };
 
     slskdJobs.set(job.id, job);
-    executeSlskdGrabJob(
+    pendingGrabQueue.push({
       job,
       slskdUrl,
       slskdApiKey,
       sourceMode,
-      ignoreFilters ? null : activeFilters
-    );
+      filtersConfig: ignoreFilters ? null : activeFilters,
+    });
+    pumpGrabQueue();
 
     return res.json({
       ok: true,
       job,
-      message: `Started automated ${job.type} grab for "${label}" (${sourceMode.toUpperCase()}).`,
+      message: `Started automated ${job.type} grab for "${label}" (${formatEngineChainLabel(sourceMode)}).`,
     });
   } catch (err) {
     return res.status(500).json({
@@ -3343,6 +3927,7 @@ app.post('/api/slskd/grab', async (req, res) => {
 });
 
 app.get('/api/slskd/status', (_req, res) => {
+  updatePendingQueuePositions();
   const jobs = Array.from(slskdJobs.values()).sort((a, b) =>
     b.createdAt.localeCompare(a.createdAt)
   );
@@ -3412,14 +3997,15 @@ async function pollSlskdTransfersAndScanLocalLibrary() {
         }
       }
 
-      job.message = `Downloading from ${job.matchedPeer}: ${completedCount}/${job.files.length} file(s) complete`;
+      job.message = `Downloading via slskd (${job.matchedPeer}): ${completedCount}/${job.files.length} file(s) complete`;
 
       if (completedCount === job.files.length) {
         job.status = 'completed';
         job.completedAt = new Date().toISOString();
-        job.message = `${job.label} downloaded & indexed into Brokeify SQLite!`;
+        job.message = `✓ Downloaded via slskd & added to library!`;
 
         await runFullLibraryScan();
+        reconcilePlaylistsWithLibrary();
 
         readyNotifications.unshift({
           id: `notif-${job.id}`,
@@ -3545,6 +4131,183 @@ app.post('/api/picard/resolve-metadata', async (req, res) => {
   }
 });
 
+// MusicBrainz (The IMDb of Music) Live Search for Song / Album / Artist Metadata Linking
+app.get('/api/metadata/musicbrainz-search', async (req, res) => {
+  try {
+    const title = String(req.query.title || '').trim();
+    const artist = String(req.query.artist || '').trim();
+    const album = String(req.query.album || '').trim();
+    const qRaw = String(req.query.q || '').trim();
+
+    const parts: string[] = [];
+    if (title) parts.push(`recording:"${title}"`);
+    if (artist && artist !== 'Unknown Artist') parts.push(`artist:"${artist}"`);
+    if (album && album !== 'Singles') parts.push(`release:"${album}"`);
+    const finalQuery = parts.length > 0 ? parts.join(' AND ') : qRaw;
+
+    if (!finalQuery) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Provide a song title, artist, or album to search MusicBrainz.',
+      });
+    }
+
+    const mbUrl = `https://musicbrainz.org/ws/2/recording?query=${encodeURIComponent(
+      finalQuery
+    )}&limit=6&fmt=json`;
+
+    const mbResp = await fetch(mbUrl, {
+      headers: MB_HEADERS,
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!mbResp.ok) {
+      return res.status(mbResp.status).json({
+        ok: false,
+        error: `MusicBrainz returned HTTP ${mbResp.status}`,
+      });
+    }
+
+    const mbData = await mbResp.json();
+    const recordings = Array.isArray(mbData?.recordings)
+      ? mbData.recordings
+      : [];
+
+    const results = recordings.map((rec: any) => {
+      const credit = rec['artist-credit']?.[0];
+      const recArtist =
+        credit?.name || credit?.artist?.name || artist || 'Unknown Artist';
+      const artistMbid = credit?.artist?.id || null;
+      const officialRel =
+        (rec.releases || []).find((r: any) => r.status === 'Official') ||
+        rec.releases?.[0];
+      const releaseMbid = officialRel?.id || null;
+      const recAlbum = officialRel?.title || album || 'Singles';
+      const recYear =
+        (officialRel?.date || rec['first-release-date'] || '').slice(0, 4) ||
+        null;
+
+      return {
+        recordingMbid: String(rec.id || ''),
+        title: String(rec.title || title),
+        artist: String(recArtist),
+        artistMbid,
+        album: String(recAlbum),
+        releaseMbid,
+        year: recYear ? Number(recYear) : null,
+        score: Number(rec.score || 100),
+        musicbrainzUrl: rec.id
+          ? `https://musicbrainz.org/recording/${rec.id}`
+          : null,
+        coverArtUrl: releaseMbid
+          ? `https://coverartarchive.org/release/${releaseMbid}/front-250`
+          : null,
+      };
+    });
+
+    return res.json({
+      ok: true,
+      query: finalQuery,
+      results,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : 'Failed to search MusicBrainz metadata.',
+    });
+  }
+});
+
+// Enrich or manually update metadata & MusicBrainz IDs (MBID) for 1 or more tracks
+app.post('/api/metadata/enrich', async (req, res) => {
+  try {
+    const rawIds = Array.isArray(req.body?.trackIds)
+      ? req.body.trackIds.map(String)
+      : req.body?.trackId
+        ? [String(req.body.trackId)]
+        : [];
+
+    if (rawIds.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Provide trackId or trackIds to update or refresh metadata.',
+      });
+    }
+
+    const manualOverride = req.body?.manualOverride;
+    const updatedTracks = [];
+    const errors = [];
+
+    for (const tid of rawIds.slice(0, 50)) {
+      if (manualOverride && typeof manualOverride === 'object') {
+        const updated = await updateTrackMetadataInDb({
+          trackId: tid,
+          title:
+            rawIds.length === 1 && manualOverride.title
+              ? String(manualOverride.title)
+              : undefined,
+          artist: manualOverride.artist
+            ? String(manualOverride.artist)
+            : undefined,
+          album: manualOverride.album
+            ? String(manualOverride.album)
+            : undefined,
+          year:
+            manualOverride.year !== undefined
+              ? manualOverride.year
+                ? Number(manualOverride.year)
+                : null
+              : undefined,
+          genre: manualOverride.genre
+            ? String(manualOverride.genre)
+            : undefined,
+          musicbrainzId:
+            rawIds.length === 1 && manualOverride.musicbrainzId !== undefined
+              ? manualOverride.musicbrainzId
+              : undefined,
+          artistMusicbrainzId:
+            manualOverride.artistMusicbrainzId !== undefined
+              ? manualOverride.artistMusicbrainzId
+              : undefined,
+          albumMusicbrainzId:
+            manualOverride.albumMusicbrainzId !== undefined
+              ? manualOverride.albumMusicbrainzId
+              : undefined,
+        });
+        if (updated) updatedTracks.push(updated);
+      } else {
+        const resEnrich = await enrichTrackFromMusicBrainz(tid);
+        if (resEnrich.ok && resEnrich.track) {
+          updatedTracks.push(resEnrich.track);
+        } else {
+          errors.push(resEnrich.message);
+        }
+      }
+    }
+
+    return res.json({
+      ok: true,
+      updatedCount: updatedTracks.length,
+      updatedTracks,
+      allTracks: queryTracks(),
+      playlists: queryPlaylists(),
+      message:
+        updatedTracks.length > 0
+          ? `Updated metadata & MusicBrainz IDs for ${updatedTracks.length} track(s)!`
+          : errors[0] || 'No matching MusicBrainz metadata found.',
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        err instanceof Error ? err.message : 'Failed to refresh metadata.',
+    });
+  }
+});
+
 // ============================================================================
 // 12. AUTOPILOT LINKED PLAYLISTS (SPOTIFY -> BROKEIFY SQLITE AUTO-SYNC)
 // ============================================================================
@@ -3557,150 +4320,86 @@ async function runSingleAutopilotRule(ruleId) {
     throw new Error('Autopilot rule not found.');
   }
   const rule = rules[ruleIdx];
+  const rawUrl = String(rule.sourceUrl || rule.spotifyUrl || '').trim();
+  const { playlistTitle, tracks } = await fetchSpotifyTracksFromUrl(rawUrl);
 
-  const match =
-    String(rule.sourceUrl || rule.spotifyUrl || '').match(
-      /open\.spotify\.com\/(?:intl-[a-z]+\/)?(playlist|album)\/([a-zA-Z0-9]+)/i
-    ) ||
-    String(rule.sourceUrl || rule.spotifyUrl || '').match(
-      /spotify:(playlist|album):([a-zA-Z0-9]+)/i
-    );
+  const targetPl = queryPlaylists().find((p) => p.id === rule.playlistId);
+  const playlistId = rule.playlistId || `pl-spotify-${Date.now().toString(36)}`;
+  const playlistName =
+    targetPl?.name || rule.playlistName || playlistTitle || 'Spotify Playlist';
 
-  if (!match) {
-    throw new Error('Invalid Spotify URL in Autopilot rule.');
+  const existingGhosts = Array.isArray(targetPl?.ghostTracks)
+    ? [...targetPl.ghostTracks]
+    : [];
+  const seenKeys = new Set(
+    existingGhosts.map(
+      (g) => `${normalizeText(g.artist)}::${normalizeText(g.title)}`
+    )
+  );
+  const combinedGhosts = [...existingGhosts];
+  for (const tr of tracks) {
+    const key = `${normalizeText(tr.artist)}::${normalizeText(tr.title)}`;
+    if (!tr.title || seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    combinedGhosts.push({
+      id: `ghost-${playlistId}-${combinedGhosts.length + 1}-${Math.random()
+        .toString(36)
+        .slice(2, 6)}`,
+      title: tr.title,
+      artist: tr.artist || 'Unknown Artist',
+      album: tr.album,
+      durationSec: tr.durationSec || 210,
+      matchedTrackId: null,
+    });
   }
 
-  const entityType = match[1].toLowerCase();
-  const entityId = match[2];
-  const embedUrl = `https://open.spotify.com/embed/${entityType}/${entityId}`;
-  const resp = await fetch(embedUrl, {
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      Accept: 'text/html',
-    },
+  upsertPlaylistWithTracks({
+    id: playlistId,
+    name: playlistName,
+    description: targetPl?.description || `Spotify Playlist (${combinedGhosts.length} tracks)`,
+    ghostTracks: combinedGhosts,
+    spotifyUrl: rawUrl,
+    trackIds: targetPl?.trackIds || [],
   });
 
-  const tracks = [];
-  if (resp.ok) {
-    const html = await resp.text();
-    const nextDataMatch = html.match(
-      /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/i
-    );
-    if (nextDataMatch && nextDataMatch[1]) {
-      try {
-        const nextJson = JSON.parse(nextDataMatch[1]);
-        const entity =
-          nextJson?.props?.pageProps?.state?.data?.entity ||
-          nextJson?.props?.pageProps?.entity;
-        const trackList = entity?.trackList || entity?.tracks?.items || [];
-        for (const item of trackList) {
-          const tObj = item.track || item;
-          const trackTitle = tObj.title || tObj.name || '';
-          const trackArtist =
-            tObj.subtitle ||
-            (Array.isArray(tObj.artists)
-              ? tObj.artists.map((a) => a.name).join(', ')
-              : '') ||
-            'Unknown Artist';
-          if (trackTitle) {
-            tracks.push({
-              title: String(trackTitle).replace(/\u00a0/g, ' ').trim(),
-              artist: String(trackArtist).replace(/\u00a0/g, ' ').trim(),
-            });
-          }
-        }
-      } catch {}
-    }
-  }
+  reconcilePlaylistsWithLibrary();
 
-  const localLibrary = getSqliteAudioFingerprints();
-  const matchedTrackIds = [];
-  const missingTracks = [];
-
-  for (const t of tracks) {
-    const normT = normalizeText(t.title);
-    const normA = normalizeText(t.artist);
-    const matched = localLibrary.find(
-      (loc) =>
-        loc.normTitle &&
-        normT &&
-        (loc.normTitle === normT ||
-          loc.normTitle.includes(normT) ||
-          normT.includes(loc.normTitle)) &&
-        (!normA ||
-          !loc.normArtist ||
-          loc.normArtist.includes(normA) ||
-          normA.includes(loc.normArtist))
-    );
-    if (matched) {
-      matchedTrackIds.push(matched.id);
-    } else {
-      const filterCheck = evaluateServerDiscoveryFilter(
-        t,
-        cfg.discoveryFilters
-      );
-      if (!filterCheck.excluded) {
-        missingTracks.push(t);
-      }
-    }
-  }
-
-  let addedCount = 0;
-  if (rule.playlistId && matchedTrackIds.length > 0) {
-    const existingIds = getPlaylistTrackIds(rule.playlistId);
-    const existingSet = new Set(existingIds);
-    const combinedIds = [...existingIds];
-    for (const tid of matchedTrackIds) {
-      if (!existingSet.has(tid)) {
-        existingSet.add(tid);
-        combinedIds.push(tid);
-        addedCount += 1;
-      }
-    }
-    setPlaylistTrackIds(rule.playlistId, combinedIds);
-  }
+  const updatedPl = queryPlaylists().find((p) => p.id === playlistId);
+  const finalGhosts = Array.isArray(updatedPl?.ghostTracks)
+    ? updatedPl.ghostTracks
+    : combinedGhosts;
+  const matchedCount = finalGhosts.filter((g) => Boolean(g.matchedTrackId)).length;
+  const missingGhosts = finalGhosts.filter((g) => !g.matchedTrackId);
 
   let queuedCount = 0;
-  if (rule.autoDownloadMissing && missingTracks.length > 0) {
+  if (rule.autoDownloadMissing && missingGhosts.length > 0) {
     const { slskdUrl, slskdApiKey } = getSlskdConfig();
     const sourceMode = cfg.integrations?.preferredDownloader || 'auto';
-    for (const tr of missingTracks.slice(0, 15)) {
-      queuedCount += 1;
-      const jobLabel = `${tr.artist} - ${tr.title}`;
-      const job = {
-        id: `job-auto-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        type: 'track',
-        sourceEngine: sourceMode === 'youtube' ? 'youtube' : 'slskd',
-        label: jobLabel,
-        artist: tr.artist,
-        title: tr.title,
-        searchText: `${tr.artist} ${tr.title}`,
-        status: 'searching',
-        message: `[Autopilot: ${rule.playlistName}] Queued ${jobLabel}`,
-        matchedPeer: null,
-        matchedFormat: null,
-        files: [],
-        createdAt: new Date().toISOString(),
-        completedAt: null,
-      };
-      slskdJobs.set(job.id, job);
-      executeSlskdGrabJob(
-        job,
+    for (const ghost of missingGhosts) {
+      const job = createAndEnqueueTrackGrabJob({
+        artist: ghost.artist,
+        title: ghost.title,
+        album: ghost.album || '',
+        sourceMode,
         slskdUrl,
         slskdApiKey,
-        sourceMode,
-        cfg.discoveryFilters
-      );
+        activeFilters: cfg.discoveryFilters,
+        ignoreFilters: false,
+        playlistId,
+        ghostTrackId: ghost.id,
+      });
+      if (job.status !== 'filtered') {
+        queuedCount += 1;
+      }
     }
   }
 
   rules[ruleIdx] = {
     ...rule,
     lastSyncedAt: new Date().toISOString(),
-    lastAddedCount: addedCount,
+    lastAddedCount: matchedCount,
     lastMissingQueuedCount: queuedCount,
-    statusMessage: `Synced ${tracks.length} Spotify tracks (${addedCount} added to SQLite playlist, ${queuedCount} missing queued for download).`,
+    statusMessage: `Synced ${finalGhosts.length} Spotify tracks (${matchedCount} in library, ${missingGhosts.length} ghost tracks, ${queuedCount} downloading).`,
   };
 
   writeServerConfig({

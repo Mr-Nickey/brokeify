@@ -51,6 +51,9 @@ import {
   VolumeX,
   X,
   Bug,
+  ArrowLeft,
+  Clock,
+  Layers,
 } from 'lucide-react';
 import { BrokeifyLogo } from './components/BrokeifyLogo';
 import { SlidingToggle } from './components/SlidingToggle';
@@ -64,6 +67,14 @@ import { CarModeOverlay } from './components/CarModeOverlay';
 import { NowPlayingDrawer } from './components/NowPlayingDrawer';
 import { BrokeifyOnboardingModal } from './components/BrokeifyOnboardingModal';
 import { WinampVisualizer } from './components/WinampVisualizer';
+import { PlaylistDetailView } from './components/PlaylistDetailView';
+import {
+  SpotifyPlaylistImporterModal,
+  AddToPlaylistModal,
+  MergePlaylistsModal,
+  MetadataInspectorModal,
+  type MetadataInspectorTarget,
+} from './components/LibraryModals';
 import {
   PWAInstallButton,
   MobilePixelInstallBanner,
@@ -81,6 +92,7 @@ import type {
   DiscoveryFilterConfig,
   PicardOrganizerConfig,
   Playlist,
+  PlaylistGhostTrack,
   ProviderConfig,
   ProviderType,
   SlskdGrabJob,
@@ -349,6 +361,116 @@ export default function App() {
   const [deletingTrackId, setDeletingTrackId] = useState<string | null>(null);
   const hasLoadedServerConfigRef = useRef<boolean>(false);
   const scrobbledTrackIdsRef = useRef<Set<string>>(new Set());
+
+  // New Unified Modals: Spotify Importer, Add to Playlist, Merge/Link Playlists, and Metadata Inspector
+  const [spotifyImporterModalOpen, setSpotifyImporterModalOpen] =
+    useState<boolean>(false);
+  const [spotifyImporterTargetPlaylist, setSpotifyImporterTargetPlaylist] =
+    useState<Playlist | null>(null);
+
+  const [addToPlaylistModalOpen, setAddToPlaylistModalOpen] =
+    useState<boolean>(false);
+  const [addToPlaylistTracks, setAddToPlaylistTracks] = useState<Track[]>([]);
+  const [addToPlaylistLabel, setAddToPlaylistLabel] = useState<string>('');
+
+  const [mergePlaylistsModalOpen, setMergePlaylistsModalOpen] =
+    useState<boolean>(false);
+  const [mergePlaylistsTargets, setMergePlaylistsTargets] = useState<
+    Playlist[]
+  >([]);
+
+  const [metadataModalTarget, setMetadataModalTarget] =
+    useState<MetadataInspectorTarget | null>(null);
+
+  // Multi-Selection States with Shift-Click range selection for Songs, Albums, Artists, Playlists
+  const [isSongSelectMode, setIsSongSelectMode] = useState<boolean>(false);
+  const [selectedSongIds, setSelectedSongIds] = useState<Set<string>>(
+    new Set()
+  );
+  const [lastSelectedSongIndex, setLastSelectedSongIndex] = useState<
+    number | null
+  >(null);
+
+  const [isAlbumSelectMode, setIsAlbumSelectMode] = useState<boolean>(false);
+  const [selectedAlbumNames, setSelectedAlbumNames] = useState<Set<string>>(
+    new Set()
+  );
+  const [lastSelectedAlbumIndex, setLastSelectedAlbumIndex] = useState<
+    number | null
+  >(null);
+
+  const [isArtistSelectMode, setIsArtistSelectMode] = useState<boolean>(false);
+  const [selectedArtistNames, setSelectedArtistNames] = useState<Set<string>>(
+    new Set()
+  );
+  const [lastSelectedArtistIndex, setLastSelectedArtistIndex] = useState<
+    number | null
+  >(null);
+
+  const [lastSelectedPlaylistIndex, setLastSelectedPlaylistIndex] = useState<
+    number | null
+  >(null);
+
+  // Context Menu Dropdowns (auto-close on outside click or Escape key)
+  const [openMenuSongId, setOpenMenuSongId] = useState<string | null>(null);
+  const [openMenuAlbumName, setOpenMenuAlbumName] = useState<string | null>(
+    null
+  );
+  const [openMenuArtistName, setOpenMenuArtistName] = useState<string | null>(
+    null
+  );
+
+  // Global outside click & escape handler to close any open dropdown menus
+  useEffect(() => {
+    const handleGlobalPointerDown = (e: MouseEvent | TouchEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('[data-dropdown-menu], [data-menu-trigger]')) {
+        return;
+      }
+      setOpenMenuPlaylistId(null);
+      setOpenMenuSongId(null);
+      setOpenMenuAlbumName(null);
+      setOpenMenuArtistName(null);
+    };
+
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setOpenMenuPlaylistId(null);
+        setOpenMenuSongId(null);
+        setOpenMenuAlbumName(null);
+        setOpenMenuArtistName(null);
+      }
+    };
+
+    document.addEventListener('mousedown', handleGlobalPointerDown);
+    document.addEventListener('keydown', handleGlobalKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handleGlobalPointerDown);
+      document.removeEventListener('keydown', handleGlobalKeyDown);
+    };
+  }, []);
+
+  // Browser History & Popstate navigation for Playlists
+  useEffect(() => {
+    const handlePopState = (e: PopStateEvent) => {
+      if (e.state?.brokeifyPlaylistId) {
+        setSelectedPlaylistId(e.state.brokeifyPlaylistId);
+        setLibrarySubTab('playlists');
+      } else {
+        setSelectedPlaylistId(null);
+      }
+    };
+
+    if (window.location.hash.startsWith('#playlist=')) {
+      const plId = decodeURIComponent(window.location.hash.slice(10));
+      if (plId) {
+        setSelectedPlaylistId(plId);
+      }
+    }
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
 
   // Sync Brokeify Standalone SQLite Library helper
   const syncJellyfinProvider = (prov?: ProviderConfig) => {
@@ -812,14 +934,32 @@ export default function App() {
     setToastMessage(`Restored real playlist name: "${realName}"`);
   };
 
-  // Toggle selection of a playlist for multi-delete
-  const handleToggleSelectPlaylistForDelete = (plId: string) => {
+  // Toggle selection of a playlist for multi-delete / merge (supports Shift-click range selection)
+  const handleToggleSelectPlaylistForDelete = (
+    plId: string,
+    isShiftKey: boolean = false,
+    index?: number
+  ) => {
     setSelectedPlaylistIdsForDelete((prev) => {
       const next = new Set(prev);
-      if (next.has(plId)) next.delete(plId);
-      else next.add(plId);
+      if (
+        isShiftKey &&
+        lastSelectedPlaylistIndex !== null &&
+        index !== undefined
+      ) {
+        const start = Math.min(lastSelectedPlaylistIndex, index);
+        const end = Math.max(lastSelectedPlaylistIndex, index);
+        for (let i = start; i <= end; i++) {
+          const id = visiblePlaylists[i]?.id;
+          if (id) next.add(id);
+        }
+      } else {
+        if (next.has(plId)) next.delete(plId);
+        else next.add(plId);
+      }
       return next;
     });
+    if (index !== undefined) setLastSelectedPlaylistIndex(index);
   };
 
   // Confirm & execute safe playlist deletion (deletes ONLY the playlist containers in SQLite, NEVER the songs or albums)
@@ -1507,7 +1647,262 @@ export default function App() {
       return updated;
     });
     setSelectedPlaylistId(savedPl.id);
-    setLibrarySubTab('songs');
+    setLibrarySubTab('playlists');
+    try {
+      window.history.pushState(
+        { brokeifyPlaylistId: savedPl.id },
+        '',
+        `#playlist=${encodeURIComponent(savedPl.id)}`
+      );
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleOpenPlaylist = (pl: Playlist) => {
+    setSelectedPlaylistId(pl.id);
+    setLibrarySubTab('playlists');
+    try {
+      window.history.pushState(
+        { brokeifyPlaylistId: pl.id },
+        '',
+        `#playlist=${encodeURIComponent(pl.id)}`
+      );
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleBackToPlaylists = () => {
+    setSelectedPlaylistId(null);
+    try {
+      if (window.location.hash.startsWith('#playlist=')) {
+        window.history.back();
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleSavePlaylistNameDirect = async (
+    targetPl: Playlist,
+    newName: string
+  ) => {
+    try {
+      const resp = await fetch(
+        `/api/playlists/${encodeURIComponent(targetPl.id)}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: newName,
+            description: targetPl.description,
+            trackIds: targetPl.trackIds,
+            ghostTracks: targetPl.ghostTracks,
+          }),
+        }
+      );
+      const data = await resp.json();
+      if (data.ok && data.playlist) {
+        setPlaylists((prev) =>
+          prev.map((p) => (p.id === targetPl.id ? data.playlist : p))
+        );
+        const customNames = MusicProviderManager.loadCustomPlaylistNames();
+        customNames[targetPl.id] = newName;
+        MusicProviderManager.saveCustomPlaylistNames(customNames);
+        setToastMessage(`Renamed playlist to "${newName}"`);
+      }
+    } catch {
+      setToastMessage('Failed to rename playlist.');
+    }
+  };
+
+  const handleAddTracksToPlaylist = async (
+    targetPlaylistId: string,
+    newTracks: Track[]
+  ) => {
+    const targetPl = playlists.find((p) => p.id === targetPlaylistId);
+    if (!targetPl) return;
+
+    const existingSet = new Set(targetPl.trackIds);
+    const idsToAdd = newTracks
+      .map((t) => t.id)
+      .filter((id) => !existingSet.has(id));
+    const updatedTrackIds = [...targetPl.trackIds, ...idsToAdd];
+
+    try {
+      const resp = await fetch(
+        `/api/playlists/${encodeURIComponent(targetPl.id)}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: targetPl.name,
+            description: targetPl.description,
+            trackIds: updatedTrackIds,
+            ghostTracks: targetPl.ghostTracks,
+          }),
+        }
+      );
+      const data = await resp.json();
+      if (data.ok && data.playlist) {
+        setPlaylists((prev) =>
+          prev.map((p) => (p.id === targetPl.id ? data.playlist : p))
+        );
+        setToastMessage(
+          `Added ${idsToAdd.length} songs to "${targetPl.name}"!`
+        );
+      }
+    } catch {
+      setToastMessage('Failed to add songs to playlist.');
+    }
+    setAddToPlaylistModalOpen(false);
+  };
+
+  const handleCreatePlaylistWithTracks = async (
+    playlistName: string,
+    newTracks: Track[]
+  ) => {
+    const pl: Playlist = {
+      id: `pl-custom-${Date.now().toString(36)}`,
+      name: playlistName,
+      originalName: playlistName,
+      description: `Custom playlist with ${newTracks.length} tracks.`,
+      source: 'built-in',
+      trackIds: newTracks.map((t) => t.id),
+      createdAt: new Date().toISOString().slice(0, 10),
+      coverAccent: '#10b981',
+    };
+
+    try {
+      const resp = await fetch('/api/playlists', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: pl.id,
+          name: pl.name,
+          description: pl.description,
+          trackIds: pl.trackIds,
+        }),
+      });
+      const data = await resp.json();
+      if (data.ok && data.playlist) {
+        setPlaylists((prev) => [data.playlist, ...prev]);
+        setToastMessage(
+          `Created playlist "${pl.name}" with ${newTracks.length} tracks!`
+        );
+      }
+    } catch {
+      setPlaylists((prev) => [pl, ...prev]);
+      setToastMessage(`Created playlist "${pl.name}"!`);
+    }
+    setAddToPlaylistModalOpen(false);
+  };
+
+  const handleRemoveTracksFromPlaylist = async (
+    targetPlaylistId: string,
+    trackIdsToRemove: string[],
+    ghostIdsToRemove?: string[]
+  ) => {
+    const targetPl = playlists.find((p) => p.id === targetPlaylistId);
+    if (!targetPl) return;
+
+    const remainingTrackIds = targetPl.trackIds.filter(
+      (id) => !trackIdsToRemove.includes(id)
+    );
+    const remainingGhosts = (targetPl.ghostTracks || []).filter(
+      (g) => !ghostIdsToRemove?.includes(g.id)
+    );
+
+    try {
+      const resp = await fetch(
+        `/api/playlists/${encodeURIComponent(targetPl.id)}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: targetPl.name,
+            description: targetPl.description,
+            trackIds: remainingTrackIds,
+            ghostTracks: remainingGhosts,
+          }),
+        }
+      );
+      const data = await resp.json();
+      if (data.ok && data.playlist) {
+        setPlaylists((prev) =>
+          prev.map((p) => (p.id === targetPl.id ? data.playlist : p))
+        );
+        setToastMessage(`Updated "${targetPl.name}"`);
+      }
+    } catch {
+      setToastMessage('Failed to update playlist tracks.');
+    }
+  };
+
+  const handleDownloadMissingGhostTracks = async (targetPl: Playlist) => {
+    const ghosts = targetPl.ghostTracks || [];
+    if (ghosts.length === 0) {
+      setToastMessage('No ghost tracks to download in this playlist.');
+      return;
+    }
+
+    setToastMessage(`Queuing download for ${ghosts.length} ghost tracks...`);
+    let queued = 0;
+    for (const ghost of ghosts) {
+      try {
+        await fetch('/api/slskd/grab-job', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'track',
+            artist: ghost.artist,
+            title: ghost.title,
+            playlistId: targetPl.id,
+            ghostTrackId: ghost.id,
+            sourceEngine: serverIntegrations.preferredDownloader || 'auto',
+          }),
+        });
+        queued++;
+      } catch {
+        // continue
+      }
+    }
+    fetchSlskdStatus();
+    setToastMessage(`Queued ${queued} tracks into download manager!`);
+  };
+
+  const handleRetryGhostTrackDownload = async (ghost: PlaylistGhostTrack) => {
+    try {
+      const resp = await fetch('/api/slskd/grab-job', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'track',
+          artist: ghost.artist,
+          title: ghost.title,
+          ghostTrackId: ghost.id,
+          sourceEngine: serverIntegrations.preferredDownloader || 'auto',
+        }),
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        setToastMessage(`Retrying "${ghost.title}" via downloader!`);
+        fetchSlskdStatus();
+      }
+    } catch {
+      setToastMessage(`Failed to queue retry for ${ghost.title}`);
+    }
+  };
+
+  const handleClearAllNotifications = () => {
+    fetch('/api/slskd/notifications/dismiss', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }).catch(() => {});
+    setReadyNotifications([]);
+    setToastMessage('Cleared all notifications.');
   };
 
   const handleCreateCustomPlaylist = (e: React.FormEvent) => {
@@ -1568,14 +1963,6 @@ export default function App() {
   // Filtered tracks for Songs sub-tab
   const displayedTracks = useMemo(() => {
     let list = allTracks;
-
-    if (selectedPlaylistId) {
-      const pl = visiblePlaylists.find((p) => p.id === selectedPlaylistId);
-      if (pl) {
-        const idSet = new Set(pl.trackIds);
-        list = list.filter((t) => idSet.has(t.id));
-      }
-    }
 
     if (sourceFilter !== 'all') {
       list = list.filter((t) => t.source === sourceFilter);
@@ -1954,7 +2341,14 @@ export default function App() {
           >
             <div className="flex items-center gap-2.5 text-xs sm:text-sm font-mono font-bold text-[#00ff66]">
               <CheckCircle2 className="w-5 h-5 shrink-0" />
-              <span>{readyNotifications[0].message}</span>
+              <span>
+                {readyNotifications[0].message}
+                {readyNotifications.length > 1 && (
+                  <span className="ml-2 text-zinc-300 font-normal text-xs">
+                    (+{readyNotifications.length - 1} more ready)
+                  </span>
+                )}
+              </span>
             </div>
 
             <div className="flex items-center gap-2">
@@ -1966,7 +2360,7 @@ export default function App() {
                   setActiveTab('library');
                   setLibrarySubTab('songs');
                 }}
-                className="rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-3.5 py-1.5 text-xs font-mono font-bold text-zinc-950"
+                className="rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-3.5 py-1.5 text-xs font-mono font-bold text-zinc-950 min-h-[34px]"
               >
                 Sync &amp; Play Now ▶
               </button>
@@ -1980,9 +2374,17 @@ export default function App() {
                   }).catch(() => {});
                   setReadyNotifications((prev) => prev.slice(1));
                 }}
-                className="rounded-xl border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs font-mono text-zinc-300 hover:text-white"
+                className="rounded-xl border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs font-mono text-zinc-300 hover:text-white min-h-[34px]"
               >
                 Dismiss
+              </button>
+              <button
+                type="button"
+                onClick={handleClearAllNotifications}
+                data-testid="clear-all-notifications-btn"
+                className="rounded-xl border border-rose-500/50 bg-rose-950/40 hover:bg-rose-900/60 px-3 py-1.5 text-xs font-mono font-bold text-rose-300 transition-colors min-h-[34px]"
+              >
+                Clear All ({readyNotifications.length})
               </button>
             </div>
           </div>
@@ -2223,40 +2625,50 @@ export default function App() {
                   <input
                     type="search"
                     value={searchQuery}
-                    onChange={(e) => {
-                      setSearchQuery(e.target.value);
-                      if (
-                        librarySubTab === 'playlists' &&
-                        e.target.value.trim()
-                      ) {
-                        setLibrarySubTab('songs');
-                      }
-                    }}
+                    onChange={(e) => setSearchQuery(e.target.value)}
                     placeholder="Search songs, artists, genres..."
                     aria-label="Search library"
                     className="w-full rounded-xl border border-zinc-800 bg-zinc-950 pl-8 pr-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:border-[#00ff66] focus:outline-none min-h-[36px]"
                   />
                 </div>
 
-                {librarySubTab === 'playlists' && visiblePlaylists.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsPlaylistSelectMode(!isPlaylistSelectMode);
-                      setSelectedPlaylistIdsForDelete(new Set());
-                    }}
-                    data-testid="toggle-select-playlists-btn"
-                    className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-mono font-semibold transition-colors whitespace-nowrap shrink-0 min-h-[36px] ${
-                      isPlaylistSelectMode
-                        ? 'border-[#00ff66] bg-emerald-500/20 text-[#00ff66]'
-                        : 'border-zinc-700 bg-zinc-900 text-zinc-200 hover:text-white'
-                    }`}
-                  >
-                    <CheckSquare className="w-3.5 h-3.5" />
-                    <span>
-                      {isPlaylistSelectMode ? 'Done Selecting' : 'Select Playlists'}
-                    </span>
-                  </button>
+                {librarySubTab === 'playlists' && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSpotifyImporterTargetPlaylist(null);
+                        setSpotifyImporterModalOpen(true);
+                      }}
+                      data-testid="import-spotify-playlist-btn"
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-500/50 bg-emerald-950/40 hover:bg-emerald-900/60 px-3 py-1.5 text-xs font-mono font-semibold text-[#00ff66] transition-colors whitespace-nowrap shrink-0 min-h-[36px]"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>Import Spotify</span>
+                    </button>
+
+                    {visiblePlaylists.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsPlaylistSelectMode(!isPlaylistSelectMode);
+                          setSelectedPlaylistIdsForDelete(new Set());
+                          setLastSelectedPlaylistIndex(null);
+                        }}
+                        data-testid="toggle-select-playlists-btn"
+                        className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-mono font-semibold transition-colors whitespace-nowrap shrink-0 min-h-[36px] ${
+                          isPlaylistSelectMode
+                            ? 'border-[#00ff66] bg-emerald-500/20 text-[#00ff66]'
+                            : 'border-zinc-700 bg-zinc-900 text-zinc-200 hover:text-white'
+                        }`}
+                      >
+                        <CheckSquare className="w-3.5 h-3.5" />
+                        <span>
+                          {isPlaylistSelectMode ? 'Done Selecting' : 'Select Playlists'}
+                        </span>
+                      </button>
+                    )}
+                  </>
                 )}
 
                 <button
@@ -2319,30 +2731,55 @@ export default function App() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => setSelectedPlaylistIdsForDelete(new Set())}
+                    onClick={() => {
+                      setSelectedPlaylistIdsForDelete(new Set());
+                      setLastSelectedPlaylistIndex(null);
+                    }}
                     className="rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-1 text-zinc-400 hover:text-white"
                   >
                     Clear Selection
                   </button>
                 </div>
 
-                <button
-                  type="button"
-                  disabled={selectedPlaylistIdsForDelete.size === 0}
-                  onClick={() => {
-                    const targets = visiblePlaylists.filter((p) =>
-                      selectedPlaylistIdsForDelete.has(p.id)
-                    );
-                    setPlaylistsPendingDeletion(targets);
-                  }}
-                  data-testid="delete-selected-playlists-btn"
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-rose-500 hover:bg-rose-400 disabled:opacity-40 px-4 py-2 text-xs font-mono font-bold text-white transition-colors min-h-[36px]"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  <span>
-                    Delete Selected Playlists ({selectedPlaylistIdsForDelete.size})
-                  </span>
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  {selectedPlaylistIdsForDelete.size >= 2 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const targets = visiblePlaylists.filter((p) =>
+                          selectedPlaylistIdsForDelete.has(p.id)
+                        );
+                        setMergePlaylistsTargets(targets);
+                        setMergePlaylistsModalOpen(true);
+                      }}
+                      data-testid="merge-selected-playlists-btn"
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-purple-500/60 bg-purple-950/60 hover:bg-purple-900/80 px-3.5 py-2 text-xs font-mono font-bold text-purple-200 transition-colors min-h-[36px]"
+                    >
+                      <Link2 className="w-3.5 h-3.5 text-purple-400" />
+                      <span>
+                        Link &amp; Merge Selected ({selectedPlaylistIdsForDelete.size})
+                      </span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    disabled={selectedPlaylistIdsForDelete.size === 0}
+                    onClick={() => {
+                      const targets = visiblePlaylists.filter((p) =>
+                        selectedPlaylistIdsForDelete.has(p.id)
+                      );
+                      setPlaylistsPendingDeletion(targets);
+                    }}
+                    data-testid="delete-selected-playlists-btn"
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-rose-500 hover:bg-rose-400 disabled:opacity-40 px-4 py-2 text-xs font-mono font-bold text-white transition-colors min-h-[36px]"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>
+                      Delete Selected ({selectedPlaylistIdsForDelete.size})
+                    </span>
+                  </button>
+                </div>
               </div>
             )}
 
@@ -2405,387 +2842,468 @@ export default function App() {
               </div>
             )}
 
-            {/* SUB-TAB 1: UNIFIED PLAYLISTS GRID (Responsive 1 to 5 Columns across Phones, Laptops & 72" TVs) */}
+            {/* SUB-TAB 1: UNIFIED PLAYLISTS (GRID OR DEDICATED DETAIL VIEW) */}
             {librarySubTab === 'playlists' && (
-              <section aria-label="Unified Playlists Grid" className="space-y-4">
-                {visiblePlaylists.length === 0 ? (
-                  <div className="winamp-bezel rounded-2xl border border-zinc-800/90 p-8 text-center space-y-3">
-                    <p className="text-sm font-semibold text-zinc-200">
-                      No playlists loaded yet.
-                    </p>
-                    <p className="text-xs text-zinc-400 max-w-md mx-auto">
-                      Open{' '}
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setActiveTab('settings');
-                          setSettingsSubTab('sources');
-                        }}
-                        className="text-[#00ff66] underline font-semibold"
-                      >
-                        Settings → Server &amp; Connections
-                      </button>{' '}
-                      to connect or sync your music server.
-                    </p>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4">
-                    {visiblePlaylists.map((pl) => {
-                      const plTracks = getTracksForPlaylist(pl);
-                      const allCached =
-                        plTracks.length > 0 &&
-                        plTracks.every((t) => audio.cachedTrackIds.has(t.id));
-                      const isDownloading = downloadingPlaylistId === pl.id;
-                      const isPinned = pinnedFavoritePlaylist?.id === pl.id;
-                      const realPlaylistName = pl.originalName || pl.name;
-                      const hasCustomName = realPlaylistName !== pl.name;
-                      const isEditingThis = editingPlaylistId === pl.id;
-                      const isMenuOpen = openMenuPlaylistId === pl.id;
-                      const isSelectedForDelete =
-                        selectedPlaylistIdsForDelete.has(pl.id);
-                      const linkedAutopilotRule = autopilotRules.find(
-                        (r) => r.playlistId === pl.id
-                      );
-
-                      return (
-                        <div
-                          key={pl.id}
-                          data-testid={`playlist-card-${pl.id}`}
-                          className={`group winamp-bezel rounded-2xl border p-4 flex flex-col justify-between gap-4 transition-all relative ${
-                            isSelectedForDelete
-                              ? 'border-rose-500 ring-1 ring-rose-500/50'
-                              : isPinned
-                                ? 'border-purple-500/60 shadow-lg shadow-purple-950/20'
-                                : 'border-zinc-800/90 hover:border-zinc-700'
-                          }`}
+              selectedPlaylistId &&
+              visiblePlaylists.some((p) => p.id === selectedPlaylistId) ? (
+                <PlaylistDetailView
+                  playlist={
+                    visiblePlaylists.find((p) => p.id === selectedPlaylistId)!
+                  }
+                  allTracks={allTracks}
+                  slskdJobs={slskdJobs}
+                  currentTrackId={audio.currentTrack?.id}
+                  isPlaying={audio.isPlaying}
+                  cachedTrackIds={audio.cachedTrackIds}
+                  onBack={handleBackToPlaylists}
+                  onPlayTrack={(track, context) =>
+                    audio.playSpecificTrack(track, context)
+                  }
+                  onPlayPlaylistInOrder={handlePlayPlaylistInOrder}
+                  onShufflePlayPlaylist={handleShufflePlayPlaylist}
+                  onOpenSpotifyImporter={(pl) => {
+                    setSpotifyImporterTargetPlaylist(pl);
+                    setSpotifyImporterModalOpen(true);
+                  }}
+                  onOpenMergePlaylists={(pl) => {
+                    setMergePlaylistsTargets([pl]);
+                    setMergePlaylistsModalOpen(true);
+                  }}
+                  onOpenAddToPlaylist={(tracks, label) => {
+                    setAddToPlaylistTracks(tracks);
+                    setAddToPlaylistLabel(label);
+                    setAddToPlaylistModalOpen(true);
+                  }}
+                  onOpenMetadataInspector={(track) => {
+                    setMetadataModalTarget({
+                      mode: 'track',
+                      label: `Track: "${track.title}"`,
+                      tracks: [track],
+                    });
+                  }}
+                  onRemoveTracksFromPlaylist={(tids, gids) =>
+                    handleRemoveTracksFromPlaylist(
+                      selectedPlaylistId,
+                      tids,
+                      gids
+                    )
+                  }
+                  onDownloadMissingGhostTracks={
+                    handleDownloadMissingGhostTracks
+                  }
+                  onRetryGhostTrackDownload={handleRetryGhostTrackDownload}
+                  onSavePlaylistName={(pl, newName) => {
+                    handleSavePlaylistNameDirect(pl, newName);
+                  }}
+                  onShowToast={(msg) => setToastMessage(msg)}
+                />
+              ) : (
+                <section aria-label="Unified Playlists Grid" className="space-y-4">
+                  {visiblePlaylists.length === 0 ? (
+                    <div className="winamp-bezel rounded-2xl border border-zinc-800/90 p-8 text-center space-y-3">
+                      <p className="text-sm font-semibold text-zinc-200">
+                        No playlists loaded yet.
+                      </p>
+                      <p className="text-xs text-zinc-400 max-w-md mx-auto">
+                        Open{' '}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setActiveTab('settings');
+                            setSettingsSubTab('sources');
+                          }}
+                          className="text-[#00ff66] underline font-semibold"
                         >
-                          <div className="space-y-2.5">
-                            <div className="flex items-start justify-between gap-2">
-                              {isPlaylistSelectMode && (
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    handleToggleSelectPlaylistForDelete(pl.id)
-                                  }
-                                  data-testid={`select-playlist-checkbox-${pl.id}`}
-                                  className="mt-0.5 text-zinc-300 hover:text-[#00ff66] shrink-0"
-                                >
-                                  {isSelectedForDelete ? (
-                                    <CheckSquare className="w-5 h-5 text-[#00ff66]" />
-                                  ) : (
-                                    <Square className="w-5 h-5" />
-                                  )}
-                                </button>
-                              )}
+                          Settings → Server &amp; Connections
+                        </button>{' '}
+                        to connect or sync your music server, or click{' '}
+                        <strong className="text-[#00ff66]">Import Spotify</strong>{' '}
+                        above to grab any playlist link.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4">
+                      {visiblePlaylists.map((pl, idx) => {
+                        const plTracks = getTracksForPlaylist(pl);
+                        const allCached =
+                          plTracks.length > 0 &&
+                          plTracks.every((t) => audio.cachedTrackIds.has(t.id));
+                        const isDownloading = downloadingPlaylistId === pl.id;
+                        const isPinned = pinnedFavoritePlaylist?.id === pl.id;
+                        const realPlaylistName = pl.originalName || pl.name;
+                        const hasCustomName = realPlaylistName !== pl.name;
+                        const isEditingThis = editingPlaylistId === pl.id;
+                        const isMenuOpen = openMenuPlaylistId === pl.id;
+                        const isSelectedForDelete =
+                          selectedPlaylistIdsForDelete.has(pl.id);
+                        const linkedAutopilotRule = autopilotRules.find(
+                          (r) => r.playlistId === pl.id
+                        );
 
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  if (isPlaylistSelectMode) {
-                                    handleToggleSelectPlaylistForDelete(pl.id);
-                                    return;
-                                  }
-                                  setSelectedPlaylistId(pl.id);
-                                  setLibrarySubTab('songs');
-                                }}
-                                className="text-left min-w-0 flex-1 overflow-hidden"
-                              >
-                                <div className="flex items-center gap-1.5 flex-wrap">
-                                  <h3
-                                    data-testid={`playlist-display-name-${pl.id}`}
-                                    className="text-base font-bold text-white group-hover:text-[#00ff66] transition-colors truncate"
+                        return (
+                          <div
+                            key={pl.id}
+                            data-testid={`playlist-card-${pl.id}`}
+                            className={`group winamp-bezel rounded-2xl border p-4 flex flex-col justify-between gap-4 transition-all relative ${
+                              isSelectedForDelete
+                                ? 'border-rose-500 ring-1 ring-rose-500/50'
+                                : isPinned
+                                  ? 'border-purple-500/60 shadow-lg shadow-purple-950/20'
+                                  : 'border-zinc-800/90 hover:border-zinc-700'
+                            }`}
+                          >
+                            <div className="space-y-2.5">
+                              <div className="flex items-start justify-between gap-2">
+                                {isPlaylistSelectMode && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) =>
+                                      handleToggleSelectPlaylistForDelete(
+                                        pl.id,
+                                        e.shiftKey,
+                                        idx
+                                      )
+                                    }
+                                    data-testid={`select-playlist-checkbox-${pl.id}`}
+                                    className="mt-0.5 text-zinc-300 hover:text-[#00ff66] shrink-0"
                                   >
-                                    {pl.name}
-                                  </h3>
-                                  {hasCustomName && (
-                                    <span className="rounded bg-purple-500/20 border border-purple-500/40 px-1.5 py-0.5 text-[9px] font-mono font-bold uppercase text-purple-300 shrink-0">
-                                      Renamed
-                                    </span>
-                                  )}
-                                  {linkedAutopilotRule && (
-                                    <span className="rounded bg-emerald-500/20 border border-emerald-500/40 px-1.5 py-0.5 text-[9px] font-mono font-bold uppercase text-[#00ff66] shrink-0">
-                                      🤖 {linkedAutopilotRule.interval}
-                                    </span>
-                                  )}
-                                </div>
-
-                                {/* Always display the Real / Original Server Name alongside the custom Playlist Name */}
-                                <div
-                                  data-testid={`playlist-real-name-${pl.id}`}
-                                  className="mt-1 rounded-lg border border-zinc-800/90 bg-zinc-950/80 px-2 py-1 text-[11px] font-mono text-zinc-300 flex items-center gap-1.5 truncate"
-                                  title={`Real Server Playlist Name: ${realPlaylistName}`}
-                                >
-                                  <span className="text-zinc-500 shrink-0">
-                                    Real Name:
-                                  </span>
-                                  <span className="text-[#00ff66] font-semibold truncate">
-                                    {realPlaylistName}
-                                  </span>
-                                </div>
-
-                                <p className="text-xs text-zinc-400 mt-1.5 line-clamp-2">
-                                  {pl.description}
-                                </p>
-                              </button>
-
-                              {/* Right Action Icons: Pin, Offline Download, and Three Dots (⋯) Menu */}
-                              <div className="flex items-center gap-1 shrink-0 relative">
-                                <button
-                                  type="button"
-                                  onClick={() => handleTogglePinPlaylist(pl.id)}
-                                  data-testid={`pin-playlist-${pl.id}`}
-                                  aria-label={
-                                    isPinned
-                                      ? `Unpin ${pl.name} from Quick Launch`
-                                      : `Pin ${pl.name} to Quick Launch`
-                                  }
-                                  title={
-                                    isPinned
-                                      ? 'Pinned in Quick Launch'
-                                      : 'Pin as Favorite Playlist'
-                                  }
-                                  className={`min-h-[34px] min-w-[34px] rounded-xl border flex items-center justify-center transition-colors ${
-                                    isPinned
-                                      ? 'border-amber-500/50 bg-amber-500/15 text-amber-400'
-                                      : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-amber-300'
-                                  }`}
-                                >
-                                  <Star
-                                    className={`w-3.5 h-3.5 ${
-                                      isPinned ? 'fill-amber-400' : ''
-                                    }`}
-                                  />
-                                </button>
+                                    {isSelectedForDelete ? (
+                                      <CheckSquare className="w-5 h-5 text-[#00ff66]" />
+                                    ) : (
+                                      <Square className="w-5 h-5" />
+                                    )}
+                                  </button>
+                                )}
 
                                 <button
                                   type="button"
-                                  onClick={() =>
-                                    handleDownloadPlaylistOffline(pl)
-                                  }
-                                  disabled={isDownloading}
-                                  aria-label={`Download playlist ${pl.name} to Offline Vault`}
-                                  title="Save playlist to IndexedDB Offline Vault"
-                                  className={`min-h-[34px] px-2 rounded-xl border flex items-center justify-center gap-1 text-xs font-mono transition-colors ${
-                                    allCached
-                                      ? 'border-emerald-500/50 bg-emerald-500/20 text-[#00ff66]'
-                                      : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-white'
-                                  }`}
+                                  onClick={() => {
+                                    if (isPlaylistSelectMode) {
+                                      handleToggleSelectPlaylistForDelete(
+                                        pl.id,
+                                        false,
+                                        idx
+                                      );
+                                      return;
+                                    }
+                                    handleOpenPlaylist(pl);
+                                  }}
+                                  className="text-left min-w-0 flex-1 overflow-hidden"
                                 >
-                                  {isDownloading ? (
-                                    <>
-                                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[#00ff66]" />
-                                      <span className="tabular-nums">
-                                        {downloadProgress?.done}/
-                                        {downloadProgress?.total}
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    <h3
+                                      data-testid={`playlist-display-name-${pl.id}`}
+                                      className="text-base font-bold text-white group-hover:text-[#00ff66] transition-colors truncate"
+                                    >
+                                      {pl.name}
+                                    </h3>
+                                    {hasCustomName && (
+                                      <span className="rounded bg-purple-500/20 border border-purple-500/40 px-1.5 py-0.5 text-[9px] font-mono font-bold uppercase text-purple-300 shrink-0">
+                                        Renamed
                                       </span>
-                                    </>
-                                  ) : allCached ? (
-                                    <CheckCircle2 className="w-3.5 h-3.5 text-[#00ff66]" />
-                                  ) : (
-                                    <ArrowDownToLine className="w-3.5 h-3.5" />
-                                  )}
-                                </button>
+                                    )}
+                                    {linkedAutopilotRule && (
+                                      <span className="rounded bg-emerald-500/20 border border-emerald-500/40 px-1.5 py-0.5 text-[9px] font-mono font-bold uppercase text-[#00ff66] shrink-0">
+                                        🤖 {linkedAutopilotRule.interval}
+                                      </span>
+                                    )}
+                                  </div>
 
-                                {/* Three Little Dots (⋯) Menu Button */}
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setOpenMenuPlaylistId(
-                                      isMenuOpen ? null : pl.id
-                                    )
-                                  }
-                                  data-testid={`playlist-menu-btn-${pl.id}`}
-                                  aria-label={`More options for ${pl.name}`}
-                                  title="More Playlist Actions (Rename, Link Spotify Autopilot, Select, Delete)"
-                                  className={`min-h-[34px] min-w-[34px] rounded-xl border flex items-center justify-center transition-colors ${
-                                    isMenuOpen
-                                      ? 'border-[#00ff66] bg-emerald-500/20 text-[#00ff66]'
-                                      : 'border-zinc-800 bg-zinc-950 text-zinc-300 hover:text-white'
-                                  }`}
-                                >
-                                  <MoreVertical className="w-4 h-4" />
-                                </button>
-
-                                {/* Dropdown Menu for Three Dots (⋯) */}
-                                {isMenuOpen && (
+                                  {/* Always display the Real / Original Server Name alongside the custom Playlist Name */}
                                   <div
-                                    data-testid={`playlist-dropdown-menu-${pl.id}`}
-                                    className="absolute right-0 top-10 z-30 w-56 rounded-2xl border border-zinc-700 bg-zinc-950/95 p-1.5 shadow-2xl backdrop-blur-md space-y-1 text-xs font-mono"
+                                    data-testid={`playlist-real-name-${pl.id}`}
+                                    className="mt-1 rounded-lg border border-zinc-800/90 bg-zinc-950/80 px-2 py-1 text-[11px] font-mono text-zinc-300 flex items-center gap-1.5 truncate"
+                                    title={`Real Server Playlist Name: ${realPlaylistName}`}
                                   >
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        handleStartRenamePlaylist(pl)
+                                    <span className="text-zinc-500 shrink-0">
+                                      Real Name:
+                                    </span>
+                                    <span className="text-[#00ff66] font-semibold truncate">
+                                      {realPlaylistName}
+                                    </span>
+                                  </div>
+
+                                  <p className="text-xs text-zinc-400 mt-1.5 line-clamp-2">
+                                    {pl.description}
+                                  </p>
+                                </button>
+
+                                {/* Right Action Icons: Pin, Offline Download, and Three Dots (⋯) Menu */}
+                                <div className="flex items-center gap-1 shrink-0 relative">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleTogglePinPlaylist(pl.id)}
+                                    data-testid={`pin-playlist-${pl.id}`}
+                                    aria-label={
+                                      isPinned
+                                        ? `Unpin ${pl.name} from Quick Launch`
+                                        : `Pin ${pl.name} to Quick Launch`
+                                    }
+                                    title={
+                                      isPinned
+                                        ? 'Pinned in Quick Launch'
+                                        : 'Pin as Favorite Playlist'
+                                    }
+                                    className={`min-h-[34px] min-w-[34px] rounded-xl border flex items-center justify-center transition-colors ${
+                                      isPinned
+                                        ? 'border-amber-500/50 bg-amber-500/15 text-amber-400'
+                                        : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-amber-300'
+                                    }`}
+                                  >
+                                    <Star
+                                      className={`w-3.5 h-3.5 ${
+                                        isPinned ? 'fill-amber-400' : ''
+                                      }`}
+                                    />
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleDownloadPlaylistOffline(pl)
+                                    }
+                                    disabled={isDownloading}
+                                    aria-label={`Download playlist ${pl.name} to Offline Vault`}
+                                    title="Save playlist to IndexedDB Offline Vault"
+                                    className={`min-h-[34px] px-2 rounded-xl border flex items-center justify-center gap-1 text-xs font-mono transition-colors ${
+                                      allCached
+                                        ? 'border-emerald-500/50 bg-emerald-500/20 text-[#00ff66]'
+                                        : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-white'
+                                    }`}
+                                  >
+                                    {isDownloading ? (
+                                      <>
+                                        <Loader2 className="w-3.5 h-3.5 animate-spin text-[#00ff66]" />
+                                        <span className="tabular-nums">
+                                          {downloadProgress?.done}/
+                                          {downloadProgress?.total}
+                                        </span>
+                                      </>
+                                    ) : allCached ? (
+                                      <CheckCircle2 className="w-3.5 h-3.5 text-[#00ff66]" />
+                                    ) : (
+                                      <ArrowDownToLine className="w-3.5 h-3.5" />
+                                    )}
+                                  </button>
+
+                                  {/* Three Little Dots (⋯) Menu Button */}
+                                  <button
+                                    type="button"
+                                    data-menu-trigger="true"
+                                    onClick={() =>
+                                      setOpenMenuPlaylistId(
+                                        isMenuOpen ? null : pl.id
+                                      )
+                                    }
+                                    data-testid={`playlist-menu-btn-${pl.id}`}
+                                    aria-label={`More options for ${pl.name}`}
+                                    title="More Playlist Actions (Rename, Link Spotify Autopilot, Select, Delete)"
+                                    className={`min-h-[34px] min-w-[34px] rounded-xl border flex items-center justify-center transition-colors ${
+                                      isMenuOpen
+                                        ? 'border-[#00ff66] bg-emerald-500/20 text-[#00ff66]'
+                                        : 'border-zinc-800 bg-zinc-950 text-zinc-300 hover:text-white'
+                                    }`}
+                                  >
+                                    <MoreVertical className="w-4 h-4" />
+                                  </button>
+
+                                  {/* Dropdown Menu for Three Dots (⋯) */}
+                                  {isMenuOpen && (
+                                    <div
+                                      data-dropdown-menu="true"
+                                      data-testid={`playlist-dropdown-menu-${pl.id}`}
+                                      className="absolute right-0 top-10 z-30 w-56 rounded-2xl border border-zinc-700 bg-zinc-950/95 p-1.5 shadow-2xl backdrop-blur-md space-y-1 text-xs font-mono"
+                                    >
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          handleStartRenamePlaylist(pl)
+                                        }
+                                        data-testid={`rename-playlist-btn-${pl.id}`}
+                                        className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-[#00ff66]"
+                                      >
+                                        <Pencil className="w-3.5 h-3.5 text-[#00ff66]" />
+                                        <span>Rename Playlist</span>
+                                      </button>
+
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setAutopilotModalPlaylist(pl);
+                                          setAutopilotSpotifyUrlInput(
+                                            linkedAutopilotRule?.spotifyUrl ||
+                                              pl.autopilotSpotifyUrl ||
+                                              ''
+                                          );
+                                          setAutopilotScheduleInput(
+                                            linkedAutopilotRule?.interval ||
+                                              pl.autopilotInterval ||
+                                              'weekly'
+                                          );
+                                          setOpenMenuPlaylistId(null);
+                                        }}
+                                        data-testid={`autopilot-link-playlist-btn-${pl.id}`}
+                                        className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-purple-300"
+                                      >
+                                        <Link2 className="w-3.5 h-3.5 text-purple-400" />
+                                        <span>Link Spotify Autopilot</span>
+                                      </button>
+
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setMergePlaylistsTargets([pl]);
+                                          setMergePlaylistsModalOpen(true);
+                                          setOpenMenuPlaylistId(null);
+                                        }}
+                                        className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-purple-200 hover:bg-purple-950/50"
+                                      >
+                                        <Link2 className="w-3.5 h-3.5 text-purple-400" />
+                                        <span>Link with Another Playlist</span>
+                                      </button>
+
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setIsPlaylistSelectMode(true);
+                                          handleToggleSelectPlaylistForDelete(
+                                            pl.id,
+                                            false,
+                                            idx
+                                          );
+                                          setOpenMenuPlaylistId(null);
+                                        }}
+                                        className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-white"
+                                      >
+                                        <CheckSquare className="w-3.5 h-3.5 text-sky-400" />
+                                        <span>Select Multiple Playlists</span>
+                                      </button>
+
+                                      <div className="border-t border-zinc-800 my-1" />
+
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setPlaylistsPendingDeletion([pl]);
+                                          setOpenMenuPlaylistId(null);
+                                        }}
+                                        data-testid={`delete-playlist-btn-${pl.id}`}
+                                        className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-rose-300 hover:bg-rose-950/50 hover:text-rose-200"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                                        <span>Delete Playlist Only</span>
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+
+                              {/* Inline Rename Editor */}
+                              {isEditingThis && (
+                                <form
+                                  onSubmit={(e) => {
+                                    e.preventDefault();
+                                    handleSavePlaylistName(pl);
+                                  }}
+                                  data-testid={`rename-playlist-form-${pl.id}`}
+                                  className="rounded-xl border border-emerald-500/40 bg-zinc-950/95 p-2.5 space-y-2"
+                                >
+                                  <div className="flex items-center justify-between text-[10px] font-mono text-zinc-400">
+                                    <span>Custom Display Name:</span>
+                                    <span className="text-zinc-500 truncate max-w-[180px]">
+                                      Real: {realPlaylistName}
+                                    </span>
+                                  </div>
+                                  <div className="flex items-center gap-1.5">
+                                    <input
+                                      type="text"
+                                      value={editingPlaylistNameInput}
+                                      onChange={(e) =>
+                                        setEditingPlaylistNameInput(
+                                          e.target.value
+                                        )
                                       }
-                                      data-testid={`rename-playlist-btn-${pl.id}`}
-                                      className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-[#00ff66]"
+                                      placeholder="Enter custom playlist name..."
+                                      aria-label="Custom playlist name"
+                                      data-testid={`rename-playlist-input-${pl.id}`}
+                                      className="flex-1 min-w-0 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs text-white focus:border-[#00ff66] focus:outline-none"
+                                    />
+                                    <button
+                                      type="submit"
+                                      data-testid={`save-playlist-name-${pl.id}`}
+                                      title="Save Custom Name"
+                                      className="rounded-lg bg-[#00ff66] hover:bg-emerald-400 px-2.5 py-1.5 text-xs font-mono font-bold text-zinc-950 inline-flex items-center gap-1 shrink-0 min-h-[32px]"
                                     >
-                                      <Pencil className="w-3.5 h-3.5 text-[#00ff66]" />
-                                      <span>Rename Playlist</span>
+                                      <Check className="w-3.5 h-3.5" />
+                                      <span>Save</span>
                                     </button>
-
+                                    {hasCustomName && (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleResetPlaylistName(pl)}
+                                        data-testid={`reset-playlist-name-${pl.id}`}
+                                        title={`Reset to real name (${realPlaylistName})`}
+                                        className="rounded-lg border border-zinc-700 bg-zinc-900 hover:text-amber-300 px-2 py-1.5 text-xs font-mono text-zinc-300 inline-flex items-center gap-1 shrink-0 min-h-[32px]"
+                                      >
+                                        <RotateCcw className="w-3.5 h-3.5" />
+                                      </button>
+                                    )}
                                     <button
                                       type="button"
-                                      onClick={() => {
-                                        setAutopilotModalPlaylist(pl);
-                                        setAutopilotSpotifyUrlInput(
-                                          linkedAutopilotRule?.spotifyUrl ||
-                                            pl.autopilotSpotifyUrl ||
-                                            ''
-                                        );
-                                        setAutopilotScheduleInput(
-                                          linkedAutopilotRule?.interval ||
-                                            pl.autopilotInterval ||
-                                            'weekly'
-                                        );
-                                        setOpenMenuPlaylistId(null);
-                                      }}
-                                      data-testid={`autopilot-link-playlist-btn-${pl.id}`}
-                                      className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-purple-300"
+                                      onClick={() => setEditingPlaylistId(null)}
+                                      title="Cancel"
+                                      className="rounded-lg border border-zinc-800 bg-zinc-900 hover:text-white p-1.5 text-zinc-400 shrink-0 min-h-[32px]"
                                     >
-                                      <Link2 className="w-3.5 h-3.5 text-purple-400" />
-                                      <span>Link Spotify Autopilot</span>
-                                    </button>
-
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        setIsPlaylistSelectMode(true);
-                                        handleToggleSelectPlaylistForDelete(
-                                          pl.id
-                                        );
-                                        setOpenMenuPlaylistId(null);
-                                      }}
-                                      className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-white"
-                                    >
-                                      <CheckSquare className="w-3.5 h-3.5 text-sky-400" />
-                                      <span>Select Multiple Playlists</span>
-                                    </button>
-
-                                    <div className="border-t border-zinc-800 my-1" />
-
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        setPlaylistsPendingDeletion([pl]);
-                                        setOpenMenuPlaylistId(null);
-                                      }}
-                                      data-testid={`delete-playlist-btn-${pl.id}`}
-                                      className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-rose-300 hover:bg-rose-950/50 hover:text-rose-200"
-                                    >
-                                      <Trash2 className="w-3.5 h-3.5 text-rose-400" />
-                                      <span>Delete Playlist Only</span>
+                                      <X className="w-3.5 h-3.5" />
                                     </button>
                                   </div>
+                                </form>
+                              )}
+
+                              <div className="text-[11px] font-mono text-zinc-400 flex items-center gap-2 flex-wrap">
+                                <span>{plTracks.length} tracks</span>
+                                <span aria-hidden="true">·</span>
+                                <span className="uppercase">{pl.source}</span>
+                                {isPinned && (
+                                  <>
+                                    <span aria-hidden="true">·</span>
+                                    <span className="text-amber-400 font-semibold">
+                                      ★ Pinned
+                                    </span>
+                                  </>
                                 )}
                               </div>
                             </div>
 
-                            {/* Inline Rename Editor */}
-                            {isEditingThis && (
-                              <form
-                                onSubmit={(e) => {
-                                  e.preventDefault();
-                                  handleSavePlaylistName(pl);
-                                }}
-                                data-testid={`rename-playlist-form-${pl.id}`}
-                                className="rounded-xl border border-emerald-500/40 bg-zinc-950/95 p-2.5 space-y-2"
+                            {/* Direct 1-Tap Action Buttons: Green Play (▶) + Purple Shuffle (🔀) */}
+                            <div className="pt-3 border-t border-zinc-800/70 flex items-center gap-2.5">
+                              <button
+                                type="button"
+                                onClick={() => handlePlayPlaylistInOrder(pl)}
+                                data-testid={`play-playlist-${pl.id}`}
+                                className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-3 py-2 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[38px]"
                               >
-                                <div className="flex items-center justify-between text-[10px] font-mono text-zinc-400">
-                                  <span>Custom Display Name:</span>
-                                  <span className="text-zinc-500 truncate max-w-[180px]">
-                                    Real: {realPlaylistName}
-                                  </span>
-                                </div>
-                                <div className="flex items-center gap-1.5">
-                                  <input
-                                    type="text"
-                                    value={editingPlaylistNameInput}
-                                    onChange={(e) =>
-                                      setEditingPlaylistNameInput(
-                                        e.target.value
-                                      )
-                                    }
-                                    placeholder="Enter custom playlist name..."
-                                    aria-label="Custom playlist name"
-                                    data-testid={`rename-playlist-input-${pl.id}`}
-                                    className="flex-1 min-w-0 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs text-white focus:border-[#00ff66] focus:outline-none"
-                                  />
-                                  <button
-                                    type="submit"
-                                    data-testid={`save-playlist-name-${pl.id}`}
-                                    title="Save Custom Name"
-                                    className="rounded-lg bg-[#00ff66] hover:bg-emerald-400 px-2.5 py-1.5 text-xs font-mono font-bold text-zinc-950 inline-flex items-center gap-1 shrink-0 min-h-[32px]"
-                                  >
-                                    <Check className="w-3.5 h-3.5" />
-                                    <span>Save</span>
-                                  </button>
-                                  {hasCustomName && (
-                                    <button
-                                      type="button"
-                                      onClick={() => handleResetPlaylistName(pl)}
-                                      data-testid={`reset-playlist-name-${pl.id}`}
-                                      title={`Reset to real name (${realPlaylistName})`}
-                                      className="rounded-lg border border-zinc-700 bg-zinc-900 hover:text-amber-300 px-2 py-1.5 text-xs font-mono text-zinc-300 inline-flex items-center gap-1 shrink-0 min-h-[32px]"
-                                    >
-                                      <RotateCcw className="w-3.5 h-3.5" />
-                                    </button>
-                                  )}
-                                  <button
-                                    type="button"
-                                    onClick={() => setEditingPlaylistId(null)}
-                                    title="Cancel"
-                                    className="rounded-lg border border-zinc-800 bg-zinc-900 hover:text-white p-1.5 text-zinc-400 shrink-0 min-h-[32px]"
-                                  >
-                                    <X className="w-3.5 h-3.5" />
-                                  </button>
-                                </div>
-                              </form>
-                            )}
+                                <Play className="w-3.5 h-3.5 fill-current" />
+                                <span>Play</span>
+                              </button>
 
-                            <div className="text-[11px] font-mono text-zinc-400 flex items-center gap-2 flex-wrap">
-                              <span>{plTracks.length} tracks</span>
-                              <span aria-hidden="true">·</span>
-                              <span className="uppercase">{pl.source}</span>
-                              {isPinned && (
-                                <>
-                                  <span aria-hidden="true">·</span>
-                                  <span className="text-amber-400 font-semibold">
-                                    ★ Pinned
-                                  </span>
-                                </>
-                              )}
+                              <button
+                                type="button"
+                                onClick={() => handleShufflePlayPlaylist(pl)}
+                                data-testid={`shuffle-playlist-${pl.id}`}
+                                className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#a855f7] hover:bg-purple-400 px-3 py-2 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[38px]"
+                              >
+                                <Shuffle className="w-3.5 h-3.5" />
+                                <span>Shuffle 🔀</span>
+                              </button>
                             </div>
                           </div>
-
-                          {/* Direct 1-Tap Action Buttons: Green Play (▶) + Purple Shuffle (🔀) */}
-                          <div className="pt-3 border-t border-zinc-800/70 flex items-center gap-2.5">
-                            <button
-                              type="button"
-                              onClick={() => handlePlayPlaylistInOrder(pl)}
-                              data-testid={`play-playlist-${pl.id}`}
-                              className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-3 py-2 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[38px]"
-                            >
-                              <Play className="w-3.5 h-3.5 fill-current" />
-                              <span>Play</span>
-                            </button>
-
-                            <button
-                              type="button"
-                              onClick={() => handleShufflePlayPlaylist(pl)}
-                              data-testid={`shuffle-playlist-${pl.id}`}
-                              className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#a855f7] hover:bg-purple-400 px-3 py-2 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[38px]"
-                            >
-                              <Shuffle className="w-3.5 h-3.5" />
-                              <span>Shuffle 🔀</span>
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </section>
+                        );
+                      })}
+                    </div>
+                  )}
+                </section>
+              )
             )}
 
             {/* Modal to Link a Playlist to a Spotify Playlist for Daily/Weekly/Monthly Autopilot */}
@@ -2928,33 +3446,23 @@ export default function App() {
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2">
-                    {selectedPlaylistId &&
-                      (() => {
-                        const activePl = visiblePlaylists.find(
-                          (p) => p.id === selectedPlaylistId
-                        );
-                        const realPlName =
-                          activePl?.originalName || activePl?.name || '';
-                        return (
-                          <div className="flex items-center gap-2">
-                            {activePl && (
-                              <span className="rounded-lg border border-purple-500/40 bg-purple-950/30 px-2.5 py-1 text-xs font-mono text-purple-200">
-                                Playlist: <strong>{activePl.name}</strong>
-                                {realPlName && realPlName !== activePl.name
-                                  ? ` (Real: ${realPlName})`
-                                  : ''}
-                              </span>
-                            )}
-                            <button
-                              type="button"
-                              onClick={() => setSelectedPlaylistId(null)}
-                              className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs font-mono font-semibold text-[#00ff66] hover:text-white min-h-[32px]"
-                            >
-                              Clear Playlist Filter (Show All {allTracks.length})
-                            </button>
-                          </div>
-                        );
-                      })()}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsSongSelectMode(!isSongSelectMode);
+                        setSelectedSongIds(new Set());
+                        setLastSelectedSongIndex(null);
+                      }}
+                      data-testid="toggle-select-songs-btn"
+                      className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-mono font-semibold transition-colors whitespace-nowrap shrink-0 min-h-[32px] ${
+                        isSongSelectMode
+                          ? 'border-[#00ff66] bg-emerald-500/20 text-[#00ff66]'
+                          : 'border-zinc-700 bg-zinc-900 text-zinc-200 hover:text-white'
+                      }`}
+                    >
+                      <CheckSquare className="w-3.5 h-3.5" />
+                      <span>{isSongSelectMode ? 'Done Selecting' : 'Select Songs'}</span>
+                    </button>
 
                     <button
                       type="button"
@@ -2978,60 +3486,119 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* Multi-Select Songs Action Bar */}
+                {isSongSelectMode && (
+                  <div
+                    data-testid="songs-multi-select-bar"
+                    className="winamp-bezel px-4 py-2.5 bg-emerald-950/40 border-b border-emerald-500/40 flex flex-wrap items-center justify-between gap-3 text-xs font-mono"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="text-[#00ff66] font-bold">
+                        {selectedSongIds.size} of {displayedTracks.length} songs selected
+                      </span>
+                      <span className="text-zinc-500 text-[11px]">
+                        (Hold Shift to select range)
+                      </span>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSelectedSongIds(
+                            new Set(displayedTracks.map((t) => t.id))
+                          )
+                        }
+                        className="rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-zinc-200 hover:text-white"
+                      >
+                        Select All
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedSongIds(new Set());
+                          setLastSelectedSongIndex(null);
+                        }}
+                        className="rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-zinc-400 hover:text-white"
+                      >
+                        Clear
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={selectedSongIds.size === 0}
+                        onClick={() => {
+                          const tracks = displayedTracks.filter((t) =>
+                            selectedSongIds.has(t.id)
+                          );
+                          setAddToPlaylistTracks(tracks);
+                          setAddToPlaylistLabel(
+                            `${tracks.length} selected tracks`
+                          );
+                          setAddToPlaylistModalOpen(true);
+                        }}
+                        className="inline-flex items-center gap-1.5 rounded-xl border border-purple-500/60 bg-purple-950/60 hover:bg-purple-900/80 disabled:opacity-40 px-3 py-1.5 font-bold text-purple-200 transition-colors min-h-[32px]"
+                      >
+                        <ListPlus className="w-3.5 h-3.5 text-purple-300" />
+                        <span>Add to Playlist ({selectedSongIds.size})</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={selectedSongIds.size === 0}
+                        onClick={() => {
+                          const tracks = displayedTracks.filter((t) =>
+                            selectedSongIds.has(t.id)
+                          );
+                          if (tracks.length > 0) {
+                            setMetadataModalTarget({
+                              mode: tracks.length === 1 ? 'track' : 'bulk',
+                              label: `${tracks.length} Selected Track(s)`,
+                              tracks,
+                            });
+                          }
+                        }}
+                        className="inline-flex items-center gap-1.5 rounded-xl border border-purple-500/50 bg-zinc-900 hover:text-purple-300 disabled:opacity-40 px-3 py-1.5 font-semibold text-zinc-200 transition-colors min-h-[32px]"
+                      >
+                        <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+                        <span>Check Metadata</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={selectedSongIds.size === 0}
+                        onClick={async () => {
+                          const tracks = displayedTracks.filter((t) =>
+                            selectedSongIds.has(t.id)
+                          );
+                          await handleBulkDeleteTracksFromJellyfin(tracks);
+                          setSelectedSongIds(new Set());
+                        }}
+                        className="inline-flex items-center gap-1.5 rounded-xl bg-rose-500 hover:bg-rose-400 disabled:opacity-40 px-3 py-1.5 font-bold text-white transition-colors min-h-[32px]"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span>Delete Selected ({selectedSongIds.size})</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 <div className="p-4 sm:p-5">
                   {displayedTracks.length === 0 ? (
-                    selectedPlaylistId ? (
-                      <div className="py-12 px-4 text-center max-w-md mx-auto space-y-3">
-                        <div className="w-12 h-12 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center mx-auto text-amber-400">
-                          <Radio className="w-6 h-6 animate-pulse" />
-                        </div>
-                        <h3 className="text-base font-bold text-white">
-                          Playlist Songs Not Downloaded Yet
-                        </h3>
-                        <p className="text-xs text-zinc-400 font-mono leading-relaxed">
-                          &ldquo;
-                          {visiblePlaylists.find(
-                            (p) => p.id === selectedPlaylistId
-                          )?.name || 'This playlist'}
-                          &rdquo; has no matching songs in your local Jellyfin
-                          server yet. Open Request / Discover to grab and
-                          download the missing songs straight to your server
-                          disk!
-                        </p>
-                        <div className="flex flex-wrap items-center justify-center gap-2 pt-2">
-                          <button
-                            type="button"
-                            onClick={() => setActiveTab('discover')}
-                            className="inline-flex items-center gap-1.5 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-4 py-2 text-xs font-mono font-bold text-zinc-950 transition-colors"
-                          >
-                            <ArrowDownToLine className="w-4 h-4" />
-                            <span>Open Request &amp; Discover</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setSelectedPlaylistId(null)}
-                            className="rounded-xl border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 px-3 py-2 text-xs font-mono text-zinc-300"
-                          >
-                            Show All Songs ({allTracks.length})
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="py-10 text-center space-y-2">
-                        <p className="text-sm font-semibold text-zinc-300">
-                          No songs match your current filter.
-                        </p>
-                        {offlineOnlyMode && (
-                          <button
-                            type="button"
-                            onClick={() => setOfflineOnlyMode(false)}
-                            className="rounded-xl bg-zinc-800 px-4 py-2 text-xs font-semibold text-white hover:bg-zinc-700"
-                          >
-                            Disable Offline Only Mode
-                          </button>
-                        )}
-                      </div>
-                    )
+                    <div className="py-10 text-center space-y-2">
+                      <p className="text-sm font-semibold text-zinc-300 font-mono">
+                        No songs match your current filter.
+                      </p>
+                      {offlineOnlyMode && (
+                        <button
+                          type="button"
+                          onClick={() => setOfflineOnlyMode(false)}
+                          className="rounded-xl bg-zinc-800 px-4 py-2 text-xs font-semibold text-white hover:bg-zinc-700"
+                        >
+                          Disable Offline Only Mode
+                        </button>
+                      )}
+                    </div>
                   ) : (
                     <div className="divide-y divide-zinc-800/70">
                       {displayedTracks.map((track, idx) => {
@@ -3040,17 +3607,64 @@ export default function App() {
                         const isPreloading = audio.preloadingTrackIds.has(
                           track.id
                         );
+                        const isSelected = selectedSongIds.has(track.id);
+                        const isMenuOpen = openMenuSongId === track.id;
 
                         return (
                           <div
                             key={track.id}
-                            className={`py-2.5 px-2 rounded-xl flex items-center justify-between gap-3 transition-colors ${
-                              isCurrent
-                                ? 'bg-emerald-500/15'
-                                : 'hover:bg-zinc-950/60'
+                            data-testid={`song-row-${track.id}`}
+                            className={`py-2.5 px-2.5 rounded-xl flex items-center justify-between gap-3 transition-colors relative ${
+                              isSelected
+                                ? 'bg-emerald-500/15 border border-emerald-500/40'
+                                : isCurrent
+                                  ? 'bg-emerald-500/10'
+                                  : 'hover:bg-zinc-950/60'
                             }`}
                           >
                             <div className="flex items-center gap-3 min-w-0 flex-1">
+                              {/* Checkbox for Select Mode */}
+                              {isSongSelectMode && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    setSelectedSongIds((prev) => {
+                                      const next = new Set(prev);
+                                      if (
+                                        e.shiftKey &&
+                                        lastSelectedSongIndex !== null
+                                      ) {
+                                        const start = Math.min(
+                                          lastSelectedSongIndex,
+                                          idx
+                                        );
+                                        const end = Math.max(
+                                          lastSelectedSongIndex,
+                                          idx
+                                        );
+                                        for (let i = start; i <= end; i++) {
+                                          const id = displayedTracks[i]?.id;
+                                          if (id) next.add(id);
+                                        }
+                                      } else {
+                                        if (next.has(track.id))
+                                          next.delete(track.id);
+                                        else next.add(track.id);
+                                      }
+                                      return next;
+                                    });
+                                    setLastSelectedSongIndex(idx);
+                                  }}
+                                  className="text-zinc-400 hover:text-[#00ff66] shrink-0"
+                                >
+                                  {isSelected ? (
+                                    <CheckSquare className="w-4 h-4 text-[#00ff66]" />
+                                  ) : (
+                                    <Square className="w-4 h-4" />
+                                  )}
+                                </button>
+                              )}
+
                               <span className="w-6 text-xs font-mono text-zinc-500 tabular-nums text-right shrink-0">
                                 {String(idx + 1).padStart(2, '0')}
                               </span>
@@ -3080,24 +3694,32 @@ export default function App() {
                                       {track.format}
                                     </span>
                                   )}
+                                  {track.musicbrainzId && (
+                                    <span
+                                      title={`MusicBrainz MBID: ${track.musicbrainzId}`}
+                                      className="hidden md:inline-block rounded bg-purple-500/20 border border-purple-500/40 px-1.5 py-0.5 text-[9px] font-mono font-bold text-purple-300"
+                                    >
+                                      MBID
+                                    </span>
+                                  )}
                                 </div>
 
-                                <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-zinc-400">
+                                <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-zinc-400 font-mono">
                                   <span className="truncate">
                                     {track.artist}
                                   </span>
                                   <span aria-hidden="true">·</span>
-                                  <span className="font-mono text-zinc-300">
-                                    {track.sourceName}
+                                  <span className="text-zinc-300 truncate">
+                                    {track.album}
                                   </span>
                                   <span aria-hidden="true">·</span>
-                                  <span className="font-mono tabular-nums">
+                                  <span className="tabular-nums">
                                     {formatDuration(track.duration)}
                                   </span>
                                   {isPreloading ? (
                                     <>
                                       <span aria-hidden="true">·</span>
-                                      <span className="text-amber-300 font-mono inline-flex items-center gap-1">
+                                      <span className="text-amber-300 inline-flex items-center gap-1">
                                         <Loader2 className="w-3 h-3 animate-spin" />
                                         Pre-loading
                                       </span>
@@ -3107,11 +3729,11 @@ export default function App() {
                                       <>
                                         <span aria-hidden="true">·</span>
                                         <span
-                                          className="text-[#00ff66] font-mono font-semibold inline-flex items-center gap-1"
+                                          className="text-[#00ff66] font-semibold inline-flex items-center gap-1"
                                           data-testid="preloaded-indicator"
                                         >
                                           <CheckCircle2 className="w-3 h-3" />
-                                          Pre-Loaded &amp; Ready
+                                          Pre-Loaded
                                         </span>
                                       </>
                                     )
@@ -3121,50 +3743,6 @@ export default function App() {
                             </div>
 
                             <div className="flex items-center gap-2 shrink-0">
-                              {(track.source === 'built-in' ||
-                                track.source === 'jellyfin') && (
-                                <>
-                                  {confirmDeleteTrackId === track.id ? (
-                                    <div className="inline-flex items-center gap-1 rounded-xl border border-rose-500/60 bg-rose-950/60 px-2 py-1">
-                                      <button
-                                        type="button"
-                                        disabled={deletingTrackId === track.id}
-                                        onClick={() =>
-                                          handleDeleteTrackFromJellyfin(track)
-                                        }
-                                        data-testid={`confirm-delete-track-${track.id}`}
-                                        className="rounded-lg bg-rose-500 hover:bg-rose-400 px-2 py-1 text-[11px] font-mono font-bold text-white"
-                                      >
-                                        {deletingTrackId === track.id
-                                          ? 'Deleting...'
-                                          : 'Delete File'}
-                                      </button>
-                                      <button
-                                        type="button"
-                                        onClick={() =>
-                                          setConfirmDeleteTrackId(null)
-                                        }
-                                        className="rounded-lg bg-zinc-800 px-1.5 py-1 text-[11px] font-mono text-zinc-300 hover:text-white"
-                                      >
-                                        Cancel
-                                      </button>
-                                    </div>
-                                  ) : (
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        setConfirmDeleteTrackId(track.id)
-                                      }
-                                      data-testid={`delete-jellyfin-track-${track.id}`}
-                                      title="Permanently delete track from server hard drive"
-                                      className="inline-flex items-center justify-center rounded-xl border border-zinc-800 bg-zinc-950 hover:border-rose-500/50 hover:text-rose-400 p-2 text-zinc-500 transition-colors min-h-[36px] min-w-[36px]"
-                                    >
-                                      <Trash2 className="w-3.5 h-3.5" />
-                                    </button>
-                                  )}
-                                </>
-                              )}
-
                               <button
                                 type="button"
                                 onClick={() => audio.queueTrackNext(track)}
@@ -3205,6 +3783,74 @@ export default function App() {
                                   </>
                                 )}
                               </button>
+
+                              {/* Three Dots (⋯) Menu Trigger */}
+                              <div className="relative">
+                                <button
+                                  type="button"
+                                  data-menu-trigger="true"
+                                  onClick={() =>
+                                    setOpenMenuSongId(
+                                      isMenuOpen ? null : track.id
+                                    )
+                                  }
+                                  data-testid={`song-menu-btn-${track.id}`}
+                                  className="rounded-xl border border-zinc-800 bg-zinc-950 hover:text-white p-2 text-zinc-400 min-h-[36px] min-w-[36px] flex items-center justify-center"
+                                >
+                                  <MoreVertical className="w-4 h-4" />
+                                </button>
+
+                                {isMenuOpen && (
+                                  <div
+                                    data-dropdown-menu="true"
+                                    className="absolute right-0 top-10 z-40 w-60 rounded-2xl border border-zinc-700 bg-zinc-950/95 p-1.5 shadow-2xl backdrop-blur-md space-y-1 text-xs font-mono"
+                                  >
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setMetadataModalTarget({
+                                          mode: 'track',
+                                          label: `Track: "${track.title}"`,
+                                          tracks: [track],
+                                        });
+                                        setOpenMenuSongId(null);
+                                      }}
+                                      className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-purple-300"
+                                    >
+                                      <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+                                      <span>Check Metadata (MBID)</span>
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setAddToPlaylistTracks([track]);
+                                        setAddToPlaylistLabel(`"${track.title}"`);
+                                        setAddToPlaylistModalOpen(true);
+                                        setOpenMenuSongId(null);
+                                      }}
+                                      className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-[#00ff66]"
+                                    >
+                                      <ListPlus className="w-3.5 h-3.5 text-[#00ff66]" />
+                                      <span>Add to Playlist</span>
+                                    </button>
+
+                                    <div className="border-t border-zinc-800 my-1" />
+
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setConfirmDeleteTrackId(track.id);
+                                        setOpenMenuSongId(null);
+                                      }}
+                                      className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-rose-300 hover:bg-rose-950/50"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                                      <span>Delete File from Server</span>
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
                             </div>
                           </div>
                         );
@@ -3217,127 +3863,551 @@ export default function App() {
 
             {/* SUB-TAB 3: ALBUMS GRID (Responsive up to 5 columns on large TVs) */}
             {librarySubTab === 'albums' && (
-              <section
-                aria-label="Albums Grid"
-                className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4"
-              >
-                {albumGroups.map((group) => (
-                  <div
-                    key={group.album}
-                    className="winamp-bezel rounded-2xl border border-zinc-800/90 p-4 flex flex-col justify-between gap-4"
-                  >
-                    <div className="flex items-center gap-3.5">
-                      <CachedArtworkImage
-                        src={group.artworkUrl}
-                        alt={group.album}
-                        fallbackTitle={group.album}
-                        fallbackArtist={group.artist}
-                        fallbackAccent="#10b981"
-                        className="w-16 h-16 rounded-xl border border-zinc-800 object-cover shrink-0"
-                      />
-                      <div className="min-w-0 flex-1">
-                        <h3 className="text-sm font-bold text-white truncate">
-                          {group.album}
-                        </h3>
-                        <p className="text-xs text-zinc-400 truncate mt-0.5">
-                          {group.artist}
-                        </p>
-                        <p className="text-[11px] font-mono text-[#00ff66] mt-1">
-                          {group.tracks.length} tracks
-                        </p>
-                      </div>
-                    </div>
+              <div className="space-y-4">
+                {/* Albums Header & Multi-select Bar */}
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsAlbumSelectMode(!isAlbumSelectMode);
+                        setSelectedAlbumNames(new Set());
+                        setLastSelectedAlbumIndex(null);
+                      }}
+                      className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-mono font-semibold transition-colors ${
+                        isAlbumSelectMode
+                          ? 'border-[#00ff66] bg-[#00ff66]/10 text-[#00ff66]'
+                          : 'border-zinc-800 bg-zinc-900 text-zinc-300 hover:border-zinc-700'
+                      }`}
+                    >
+                      <CheckSquare className="w-3.5 h-3.5" />
+                      <span>{isAlbumSelectMode ? 'Exit Select Mode' : 'Select Albums'}</span>
+                    </button>
+                    <span className="text-xs font-mono text-zinc-400">
+                      {albumGroups.length} album{albumGroups.length !== 1 ? 's' : ''} in library
+                    </span>
+                  </div>
 
-                    <div className="flex items-center gap-2 pt-2 border-t border-zinc-800/70">
+                  {isAlbumSelectMode && (
+                    <div className="flex items-center gap-2">
                       <button
                         type="button"
                         onClick={() =>
-                          audio.playSpecificTrack(group.tracks[0], group.tracks)
+                          setSelectedAlbumNames(new Set(albumGroups.map((g) => g.album)))
                         }
-                        className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#00ff66] hover:bg-emerald-400 py-2 px-3 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[36px]"
+                        className="rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs font-mono text-zinc-200 hover:text-white"
                       >
-                        <Play className="w-3.5 h-3.5 fill-current" />
-                        <span>Play Album</span>
+                        Select All
                       </button>
                       <button
                         type="button"
                         onClick={() => {
-                          const shuffled = smartAntiRepeatShuffle(
-                            group.tracks,
-                            audio.smartAntiRepeatEnabled
-                          );
-                          audio.playSpecificTrack(shuffled[0], shuffled);
+                          setSelectedAlbumNames(new Set());
+                          setLastSelectedAlbumIndex(null);
                         }}
-                        className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#a855f7] hover:bg-purple-400 py-2 px-3 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[36px]"
+                        className="rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs font-mono text-zinc-400 hover:text-white"
                       >
-                        <Shuffle className="w-3.5 h-3.5" />
-                        <span>Shuffle 🔀</span>
+                        Clear
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* Album Multi-Selection Active Action Bar */}
+                {isAlbumSelectMode && selectedAlbumNames.size > 0 && (
+                  <div
+                    data-testid="album-multi-select-bar"
+                    className="winamp-bezel rounded-2xl p-3 bg-emerald-950/40 border border-emerald-500/40 flex flex-wrap items-center justify-between gap-3 text-xs font-mono"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="text-[#00ff66] font-bold">
+                        {selectedAlbumNames.size} of {albumGroups.length} albums selected
+                      </span>
+                      <span className="text-zinc-500 text-[11px]">
+                        (Hold Shift to select range)
+                      </span>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const selectedGroups = albumGroups.filter((g) =>
+                            selectedAlbumNames.has(g.album)
+                          );
+                          const allAlbumTracks = selectedGroups.flatMap((g) => g.tracks);
+                          setAddToPlaylistTracks(allAlbumTracks);
+                          setAddToPlaylistLabel(
+                            `${selectedAlbumNames.size} albums (${allAlbumTracks.length} tracks)`
+                          );
+                          setAddToPlaylistModalOpen(true);
+                        }}
+                        className="inline-flex items-center gap-1.5 rounded-xl border border-purple-500/60 bg-purple-950/60 hover:bg-purple-900/80 px-3 py-1.5 font-bold text-purple-200 transition-colors"
+                      >
+                        <ListPlus className="w-3.5 h-3.5 text-purple-300" />
+                        <span>Add All Tracks to Playlist</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const selectedGroups = albumGroups.filter((g) =>
+                            selectedAlbumNames.has(g.album)
+                          );
+                          const allAlbumTracks = selectedGroups.flatMap((g) => g.tracks);
+                          setMetadataModalTarget({
+                            mode: 'album',
+                            label: `${selectedAlbumNames.size} Selected Albums`,
+                            tracks: allAlbumTracks,
+                          });
+                        }}
+                        className="inline-flex items-center gap-1.5 rounded-xl border border-purple-500/50 bg-zinc-900 hover:text-purple-300 px-3 py-1.5 font-semibold text-zinc-200 transition-colors"
+                      >
+                        <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+                        <span>Check Metadata</span>
                       </button>
                     </div>
                   </div>
-                ))}
-              </section>
+                )}
+
+                <section
+                  aria-label="Albums Grid"
+                  className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4"
+                >
+                  {albumGroups.map((group, idx) => {
+                    const isSelected = selectedAlbumNames.has(group.album);
+                    const isMenuOpen = openMenuAlbumName === group.album;
+
+                    return (
+                      <div
+                        key={group.album}
+                        className={`winamp-bezel rounded-2xl border p-4 flex flex-col justify-between gap-4 transition-all relative ${
+                          isSelected
+                            ? 'border-emerald-500/60 bg-emerald-950/20'
+                            : 'border-zinc-800/90'
+                        }`}
+                      >
+                        <div className="flex items-start gap-3.5">
+                          {isAlbumSelectMode && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                setSelectedAlbumNames((prev) => {
+                                  const next = new Set(prev);
+                                  if (
+                                    e.shiftKey &&
+                                    lastSelectedAlbumIndex !== null
+                                  ) {
+                                    const start = Math.min(
+                                      lastSelectedAlbumIndex,
+                                      idx
+                                    );
+                                    const end = Math.max(
+                                      lastSelectedAlbumIndex,
+                                      idx
+                                    );
+                                    for (let i = start; i <= end; i++) {
+                                      const alb = albumGroups[i]?.album;
+                                      if (alb) next.add(alb);
+                                    }
+                                  } else {
+                                    if (next.has(group.album))
+                                      next.delete(group.album);
+                                    else next.add(group.album);
+                                  }
+                                  return next;
+                                });
+                                setLastSelectedAlbumIndex(idx);
+                              }}
+                              className="text-zinc-400 hover:text-[#00ff66] shrink-0 mt-1"
+                            >
+                              {isSelected ? (
+                                <CheckSquare className="w-4 h-4 text-[#00ff66]" />
+                              ) : (
+                                <Square className="w-4 h-4" />
+                              )}
+                            </button>
+                          )}
+
+                          <CachedArtworkImage
+                            src={group.artworkUrl}
+                            alt={group.album}
+                            fallbackTitle={group.album}
+                            fallbackArtist={group.artist}
+                            fallbackAccent="#10b981"
+                            className="w-16 h-16 rounded-xl border border-zinc-800 object-cover shrink-0"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <h3 className="text-sm font-bold text-white truncate">
+                              {group.album}
+                            </h3>
+                            <p className="text-xs text-zinc-400 truncate mt-0.5">
+                              {group.artist}
+                            </p>
+                            <p className="text-[11px] font-mono text-[#00ff66] mt-1">
+                              {group.tracks.length} tracks
+                            </p>
+                          </div>
+
+                          {/* 3-dots menu button */}
+                          <div className="relative shrink-0">
+                            <button
+                              type="button"
+                              data-menu-trigger="true"
+                              onClick={() =>
+                                setOpenMenuAlbumName(
+                                  isMenuOpen ? null : group.album
+                                )
+                              }
+                              className="rounded-xl border border-zinc-800 bg-zinc-950 hover:text-white p-1.5 text-zinc-400"
+                              title="Album Actions"
+                            >
+                              <MoreVertical className="w-4 h-4" />
+                            </button>
+
+                            {isMenuOpen && (
+                              <div
+                                data-dropdown-menu="true"
+                                className="absolute right-0 top-8 z-40 w-56 rounded-2xl border border-zinc-700 bg-zinc-950/95 p-1.5 shadow-2xl backdrop-blur-md space-y-1 text-xs font-mono"
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setMetadataModalTarget({
+                                      mode: 'album',
+                                      label: `Album: "${group.album}"`,
+                                      tracks: group.tracks,
+                                    });
+                                    setOpenMenuAlbumName(null);
+                                  }}
+                                  className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-purple-300"
+                                >
+                                  <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+                                  <span>Check Metadata (MBID)</span>
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setAddToPlaylistTracks(group.tracks);
+                                    setAddToPlaylistLabel(`Album "${group.album}"`);
+                                    setAddToPlaylistModalOpen(true);
+                                    setOpenMenuAlbumName(null);
+                                  }}
+                                  className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-[#00ff66]"
+                                >
+                                  <ListPlus className="w-3.5 h-3.5 text-[#00ff66]" />
+                                  <span>Add Album to Playlist</span>
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2 pt-2 border-t border-zinc-800/70">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              audio.playSpecificTrack(group.tracks[0], group.tracks)
+                            }
+                            className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#00ff66] hover:bg-emerald-400 py-2 px-3 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[36px]"
+                          >
+                            <Play className="w-3.5 h-3.5 fill-current" />
+                            <span>Play Album</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const shuffled = smartAntiRepeatShuffle(
+                                group.tracks,
+                                audio.smartAntiRepeatEnabled
+                              );
+                              audio.playSpecificTrack(shuffled[0], shuffled);
+                            }}
+                            className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#a855f7] hover:bg-purple-400 py-2 px-3 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[36px]"
+                          >
+                            <Shuffle className="w-3.5 h-3.5" />
+                            <span>Shuffle 🔀</span>
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </section>
+              </div>
             )}
 
             {/* SUB-TAB 4: ARTISTS GRID (Responsive up to 5 columns on large TVs) */}
             {librarySubTab === 'artists' && (
-              <section
-                aria-label="Artists Grid"
-                className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4"
-              >
-                {artistGroups.map((group) => (
-                  <div
-                    key={group.artist}
-                    className="winamp-bezel rounded-2xl border border-zinc-800/90 p-4 flex flex-col justify-between gap-4"
-                  >
-                    <div className="flex items-center gap-3.5">
-                      <CachedArtworkImage
-                        src={group.artworkUrl}
-                        alt={group.artist}
-                        fallbackTitle={group.artist}
-                        fallbackArtist="Artist"
-                        fallbackAccent="#a855f7"
-                        className="w-14 h-14 rounded-full border border-zinc-800 object-cover shrink-0"
-                      />
-                      <div className="min-w-0 flex-1">
-                        <h3 className="text-sm font-bold text-white truncate">
-                          {group.artist}
-                        </h3>
-                        <p className="text-[11px] font-mono text-zinc-400 mt-1">
-                          {group.tracks.length} tracks in library
-                        </p>
-                      </div>
-                    </div>
+              <div className="space-y-4">
+                {/* Artists Header & Multi-select Bar */}
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsArtistSelectMode(!isArtistSelectMode);
+                        setSelectedArtistNames(new Set());
+                        setLastSelectedArtistIndex(null);
+                      }}
+                      className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-mono font-semibold transition-colors ${
+                        isArtistSelectMode
+                          ? 'border-[#00ff66] bg-[#00ff66]/10 text-[#00ff66]'
+                          : 'border-zinc-800 bg-zinc-900 text-zinc-300 hover:border-zinc-700'
+                      }`}
+                    >
+                      <CheckSquare className="w-3.5 h-3.5" />
+                      <span>{isArtistSelectMode ? 'Exit Select Mode' : 'Select Artists'}</span>
+                    </button>
+                    <span className="text-xs font-mono text-zinc-400">
+                      {artistGroups.length} artist{artistGroups.length !== 1 ? 's' : ''} in library
+                    </span>
+                  </div>
 
-                    <div className="flex items-center gap-2 pt-2 border-t border-zinc-800/70">
+                  {isArtistSelectMode && (
+                    <div className="flex items-center gap-2">
                       <button
                         type="button"
                         onClick={() =>
-                          audio.playSpecificTrack(group.tracks[0], group.tracks)
+                          setSelectedArtistNames(new Set(artistGroups.map((g) => g.artist)))
                         }
-                        className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#00ff66] hover:bg-emerald-400 py-2 px-3 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[36px]"
+                        className="rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs font-mono text-zinc-200 hover:text-white"
                       >
-                        <Play className="w-3.5 h-3.5 fill-current" />
-                        <span>Play</span>
+                        Select All
                       </button>
                       <button
                         type="button"
                         onClick={() => {
-                          const shuffled = smartAntiRepeatShuffle(
-                            group.tracks,
-                            audio.smartAntiRepeatEnabled
-                          );
-                          audio.playSpecificTrack(shuffled[0], shuffled);
+                          setSelectedArtistNames(new Set());
+                          setLastSelectedArtistIndex(null);
                         }}
-                        className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#a855f7] hover:bg-purple-400 py-2 px-3 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[36px]"
+                        className="rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs font-mono text-zinc-400 hover:text-white"
                       >
-                        <Shuffle className="w-3.5 h-3.5" />
-                        <span>Shuffle 🔀</span>
+                        Clear
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* Artist Multi-Selection Active Action Bar */}
+                {isArtistSelectMode && selectedArtistNames.size > 0 && (
+                  <div
+                    data-testid="artist-multi-select-bar"
+                    className="winamp-bezel rounded-2xl p-3 bg-emerald-950/40 border border-emerald-500/40 flex flex-wrap items-center justify-between gap-3 text-xs font-mono"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="text-[#00ff66] font-bold">
+                        {selectedArtistNames.size} of {artistGroups.length} artists selected
+                      </span>
+                      <span className="text-zinc-500 text-[11px]">
+                        (Hold Shift to select range)
+                      </span>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const selectedGroups = artistGroups.filter((g) =>
+                            selectedArtistNames.has(g.artist)
+                          );
+                          const allArtistTracks = selectedGroups.flatMap((g) => g.tracks);
+                          setAddToPlaylistTracks(allArtistTracks);
+                          setAddToPlaylistLabel(
+                            `${selectedArtistNames.size} artists (${allArtistTracks.length} tracks)`
+                          );
+                          setAddToPlaylistModalOpen(true);
+                        }}
+                        className="inline-flex items-center gap-1.5 rounded-xl border border-purple-500/60 bg-purple-950/60 hover:bg-purple-900/80 px-3 py-1.5 font-bold text-purple-200 transition-colors"
+                      >
+                        <ListPlus className="w-3.5 h-3.5 text-purple-300" />
+                        <span>Add All Tracks to Playlist</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const selectedGroups = artistGroups.filter((g) =>
+                            selectedArtistNames.has(g.artist)
+                          );
+                          const allArtistTracks = selectedGroups.flatMap((g) => g.tracks);
+                          setMetadataModalTarget({
+                            mode: 'artist',
+                            label: `${selectedArtistNames.size} Selected Artists`,
+                            tracks: allArtistTracks,
+                          });
+                        }}
+                        className="inline-flex items-center gap-1.5 rounded-xl border border-purple-500/50 bg-zinc-900 hover:text-purple-300 px-3 py-1.5 font-semibold text-zinc-200 transition-colors"
+                      >
+                        <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+                        <span>Check Metadata</span>
                       </button>
                     </div>
                   </div>
-                ))}
-              </section>
+                )}
+
+                <section
+                  aria-label="Artists Grid"
+                  className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4"
+                >
+                  {artistGroups.map((group, idx) => {
+                    const isSelected = selectedArtistNames.has(group.artist);
+                    const isMenuOpen = openMenuArtistName === group.artist;
+
+                    return (
+                      <div
+                        key={group.artist}
+                        className={`winamp-bezel rounded-2xl border p-4 flex flex-col justify-between gap-4 transition-all relative ${
+                          isSelected
+                            ? 'border-emerald-500/60 bg-emerald-950/20'
+                            : 'border-zinc-800/90'
+                        }`}
+                      >
+                        <div className="flex items-start gap-3.5">
+                          {isArtistSelectMode && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                setSelectedArtistNames((prev) => {
+                                  const next = new Set(prev);
+                                  if (
+                                    e.shiftKey &&
+                                    lastSelectedArtistIndex !== null
+                                  ) {
+                                    const start = Math.min(
+                                      lastSelectedArtistIndex,
+                                      idx
+                                    );
+                                    const end = Math.max(
+                                      lastSelectedArtistIndex,
+                                      idx
+                                    );
+                                    for (let i = start; i <= end; i++) {
+                                      const art = artistGroups[i]?.artist;
+                                      if (art) next.add(art);
+                                    }
+                                  } else {
+                                    if (next.has(group.artist))
+                                      next.delete(group.artist);
+                                    else next.add(group.artist);
+                                  }
+                                  return next;
+                                });
+                                setLastSelectedArtistIndex(idx);
+                              }}
+                              className="text-zinc-400 hover:text-[#00ff66] shrink-0 mt-1"
+                            >
+                              {isSelected ? (
+                                <CheckSquare className="w-4 h-4 text-[#00ff66]" />
+                              ) : (
+                                <Square className="w-4 h-4" />
+                              )}
+                            </button>
+                          )}
+
+                          <CachedArtworkImage
+                            src={group.artworkUrl}
+                            alt={group.artist}
+                            fallbackTitle={group.artist}
+                            fallbackArtist="Artist"
+                            fallbackAccent="#a855f7"
+                            className="w-14 h-14 rounded-full border border-zinc-800 object-cover shrink-0"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <h3 className="text-sm font-bold text-white truncate">
+                              {group.artist}
+                            </h3>
+                            <p className="text-[11px] font-mono text-zinc-400 mt-1">
+                              {group.tracks.length} tracks in library
+                            </p>
+                          </div>
+
+                          {/* 3-dots menu button */}
+                          <div className="relative shrink-0">
+                            <button
+                              type="button"
+                              data-menu-trigger="true"
+                              onClick={() =>
+                                setOpenMenuArtistName(
+                                  isMenuOpen ? null : group.artist
+                                )
+                              }
+                              className="rounded-xl border border-zinc-800 bg-zinc-950 hover:text-white p-1.5 text-zinc-400"
+                              title="Artist Actions"
+                            >
+                              <MoreVertical className="w-4 h-4" />
+                            </button>
+
+                            {isMenuOpen && (
+                              <div
+                                data-dropdown-menu="true"
+                                className="absolute right-0 top-8 z-40 w-56 rounded-2xl border border-zinc-700 bg-zinc-950/95 p-1.5 shadow-2xl backdrop-blur-md space-y-1 text-xs font-mono"
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setMetadataModalTarget({
+                                      mode: 'artist',
+                                      label: `Artist: "${group.artist}"`,
+                                      tracks: group.tracks,
+                                    });
+                                    setOpenMenuArtistName(null);
+                                  }}
+                                  className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-purple-300"
+                                >
+                                  <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+                                  <span>Check Metadata (MBID)</span>
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setAddToPlaylistTracks(group.tracks);
+                                    setAddToPlaylistLabel(`Artist "${group.artist}"`);
+                                    setAddToPlaylistModalOpen(true);
+                                    setOpenMenuArtistName(null);
+                                  }}
+                                  className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-[#00ff66]"
+                                >
+                                  <ListPlus className="w-3.5 h-3.5 text-[#00ff66]" />
+                                  <span>Add All Tracks to Playlist</span>
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2 pt-2 border-t border-zinc-800/70">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              audio.playSpecificTrack(group.tracks[0], group.tracks)
+                            }
+                            className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#00ff66] hover:bg-emerald-400 py-2 px-3 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[36px]"
+                          >
+                            <Play className="w-3.5 h-3.5 fill-current" />
+                            <span>Play</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const shuffled = smartAntiRepeatShuffle(
+                                group.tracks,
+                                audio.smartAntiRepeatEnabled
+                              );
+                              audio.playSpecificTrack(shuffled[0], shuffled);
+                            }}
+                            className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#a855f7] hover:bg-purple-400 py-2 px-3 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[36px]"
+                          >
+                            <Shuffle className="w-3.5 h-3.5" />
+                            <span>Shuffle 🔀</span>
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </section>
+              </div>
             )}
 
             {/* SUB-TAB 5: MAINTAINERR-STYLE LIBRARY STATISTICS & DISK CLEANUP */}
@@ -4391,6 +5461,75 @@ export default function App() {
         }}
         onClose={() => setIsOnboardingOpen(false)}
         onLogoutProvider={handleLogoutProvider}
+      />
+
+      {/* 1. Unified Spotify Playlist Importer & Ghost Track Downloader Modal */}
+      <SpotifyPlaylistImporterModal
+        isOpen={spotifyImporterModalOpen}
+        onClose={() => setSpotifyImporterModalOpen(false)}
+        initialPlaylist={spotifyImporterTargetPlaylist}
+        playlists={playlists}
+        preferredDownloader={serverIntegrations.preferredDownloader || 'auto'}
+        onImportedSuccess={(data) => {
+          if (data.playlists) {
+            setPlaylists(data.playlists);
+          } else if (data.playlist) {
+            setPlaylists((prev) => {
+              const idx = prev.findIndex((p) => p.id === data.playlist.id);
+              if (idx >= 0) {
+                const next = [...prev];
+                next[idx] = data.playlist;
+                return next;
+              }
+              return [data.playlist, ...prev];
+            });
+          }
+          if (data.jobs && data.jobs.length > 0) {
+            setSlskdJobs((prev) => [...data.jobs, ...prev]);
+          }
+          syncJellyfinProvider();
+        }}
+        onShowToast={(msg) => setToastMessage(msg)}
+      />
+
+      {/* 2. Add Selected Tracks / Albums / Artists to Playlist Modal */}
+      <AddToPlaylistModal
+        isOpen={addToPlaylistModalOpen}
+        onClose={() => setAddToPlaylistModalOpen(false)}
+        tracksToAdd={addToPlaylistTracks}
+        sourceLabel={addToPlaylistLabel}
+        playlists={playlists}
+        onAddTracksToPlaylist={handleAddTracksToPlaylist}
+        onCreatePlaylistWithTracks={handleCreatePlaylistWithTracks}
+      />
+
+      {/* 3. Link & Merge Playlists Modal */}
+      <MergePlaylistsModal
+        isOpen={mergePlaylistsModalOpen}
+        onClose={() => setMergePlaylistsModalOpen(false)}
+        selectedPlaylists={mergePlaylistsTargets}
+        allPlaylists={playlists}
+        onMergeSuccess={(data) => {
+          if (data.playlists) {
+            setPlaylists(data.playlists);
+          } else if (data.playlist) {
+            setPlaylists((prev) => [data.playlist, ...prev]);
+          }
+          setSelectedPlaylistIdsForDelete(new Set());
+          setIsPlaylistSelectMode(false);
+          syncJellyfinProvider();
+        }}
+        onShowToast={(msg) => setToastMessage(msg)}
+      />
+
+      {/* 4. MusicBrainz MBID Metadata Inspector & Matcher Modal */}
+      <MetadataInspectorModal
+        target={metadataModalTarget}
+        onClose={() => setMetadataModalTarget(null)}
+        onMetadataUpdated={() => {
+          syncJellyfinProvider();
+        }}
+        onShowToast={(msg) => setToastMessage(msg)}
       />
     </div>
   );

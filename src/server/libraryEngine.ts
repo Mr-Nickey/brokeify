@@ -157,6 +157,16 @@ export interface TrackRow {
   replaygain_track_gain: number | null;
   play_count: number;
   last_played_at: string | null;
+  musicbrainz_id?: string | null;
+}
+
+export interface PlaylistGhostItem {
+  id: string;
+  title: string;
+  artist: string;
+  album?: string;
+  durationSec?: number;
+  matchedTrackId?: string | null;
 }
 
 export interface PlaylistRow {
@@ -166,6 +176,8 @@ export interface PlaylistRow {
   cover_path: string | null;
   is_smart: number;
   smart_rules_json: string | null;
+  ghost_tracks_json?: string | null;
+  spotify_url?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -455,11 +467,21 @@ export function upsertPlaylistWithTracks(params: {
   description?: string;
   isSmart?: boolean;
   smartRulesJson?: string | null;
+  ghostTracks?: PlaylistGhostItem[] | null;
+  spotifyUrl?: string | null;
   trackIds?: string[];
   createdAt?: string;
 }): void {
   const now = new Date().toISOString();
   const existing = db.playlists.get(params.id);
+
+  let ghostTracksJson = existing?.ghost_tracks_json ?? null;
+  if (params.ghostTracks !== undefined) {
+    ghostTracksJson =
+      Array.isArray(params.ghostTracks) && params.ghostTracks.length > 0
+        ? JSON.stringify(params.ghostTracks)
+        : null;
+  }
 
   db.playlists.set(params.id, {
     id: params.id,
@@ -471,6 +493,9 @@ export function upsertPlaylistWithTracks(params: {
       params.smartRulesJson !== undefined
         ? params.smartRulesJson
         : existing?.smart_rules_json ?? null,
+    ghost_tracks_json: ghostTracksJson,
+    spotify_url:
+      params.spotifyUrl !== undefined ? params.spotifyUrl : existing?.spotify_url ?? null,
     created_at: params.createdAt || existing?.created_at || now,
     updated_at: now,
   });
@@ -1435,6 +1460,9 @@ export interface FormattedTrackPayload {
   normalizationGain: number;
   playCount: number;
   lastPlayedAt: string | null;
+  musicbrainzId?: string | null;
+  artistMusicbrainzId?: string | null;
+  albumMusicbrainzId?: string | null;
   source: 'built-in';
   sourceName: string;
   streamUrl: string;
@@ -1525,6 +1553,9 @@ export function queryTracks(filters?: {
       normalizationGain: normGain,
       playCount: Number(r.play_count || 0),
       lastPlayedAt: r.last_played_at ? String(r.last_played_at) : null,
+      musicbrainzId: r.musicbrainz_id || null,
+      artistMusicbrainzId: ar?.musicbrainz_id || null,
+      albumMusicbrainzId: al?.musicbrainz_id || null,
       source: 'built-in',
       sourceName: 'Brokeify Native Engine',
       streamUrl: `/api/stream/${encodeURIComponent(String(r.id))}`,
@@ -1617,7 +1648,124 @@ export function queryAlbums(filters?: { artistId?: string; search?: string }) {
   });
 }
 
+function normalizeMatchToken(str = ''): string {
+  return String(str)
+    .toLowerCase()
+    .replace(
+      /\((feat|ft|featuring|radio|explicit|clean|remaster|version|edit|bonus|deluxe|single)[^)]*\)/gi,
+      ' '
+    )
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+export function reconcilePlaylistsWithLibrary(): void {
+  if (db.playlists.size === 0 || db.tracks.size === 0) return;
+
+  const indexedCatalog: Array<{
+    id: string;
+    normTitle: string;
+    normArtist: string;
+  }> = [];
+
+  for (const t of db.tracks.values()) {
+    const ar = t.artist_id ? db.artists.get(t.artist_id) : undefined;
+    const normTitle = normalizeMatchToken(t.title);
+    const normArtist = normalizeMatchToken(ar?.name || '');
+    if (normTitle) {
+      indexedCatalog.push({ id: t.id, normTitle, normArtist });
+    }
+  }
+
+  let anyModified = false;
+
+  for (const p of db.playlists.values()) {
+    if (!p.ghost_tracks_json) continue;
+    let ghosts: PlaylistGhostItem[] = [];
+    try {
+      const parsed = JSON.parse(p.ghost_tracks_json);
+      if (Array.isArray(parsed)) ghosts = parsed;
+    } catch {
+      continue;
+    }
+    if (ghosts.length === 0) continue;
+
+    const currentTrackIds = [...(db.playlistTracks.get(p.id) || [])].filter(
+      (tid) => db.tracks.has(tid)
+    );
+    const trackIdSet = new Set(currentTrackIds);
+    let playlistChanged = false;
+
+    const updatedGhosts = ghosts.map((g) => {
+      if (g.matchedTrackId && db.tracks.has(g.matchedTrackId)) {
+        if (!trackIdSet.has(g.matchedTrackId)) {
+          trackIdSet.add(g.matchedTrackId);
+          currentTrackIds.push(g.matchedTrackId);
+          playlistChanged = true;
+        }
+        return g;
+      }
+
+      const gTitle = normalizeMatchToken(g.title);
+      const gArtist = normalizeMatchToken(g.artist);
+      const primaryArtist = normalizeMatchToken(
+        String(g.artist || '').split(/[,&/;]|\bfeat\.?\b|\bft\.?\b/i)[0] || ''
+      );
+
+      const match = indexedCatalog.find((loc) => {
+        if (!loc.normTitle || !gTitle) return false;
+        const titleMatches =
+          loc.normTitle === gTitle ||
+          (gTitle.length >= 4 && loc.normTitle.includes(gTitle)) ||
+          (loc.normTitle.length >= 4 && gTitle.includes(loc.normTitle));
+        if (!titleMatches) return false;
+
+        if (!gArtist || !loc.normArtist || loc.normArtist === 'unknown artist') {
+          return loc.normTitle === gTitle;
+        }
+        return (
+          loc.normArtist === gArtist ||
+          loc.normArtist.includes(gArtist) ||
+          gArtist.includes(loc.normArtist) ||
+          (primaryArtist.length >= 3 && loc.normArtist.includes(primaryArtist))
+        );
+      });
+
+      if (match) {
+        if (!trackIdSet.has(match.id)) {
+          trackIdSet.add(match.id);
+          currentTrackIds.push(match.id);
+        }
+        playlistChanged = true;
+        return {
+          ...g,
+          matchedTrackId: match.id,
+        };
+      }
+
+      if (g.matchedTrackId) {
+        playlistChanged = true;
+        return { ...g, matchedTrackId: null };
+      }
+      return g;
+    });
+
+    if (playlistChanged) {
+      p.ghost_tracks_json = JSON.stringify(updatedGhosts);
+      db.playlistTracks.set(p.id, currentTrackIds);
+      anyModified = true;
+    }
+  }
+
+  if (anyModified) {
+    syncDatabaseToPersistentDisk();
+  }
+}
+
 export function queryPlaylists() {
+  reconcilePlaylistsWithLibrary();
+
   const pls = Array.from(db.playlists.values()).sort((a, b) => {
     const cmpDate = String(b.updated_at || '').localeCompare(String(a.updated_at || ''));
     if (cmpDate !== 0) return cmpDate;
@@ -1629,6 +1777,13 @@ export function queryPlaylists() {
     const trackIds = (db.playlistTracks.get(pid) || []).filter((tid) =>
       db.tracks.has(tid)
     );
+    let ghostTracks: PlaylistGhostItem[] = [];
+    if (p.ghost_tracks_json) {
+      try {
+        const parsed = JSON.parse(p.ghost_tracks_json);
+        if (Array.isArray(parsed)) ghostTracks = parsed;
+      } catch {}
+    }
 
     return {
       id: pid,
@@ -1641,6 +1796,9 @@ export function queryPlaylists() {
       smartRules: p.smart_rules_json ? JSON.parse(p.smart_rules_json) : null,
       trackCount: trackIds.length,
       trackIds,
+      ghostTracks,
+      linkedSpotifyUrl: p.spotify_url || undefined,
+      autopilotSpotifyUrl: p.spotify_url || undefined,
       source: 'built-in' as const,
       createdAt: String(p.created_at || new Date().toISOString().slice(0, 10)),
       updatedAt: String(p.updated_at || new Date().toISOString()),
@@ -1922,7 +2080,11 @@ export async function enrichTrackFromMusicBrainz(trackId: string): Promise<{
   }
 
   trackRow.title = canonicalTitle;
+  if (rec.id) {
+    trackRow.musicbrainz_id = String(rec.id);
+  }
   syncDatabaseToPersistentDisk();
+  reconcilePlaylistsWithLibrary();
 
   const updated = queryTracks().find((t) => t.id === trackRow.id);
   return {
@@ -1931,3 +2093,84 @@ export async function enrichTrackFromMusicBrainz(trackId: string): Promise<{
     track: updated,
   };
 }
+
+export async function updateTrackMetadataInDb(params: {
+  trackId: string;
+  title?: string;
+  artist?: string;
+  album?: string;
+  year?: number | null;
+  genre?: string;
+  musicbrainzId?: string | null;
+  artistMusicbrainzId?: string | null;
+  albumMusicbrainzId?: string | null;
+}): Promise<FormattedTrackPayload | null> {
+  const trackRow = db.tracks.get(params.trackId);
+  if (!trackRow) return null;
+
+  if (params.title && params.title.trim()) {
+    trackRow.title = params.title.trim();
+  }
+  if (params.musicbrainzId !== undefined) {
+    trackRow.musicbrainz_id = params.musicbrainzId
+      ? String(params.musicbrainzId).trim()
+      : null;
+  }
+
+  const artistRow = trackRow.artist_id
+    ? db.artists.get(trackRow.artist_id)
+    : undefined;
+  if (artistRow) {
+    if (params.artist && params.artist.trim()) {
+      artistRow.name = params.artist.trim();
+      artistRow.sort_name = toSortName(artistRow.name);
+    }
+    if (params.artistMusicbrainzId !== undefined) {
+      artistRow.musicbrainz_id = params.artistMusicbrainzId
+        ? String(params.artistMusicbrainzId).trim()
+        : null;
+    }
+  }
+
+  const albumRow = trackRow.album_id
+    ? db.albums.get(trackRow.album_id)
+    : undefined;
+  if (albumRow) {
+    if (params.album && params.album.trim()) {
+      albumRow.title = params.album.trim();
+    }
+    if (params.year !== undefined) {
+      albumRow.year = params.year ? Number(params.year) : null;
+    }
+    if (params.genre && params.genre.trim()) {
+      albumRow.genre = params.genre.trim();
+    }
+    if (params.albumMusicbrainzId !== undefined) {
+      const relMbid = params.albumMusicbrainzId
+        ? String(params.albumMusicbrainzId).trim()
+        : null;
+      albumRow.musicbrainz_id = relMbid;
+      if (relMbid) {
+        try {
+          const coverResp = await fetch(
+            `https://coverartarchive.org/release/${encodeURIComponent(relMbid)}/front-500`,
+            { signal: AbortSignal.timeout(8000) }
+          );
+          if (coverResp.ok) {
+            const arrBuf = await coverResp.arrayBuffer();
+            const targetCover = path.join(COVERS_DIR, `${albumRow.id}.jpg`);
+            fs.writeFileSync(targetCover, Buffer.from(arrBuf));
+            albumRow.cover_path = targetCover;
+          }
+        } catch {
+          // Cover Art Archive optional
+        }
+      }
+    }
+  }
+
+  syncDatabaseToPersistentDisk();
+  reconcilePlaylistsWithLibrary();
+  return queryTracks().find((t) => t.id === trackRow.id) || null;
+}
+

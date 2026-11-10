@@ -515,6 +515,15 @@ export class MusicProviderManager {
         format: String(r.format || 'MP3').toUpperCase(),
         playCount: Number(r.playCount || 0),
         lastPlayedAt: r.lastPlayedAt ? String(r.lastPlayedAt) : undefined,
+        year: r.year ? Number(r.year) : null,
+        filePath: r.filePath ? String(r.filePath) : undefined,
+        musicbrainzId: r.musicbrainzId ? String(r.musicbrainzId) : null,
+        artistMusicbrainzId: r.artistMusicbrainzId
+          ? String(r.artistMusicbrainzId)
+          : null,
+        albumMusicbrainzId: r.albumMusicbrainzId
+          ? String(r.albumMusicbrainzId)
+          : null,
       }));
 
       let playlists: Playlist[] = [];
@@ -523,23 +532,43 @@ export class MusicProviderManager {
         const rawPlaylists: any[] = Array.isArray(plData?.playlists)
           ? plData.playlists
           : [];
-        playlists = rawPlaylists.map((p) => ({
-          id: String(p.id),
-          name: String(p.name || 'Playlist'),
-          originalName: String(p.originalName || p.name || 'Playlist'),
-          description: String(
-            p.description ||
-              `Local SQLite playlist (${Array.isArray(p.trackIds) ? p.trackIds.length : 0} tracks)`
-          ),
-          source: 'built-in',
-          trackIds: Array.isArray(p.trackIds)
+        playlists = rawPlaylists.map((p) => {
+          const ghostTracks = Array.isArray(p.ghostTracks)
+            ? p.ghostTracks
+                .map((gt: any, idx: number) => ({
+                  id: String(gt?.id || `ghost-${idx}`),
+                  title: String(gt?.title || '').trim(),
+                  artist: String(gt?.artist || 'Unknown Artist').trim(),
+                  album: gt?.album ? String(gt.album).trim() : undefined,
+                  durationSec: gt?.durationSec ? Number(gt.durationSec) : undefined,
+                  matchedTrackId: gt?.matchedTrackId ? String(gt.matchedTrackId) : null,
+                }))
+                .filter((gt: any) => Boolean(gt.title))
+            : undefined;
+          const trackIds = Array.isArray(p.trackIds)
             ? p.trackIds.map((id: any) => String(id))
-            : [],
-          createdAt: String(
-            p.createdAt || new Date().toISOString().slice(0, 10)
-          ),
-          coverAccent: String(p.coverAccent || '#10b981'),
-        }));
+            : [];
+          return {
+            id: String(p.id),
+            name: String(p.name || 'Playlist'),
+            originalName: String(p.originalName || p.name || 'Playlist'),
+            description: String(
+              p.description ||
+                (ghostTracks && ghostTracks.length > 0
+                  ? `Spotify Playlist (${trackIds.length}/${ghostTracks.length} in library)`
+                  : `Local SQLite playlist (${trackIds.length} tracks)`)
+            ),
+            source: 'built-in',
+            trackIds,
+            ghostTracks,
+            linkedSpotifyUrl: p.linkedSpotifyUrl ? String(p.linkedSpotifyUrl) : undefined,
+            autopilotSpotifyUrl: p.autopilotSpotifyUrl ? String(p.autopilotSpotifyUrl) : undefined,
+            createdAt: String(
+              p.createdAt || new Date().toISOString().slice(0, 10)
+            ),
+            coverAccent: String(p.coverAccent || '#10b981'),
+          };
+        });
       }
 
       const hasTracks = tracks.length > 0;
