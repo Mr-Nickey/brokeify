@@ -440,6 +440,8 @@ export const SecurityAndUsersManagerSection: React.FC<
   const [isCreatingKey, setIsCreatingKey] = useState(false);
   const [isCopyingSpec, setIsCopyingSpec] = useState(false);
   const [copiedSpecDone, setCopiedSpecDone] = useState(false);
+  // Unchecked by default so exported spec uses https://your-brokeify-server.com and never leaks a private domain
+  const [includeCurrentServerUrl, setIncludeCurrentServerUrl] = useState(false);
 
   const loadApiKeys = useCallback(async () => {
     try {
@@ -510,7 +512,10 @@ export const SecurityAndUsersManagerSection: React.FC<
   const handleCopyApiHandshakeSpec = async () => {
     setIsCopyingSpec(true);
     try {
-      const resp = await fetch('/api/system/spec?format=json');
+      const query = includeCurrentServerUrl
+        ? '/api/system/spec?format=json&includeCurrentUrl=1'
+        : '/api/system/spec?format=json';
+      const resp = await fetch(query);
       const data = await resp.json();
       const md = String(data?.markdown || '');
       if (md) {
@@ -557,7 +562,7 @@ export const SecurityAndUsersManagerSection: React.FC<
           </div>
           <p className="text-xs sm:text-sm text-zinc-300 max-w-3xl">
             Protect your public domain (e.g.{' '}
-            <code className="text-[#00ff66]">music.flockingreeds.farm</code>)
+            <code className="text-[#00ff66]">https://your-brokeify-server.com</code>)
             from strangers, hackers, and web scrapers. Enable the Login Gate so
             only you and your Friends &amp; Family accounts can access your
             library.
@@ -695,7 +700,7 @@ export const SecurityAndUsersManagerSection: React.FC<
 
           <p className="text-xs font-mono text-zinc-400 leading-relaxed">
             Create accounts for friends and family so they can log in at{' '}
-            <code className="text-zinc-200">music.flockingreeds.farm</code> and
+            <code className="text-zinc-200">https://your-brokeify-server.com</code> and
             stream your music collection from anywhere,{' '}
             <strong className="text-white">
               without being able to change your settings or delete files
@@ -900,11 +905,11 @@ export const SecurityAndUsersManagerSection: React.FC<
             <li>
               • Because your compose mounts{' '}
               <code className="text-[#00ff66]">
-                C:/docker/brokeify/data:/data
+                /path/to/brokeify/data:/data
               </code>
               , your database (<code>/data/brokeify.db</code>), settings (
               <code>/data/config.json</code>), playlists, MBIDs, and cover art{' '}
-              <strong>live on your C: drive outside the container</strong> and{' '}
+              <strong>live on your host storage outside the container</strong> and{' '}
               <strong className="text-[#00ff66]">
                 stay 100% intact across every update
               </strong>
@@ -913,7 +918,7 @@ export const SecurityAndUsersManagerSection: React.FC<
             <li>
               • On startup, Brokeify restores <code>/data/brokeify.db</code>{' '}
               instantly and fast-verifies existing files in <code>/music</code>{' '}
-              (<code>D:/Music:/music:rw</code>) so only newly added songs are
+              (<code>/path/to/your/music:/music:ro</code>) so only newly added songs are
               parsed!
             </li>
           </ul>
@@ -1053,17 +1058,49 @@ export const SecurityAndUsersManagerSection: React.FC<
               <strong className="text-white">
                 Brokeify Android / Android Auto
               </strong>{' '}
-              app? Download or copy the live{' '}
+              app? Download or copy the{' '}
               <code className="text-[#00ff66]">brokeify-api-handshake.md</code>{' '}
-              specification generated directly from this server—complete with
-              your detected base URL, JWT &amp; API key auth flows, HTTP 206
-              byte-range streaming headers, and exact TypeScript/JSON schemas.
+              specification—complete with JWT &amp; Personal API Key auth flows,
+              HTTP 206 byte-range streaming headers, and exact TypeScript/JSON
+              schemas. Defaults to{' '}
+              <code className="text-cyan-300">https://your-brokeify-server.com</code>{' '}
+              so exported specs never leak a private domain by accident.
             </p>
+
+            <label
+              htmlFor="include-current-server-url-checkbox"
+              className="mt-2 flex items-center gap-2.5 rounded-xl border border-zinc-800 bg-zinc-900/70 px-3 py-2 text-xs font-mono text-zinc-200 cursor-pointer hover:border-[#00ff66]/40 transition-colors"
+            >
+              <input
+                id="include-current-server-url-checkbox"
+                type="checkbox"
+                checked={includeCurrentServerUrl}
+                onChange={(e) => setIncludeCurrentServerUrl(e.target.checked)}
+                data-testid="checkbox-include-current-server-url"
+                className="h-4 w-4 rounded border-zinc-700 bg-zinc-950 text-[#00ff66] focus:ring-[#00ff66]"
+              />
+              <span>
+                Include my current server URL{' '}
+                <span className="text-zinc-400">
+                  (embeds{' '}
+                  <code className="text-[#00ff66]">
+                    {typeof window !== 'undefined'
+                      ? window.location.origin
+                      : 'https://your-brokeify-server.com'}
+                  </code>{' '}
+                  instead of placeholder)
+                </span>
+              </span>
+            </label>
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5 pt-2">
             <a
-              href="/api/system/spec"
+              href={
+                includeCurrentServerUrl
+                  ? '/api/system/spec?download=1&includeCurrentUrl=1'
+                  : '/api/system/spec?download=1'
+              }
               download="brokeify-api-handshake.md"
               data-testid="download-api-handshake-btn"
               className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-4 py-2.5 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[40px]"

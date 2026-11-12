@@ -4,8 +4,14 @@ dist/
 coverage/
 .DS_Store
 *.log
+.env
 .env*
 !.env.example
 data/
+*.db
+*.db-wal
+*.db-shm
+brokeify-api-handshake.md
 dev-dist/
 public/assets/aistudio/
+

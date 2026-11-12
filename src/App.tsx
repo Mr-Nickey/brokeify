@@ -57,7 +57,16 @@ import {
   Lock,
   Heart,
   Moon,
+  ChevronDown,
+  Smartphone,
+  HardDrive,
+  Menu,
 } from 'lucide-react';
+import {
+  NotificationCenterBell,
+  inferNotificationCategory,
+  type AppNotificationItem,
+} from './components/NotificationCenterBell';
 import { BrokeifyLogo } from './components/BrokeifyLogo';
 import { SlidingToggle } from './components/SlidingToggle';
 import { SourcesHubView } from './components/SourcesHubView';
@@ -133,13 +142,21 @@ import { CachedArtworkImage, preloadArtworkBatch } from './utils/artworkCache';
 
 type CoreTab = 'library' | 'discover' | 'nowplaying' | 'settings';
 type LibrarySubTab = 'playlists' | 'liked' | 'songs' | 'albums' | 'artists' | 'stats';
-type SettingsSectionTab = 'sources' | 'audiolab' | 'themes' | 'debug';
+type SettingsSectionTab =
+  | 'sources'
+  | 'downloaders'
+  | 'android'
+  | 'security'
+  | 'audiolab'
+  | 'themes'
+  | 'debug';
 
 const PINNED_PLAYLIST_STORAGE_KEY = 'brokeify_pinned_playlist_id_v1';
 const RECENT_TRACKS_STORAGE_KEY = 'brokeify_recent_track_ids_v1';
 const LIKED_TRACKS_STORAGE_KEY = 'brokeify_liked_tracks_v1';
 const DEVICE_VERIFIED_STORAGE_KEY = 'brokeify_device_verified_v1';
 const DEVICE_ID_STORAGE_KEY = 'brokeify_device_id_v1';
+const NOTIFICATIONS_STORAGE_KEY = 'brokeify_notifications_v1';
 
 function getOrCreateDeviceIdentity(): { deviceId: string; deviceName: string } {
   let deviceId = 'dev-default';
@@ -252,8 +269,36 @@ export default function App() {
     )
   );
 
-  // Toast Notification
+  // Toast & Notification Center State
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [mutePopupBanners, setMutePopupBanners] = useState<boolean>(true);
+  const [isMobileSettingsMenuOpen, setIsMobileSettingsMenuOpen] =
+    useState<boolean>(false);
+  const [appNotifications, setAppNotifications] = useState<
+    AppNotificationItem[]
+  >(() => {
+    try {
+      const saved = localStorage.getItem(NOTIFICATIONS_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return [
+      {
+        id: 'notif-welcome-ready',
+        message:
+          'Brokeify SQLite Engine & Notification Center active — alerts collect here to keep your player clean.',
+        category: 'system',
+        createdAt: new Date().toLocaleTimeString(),
+        read: false,
+      },
+    ];
+  });
   const [dismissedJellyfinAlert, setDismissedJellyfinAlert] =
     useState<boolean>(false);
 
@@ -811,12 +856,90 @@ export default function App() {
     [customTheme]
   );
 
-  // Auto-dismiss toast after 4.5s
+  // Route every toastMessage into the Notification Bell Center & auto-dismiss after 4s
   useEffect(() => {
     if (!toastMessage) return;
-    const t = setTimeout(() => setToastMessage(null), 4500);
+    setAppNotifications((prev) => {
+      if (prev[0]?.message === toastMessage) return prev;
+      const nextItem: AppNotificationItem = {
+        id: `notif-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        message: toastMessage,
+        category: inferNotificationCategory(toastMessage),
+        createdAt: new Date().toLocaleTimeString(),
+        read: false,
+      };
+      const updated = [nextItem, ...prev].slice(0, 100);
+      try {
+        localStorage.setItem(
+          NOTIFICATIONS_STORAGE_KEY,
+          JSON.stringify(updated)
+        );
+      } catch {
+        // ignore
+      }
+      return updated;
+    });
+    const t = setTimeout(() => setToastMessage(null), 4000);
     return () => clearTimeout(t);
   }, [toastMessage]);
+
+  const handleMarkNotificationsRead = useCallback((ids: string[]) => {
+    const idSet = new Set(ids);
+    setAppNotifications((prev) => {
+      const updated = prev.map((n) =>
+        idSet.has(n.id) ? { ...n, read: true } : n
+      );
+      try {
+        localStorage.setItem(
+          NOTIFICATIONS_STORAGE_KEY,
+          JSON.stringify(updated)
+        );
+      } catch {
+        // ignore
+      }
+      return updated;
+    });
+  }, []);
+
+  const handleMarkAllNotificationsRead = useCallback(() => {
+    setAppNotifications((prev) => {
+      const updated = prev.map((n) => ({ ...n, read: true }));
+      try {
+        localStorage.setItem(
+          NOTIFICATIONS_STORAGE_KEY,
+          JSON.stringify(updated)
+        );
+      } catch {
+        // ignore
+      }
+      return updated;
+    });
+  }, []);
+
+  const handleDeleteNotifications = useCallback((ids: string[]) => {
+    const idSet = new Set(ids);
+    setAppNotifications((prev) => {
+      const updated = prev.filter((n) => !idSet.has(n.id));
+      try {
+        localStorage.setItem(
+          NOTIFICATIONS_STORAGE_KEY,
+          JSON.stringify(updated)
+        );
+      } catch {
+        // ignore
+      }
+      return updated;
+    });
+  }, []);
+
+  const handleClearAllBellNotifications = useCallback(() => {
+    setAppNotifications([]);
+    try {
+      localStorage.setItem(NOTIFICATIONS_STORAGE_KEY, JSON.stringify([]));
+    } catch {
+      // ignore
+    }
+  }, []);
 
   // Enabled provider types
   const enabledProviderTypes = useMemo(() => {
@@ -2408,13 +2531,17 @@ export default function App() {
         }}
       />
 
-      {/* Toast Notification Banner */}
+      {/* Toast Notification Banner (kept in DOM for accessibility/test status, visually shown only when popup banners are unmuted) */}
       {toastMessage && (
         <div
           role="status"
           aria-live="polite"
           data-testid="instant-mix-toast"
-          className="fixed top-16 right-4 z-50 rounded-xl border border-[#00ff66]/50 bg-zinc-950/95 px-4 py-2.5 text-xs font-mono font-bold text-[#00ff66] shadow-2xl flex items-center gap-2 backdrop-blur-md"
+          className={
+            mutePopupBanners
+              ? 'sr-only'
+              : 'fixed top-16 right-4 z-50 rounded-xl border border-[#00ff66]/50 bg-zinc-950/95 px-4 py-2.5 text-xs font-mono font-bold text-[#00ff66] shadow-2xl flex items-center gap-2 backdrop-blur-md'
+          }
         >
           <Sparkles className="w-4 h-4 text-[#00ff66] shrink-0" />
           <span>{toastMessage}</span>
@@ -2558,8 +2685,20 @@ export default function App() {
             </nav>
           </div>
 
-          {/* Right: PWA Install to Phone 📱, Lock/Security 🔒, Car Mode 🚗 and Settings ⚙️ */}
+          {/* Right: Notification Bell 🔔, PWA Install to Phone 📱, Lock/Security 🔒, Car Mode 🚗 and Settings ⚙️ */}
           <div className="flex items-center gap-2 shrink-0 ml-auto">
+            <NotificationCenterBell
+              notifications={appNotifications}
+              onMarkAsRead={handleMarkNotificationsRead}
+              onMarkAllRead={handleMarkAllNotificationsRead}
+              onDeleteSelected={handleDeleteNotifications}
+              onClearAll={handleClearAllBellNotifications}
+              mutePopupBanners={mutePopupBanners}
+              onToggleMutePopupBanners={() =>
+                setMutePopupBanners((prev) => !prev)
+              }
+            />
+
             <PWAInstallButton />
 
             <button
@@ -5641,106 +5780,377 @@ export default function App() {
         )}
 
         {/* =====================================================================
-            TAB 3: SETTINGS & TOOLS (CLEAN 4-SECTION LAYOUT WITH DEBUG & ERROR LOGS)
+            TAB 3: SETTINGS & TOOLS (LEFT-HAND TABBED SIDEBAR + MOBILE COLLAPSIBLE MENU)
            ===================================================================== */}
         {activeTab === 'settings' && (
-          <section aria-label="Settings and Tools" className="space-y-6">
-            {/* Clean 4-Step Settings Header */}
-            <div className="winamp-bezel rounded-2xl border border-zinc-700/80 p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-              <div className="space-y-1">
-                <h1 className="text-lg font-bold text-white font-mono">
-                  Settings &amp; Easy Setup Guide
-                </h1>
-                <p className="text-xs sm:text-sm text-zinc-300 max-w-2xl">
-                  Everything is organized into 4 simple tabs below: connect your
-                  music server &amp; downloaders in{' '}
-                  <strong className="text-[#00ff66]">
-                    1. Server &amp; Connections
-                  </strong>
-                  , tune your car stereo sound in{' '}
-                  <strong className="text-[#00ff66]">
-                    2. Sound, Car Stereo &amp; Offline
-                  </strong>
-                  , customize colors &amp; CSS in{' '}
-                  <strong className="text-[#00ff66]">
-                    3. Themes &amp; Custom CSS
-                  </strong>
-                  , or inspect connection health &amp; errors in{' '}
-                  <strong className="text-[#00ff66]">
-                    4. Debug &amp; Error Logs
-                  </strong>
-                  .
-                </p>
+          <section
+            aria-label="Settings and Tools"
+            className="space-y-4"
+            data-testid="settings-page-container"
+          >
+            {/* Compact Top Settings Bar */}
+            <div className="winamp-bezel rounded-2xl border border-zinc-700/80 px-4 py-3.5 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <Settings className="w-5 h-5 text-[#00ff66] shrink-0" />
+                <div className="min-w-0">
+                  <h1 className="text-base sm:text-lg font-bold text-white font-mono truncate">
+                    Server Settings &amp; Control Center
+                  </h1>
+                  <p className="text-xs text-zinc-400 hidden sm:block">
+                    Select a category on the left to configure your music drive,
+                    downloaders, Android companion app, security gate, or audio
+                    engine.
+                  </p>
+                </div>
               </div>
 
-              <div className="flex flex-wrap items-center gap-2">
+              <div className="flex items-center gap-2 shrink-0">
                 <button
                   type="button"
                   onClick={() => setIsOnboardingOpen(true)}
                   data-testid="settings-manage-providers-btn"
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-purple-600 hover:bg-purple-500 px-3.5 py-2 text-xs font-mono font-bold text-white shadow-sm transition-colors min-h-[40px]"
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-purple-600 hover:bg-purple-500 px-3.5 py-2 text-xs font-mono font-bold text-white shadow-sm transition-colors min-h-[38px]"
                 >
                   <Server className="w-3.5 h-3.5" />
                   <span>Quick Connect Wizard</span>
                 </button>
+              </div>
+            </div>
+
+            {/* Mobile Collapsible Category Selector (Visible on screens < lg) */}
+            <div className="lg:hidden winamp-bezel rounded-2xl border border-zinc-700/90 bg-zinc-950/95 overflow-hidden">
+              <button
+                type="button"
+                onClick={() => setIsMobileSettingsMenuOpen((prev) => !prev)}
+                data-testid="settings-mobile-menu-toggle"
+                aria-expanded={isMobileSettingsMenuOpen}
+                className="w-full px-4 py-3.5 flex items-center justify-between gap-3 text-left font-mono"
+              >
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <Menu className="w-4 h-4 text-[#00ff66] shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-[10px] uppercase tracking-wider text-zinc-400">
+                      Settings Section (Tap to Switch)
+                    </div>
+                    <div className="text-xs sm:text-sm font-bold text-white truncate">
+                      {settingsSubTab === 'sources' &&
+                        '1. Music Drive & SQLite Library'}
+                      {settingsSubTab === 'downloaders' &&
+                        '2. Auto-Downloaders & Scrobbler'}
+                      {settingsSubTab === 'android' &&
+                        '3. Connect Android App (QR / PIN)'}
+                      {settingsSubTab === 'security' &&
+                        '4. Security Gate, Users & API Keys'}
+                      {settingsSubTab === 'audiolab' &&
+                        '5. Sound, Car Stereo & Offline'}
+                      {settingsSubTab === 'themes' &&
+                        '6. Themes & Custom CSS'}
+                      {settingsSubTab === 'debug' &&
+                        '7. System Health & Debug Logs'}
+                    </div>
+                  </div>
+                </div>
+                <div className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs text-[#00ff66] shrink-0">
+                  <span>{isMobileSettingsMenuOpen ? 'Close' : 'Menu'}</span>
+                  {isMobileSettingsMenuOpen ? (
+                    <ChevronUp className="w-4 h-4" />
+                  ) : (
+                    <ChevronDown className="w-4 h-4" />
+                  )}
+                </div>
+              </button>
+
+              {isMobileSettingsMenuOpen && (
+                <div
+                  data-testid="settings-mobile-menu-list"
+                  className="px-3 pb-3 pt-1 border-t border-zinc-800/80 grid grid-cols-1 sm:grid-cols-2 gap-1.5"
+                >
+                  {(
+                    [
+                      {
+                        id: 'sources',
+                        label: '1. Music Drive & SQLite',
+                        sub: '/music mount, rescan & cache',
+                        icon: HardDrive,
+                      },
+                      {
+                        id: 'downloaders',
+                        label: '2. Downloaders & Scrobbler',
+                        sub: 'slskd, Lidarr, yt-dlp, ListenBrainz',
+                        icon: ArrowDownToLine,
+                      },
+                      {
+                        id: 'android',
+                        label: '3. Connect Android App',
+                        sub: '6-digit Quick Connect & QR code',
+                        icon: Smartphone,
+                      },
+                      {
+                        id: 'security',
+                        label: '4. Security, Users & API Keys',
+                        sub: 'Login gate, family & API handshake',
+                        icon: ShieldCheck,
+                      },
+                      {
+                        id: 'audiolab',
+                        label: '5. Sound, Car Stereo & Offline',
+                        sub: '-14 LUFS, 5-Band EQ & Road-Trip Vault',
+                        icon: Sliders,
+                      },
+                      {
+                        id: 'themes',
+                        label: '6. Themes & Custom CSS',
+                        sub: 'Skins, accent colors & live CSS',
+                        icon: Palette,
+                      },
+                      {
+                        id: 'debug',
+                        label: '7. Health & Debug Logs',
+                        sub: 'Uptime Kuma, Dozzle & diagnostics',
+                        icon: Bug,
+                      },
+                    ] as const
+                  ).map((item) => {
+                    const IconComp = item.icon;
+                    const active = settingsSubTab === item.id;
+                    return (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => {
+                          setSettingsSubTab(item.id);
+                          setIsMobileSettingsMenuOpen(false);
+                        }}
+                        className={`w-full rounded-xl px-3.5 py-2.5 text-left font-mono transition-colors flex items-center gap-3 ${
+                          active
+                            ? 'bg-[#00ff66] text-zinc-950 font-bold'
+                            : 'bg-zinc-900/90 text-zinc-200 hover:bg-zinc-800 border border-zinc-800'
+                        }`}
+                      >
+                        <IconComp className="w-4 h-4 shrink-0" />
+                        <div className="min-w-0 flex-1">
+                          <div className="text-xs font-bold truncate">
+                            {item.label}
+                          </div>
+                          <div
+                            className={`text-[10px] truncate ${
+                              active ? 'text-zinc-900' : 'text-zinc-400'
+                            }`}
+                          >
+                            {item.sub}
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Desktop Left-Hand Sidebar + Right Content Pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+              {/* Left-Hand Vertical Tabs Sidebar (Desktop) */}
+              <aside
+                aria-label="Settings Categories"
+                data-testid="settings-left-sidebar"
+                className="hidden lg:flex lg:col-span-3 flex-col gap-1.5 winamp-bezel rounded-2xl border border-zinc-800 bg-zinc-950/90 p-3 sticky top-20"
+              >
+                <div className="px-2.5 py-1.5 text-[10px] font-mono font-bold uppercase tracking-wider text-zinc-400 border-b border-zinc-800/80 mb-1">
+                  Settings Categories
+                </div>
 
                 <button
                   type="button"
                   onClick={() => setSettingsSubTab('sources')}
                   data-testid="settings-subtab-sources"
-                  className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-mono font-bold transition-colors min-h-[40px] ${
+                  className={`w-full rounded-xl px-3.5 py-3 text-left font-mono transition-all flex items-start gap-3 ${
                     settingsSubTab === 'sources'
-                      ? 'bg-[#00ff66] text-zinc-950'
-                      : 'bg-zinc-950 text-zinc-300 hover:text-white border border-zinc-800'
+                      ? 'bg-[#00ff66] text-zinc-950 font-bold shadow-md'
+                      : 'text-zinc-300 hover:text-white hover:bg-zinc-900/80'
                   }`}
                 >
-                  <Server className="w-3.5 h-3.5" />
-                  <span>1. Server &amp; Connections</span>
+                  <HardDrive className="w-4 h-4 shrink-0 mt-0.5" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-bold">
+                      1. Music Drive &amp; SQLite
+                    </div>
+                    <div
+                      className={`text-[10px] mt-0.5 leading-snug ${
+                        settingsSubTab === 'sources'
+                          ? 'text-zinc-900 font-medium'
+                          : 'text-zinc-400'
+                      }`}
+                    >
+                      /music mount, scanner &amp; cache
+                    </div>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setSettingsSubTab('downloaders')}
+                  data-testid="settings-subtab-downloaders"
+                  className={`w-full rounded-xl px-3.5 py-3 text-left font-mono transition-all flex items-start gap-3 ${
+                    settingsSubTab === 'downloaders'
+                      ? 'bg-[#00ff66] text-zinc-950 font-bold shadow-md'
+                      : 'text-zinc-300 hover:text-white hover:bg-zinc-900/80'
+                  }`}
+                >
+                  <ArrowDownToLine className="w-4 h-4 shrink-0 mt-0.5" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-bold">
+                      2. Downloaders &amp; Scrobbler
+                    </div>
+                    <div
+                      className={`text-[10px] mt-0.5 leading-snug ${
+                        settingsSubTab === 'downloaders'
+                          ? 'text-zinc-900 font-medium'
+                          : 'text-zinc-400'
+                      }`}
+                    >
+                      slskd, Lidarr, yt-dlp &amp; ListenBrainz
+                    </div>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setSettingsSubTab('android')}
+                  data-testid="settings-subtab-android"
+                  className={`w-full rounded-xl px-3.5 py-3 text-left font-mono transition-all flex items-start gap-3 ${
+                    settingsSubTab === 'android'
+                      ? 'bg-[#00ff66] text-zinc-950 font-bold shadow-md'
+                      : 'text-zinc-300 hover:text-white hover:bg-zinc-900/80'
+                  }`}
+                >
+                  <Smartphone className="w-4 h-4 shrink-0 mt-0.5" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-bold">
+                      3. Connect Android App
+                    </div>
+                    <div
+                      className={`text-[10px] mt-0.5 leading-snug ${
+                        settingsSubTab === 'android'
+                          ? 'text-zinc-900 font-medium'
+                          : 'text-zinc-400'
+                      }`}
+                    >
+                      6-digit Quick Connect &amp; QR code
+                    </div>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setSettingsSubTab('security')}
+                  data-testid="settings-subtab-security"
+                  className={`w-full rounded-xl px-3.5 py-3 text-left font-mono transition-all flex items-start gap-3 ${
+                    settingsSubTab === 'security'
+                      ? 'bg-[#00ff66] text-zinc-950 font-bold shadow-md'
+                      : 'text-zinc-300 hover:text-white hover:bg-zinc-900/80'
+                  }`}
+                >
+                  <ShieldCheck className="w-4 h-4 shrink-0 mt-0.5" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-bold">
+                      4. Security, Users &amp; API Keys
+                    </div>
+                    <div
+                      className={`text-[10px] mt-0.5 leading-snug ${
+                        settingsSubTab === 'security'
+                          ? 'text-zinc-900 font-medium'
+                          : 'text-zinc-400'
+                      }`}
+                    >
+                      Login gate, family &amp; API handshake
+                    </div>
+                  </div>
                 </button>
 
                 <button
                   type="button"
                   onClick={() => setSettingsSubTab('audiolab')}
                   data-testid="settings-subtab-audiolab"
-                  className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-mono font-bold transition-colors min-h-[40px] ${
+                  className={`w-full rounded-xl px-3.5 py-3 text-left font-mono transition-all flex items-start gap-3 ${
                     settingsSubTab === 'audiolab'
-                      ? 'bg-[#00ff66] text-zinc-950'
-                      : 'bg-zinc-950 text-zinc-300 hover:text-white border border-zinc-800'
+                      ? 'bg-[#00ff66] text-zinc-950 font-bold shadow-md'
+                      : 'text-zinc-300 hover:text-white hover:bg-zinc-900/80'
                   }`}
                 >
-                  <Sliders className="w-3.5 h-3.5" />
-                  <span>2. Sound, Car Stereo &amp; Offline</span>
+                  <Sliders className="w-4 h-4 shrink-0 mt-0.5" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-bold">
+                      5. Sound, Car Stereo &amp; Offline
+                    </div>
+                    <div
+                      className={`text-[10px] mt-0.5 leading-snug ${
+                        settingsSubTab === 'audiolab'
+                          ? 'text-zinc-900 font-medium'
+                          : 'text-zinc-400'
+                      }`}
+                    >
+                      -14 LUFS, 5-Band EQ &amp; Offline Vault
+                    </div>
+                  </div>
                 </button>
 
                 <button
                   type="button"
                   onClick={() => setSettingsSubTab('themes')}
                   data-testid="settings-subtab-themes"
-                  className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-mono font-bold transition-colors min-h-[40px] ${
+                  className={`w-full rounded-xl px-3.5 py-3 text-left font-mono transition-all flex items-start gap-3 ${
                     settingsSubTab === 'themes'
-                      ? 'bg-[#00ff66] text-zinc-950'
-                      : 'bg-zinc-950 text-zinc-300 hover:text-white border border-zinc-800'
+                      ? 'bg-[#00ff66] text-zinc-950 font-bold shadow-md'
+                      : 'text-zinc-300 hover:text-white hover:bg-zinc-900/80'
                   }`}
                 >
-                  <Palette className="w-3.5 h-3.5" />
-                  <span>3. Themes &amp; Custom CSS</span>
+                  <Palette className="w-4 h-4 shrink-0 mt-0.5" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-bold">
+                      6. Themes &amp; Custom CSS
+                    </div>
+                    <div
+                      className={`text-[10px] mt-0.5 leading-snug ${
+                        settingsSubTab === 'themes'
+                          ? 'text-zinc-900 font-medium'
+                          : 'text-zinc-400'
+                      }`}
+                    >
+                      Visual skins, colors &amp; custom CSS
+                    </div>
+                  </div>
                 </button>
 
                 <button
                   type="button"
                   onClick={() => setSettingsSubTab('debug')}
                   data-testid="settings-subtab-debug"
-                  className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-mono font-bold transition-colors min-h-[40px] ${
+                  className={`w-full rounded-xl px-3.5 py-3 text-left font-mono transition-all flex items-start justify-between gap-2 ${
                     settingsSubTab === 'debug'
-                      ? 'bg-[#00ff66] text-zinc-950'
-                      : 'bg-zinc-950 text-zinc-300 hover:text-white border border-zinc-800'
+                      ? 'bg-[#00ff66] text-zinc-950 font-bold shadow-md'
+                      : 'text-zinc-300 hover:text-white hover:bg-zinc-900/80'
                   }`}
                 >
-                  <Bug className="w-3.5 h-3.5" />
-                  <span>4. Debug &amp; Error Logs</span>
+                  <div className="flex items-start gap-3 min-w-0">
+                    <Bug className="w-4 h-4 shrink-0 mt-0.5" />
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold">
+                        7. Health &amp; Debug Logs
+                      </div>
+                      <div
+                        className={`text-[10px] mt-0.5 leading-snug ${
+                          settingsSubTab === 'debug'
+                            ? 'text-zinc-900 font-medium'
+                            : 'text-zinc-400'
+                        }`}
+                      >
+                        Uptime Kuma, Dozzle &amp; diagnostics
+                      </div>
+                    </div>
+                  </div>
                   {debugErrorCount > 0 && (
                     <span
-                      className={`rounded-full px-1.5 py-0.2 text-[10px] font-mono font-bold ${
+                      className={`rounded-full px-1.5 py-0.5 text-[10px] font-mono font-bold shrink-0 ${
                         settingsSubTab === 'debug'
                           ? 'bg-zinc-950 text-rose-400'
                           : 'bg-rose-500/25 border border-rose-500/50 text-rose-300'
@@ -5750,126 +6160,145 @@ export default function App() {
                     </span>
                   )}
                 </button>
-              </div>
-            </div>
+              </aside>
 
-            {settingsSubTab === 'sources' && (
-              <SourcesHubView
-                providers={providers}
-                onUpdateProviders={handleUpdateProviders}
-                onMergeRemoteTracks={handleMergeRemoteTracks}
-                onMergeRemotePlaylists={handleMergeRemotePlaylists}
-                storagePersistStatus={storagePersistStatus}
-                cloudSyncStatus={cloudSyncStatus}
-                onPushCloudSettings={() => handlePushCloudSettings()}
-                onPullCloudSettings={(cfg) => handlePullCloudSettings(cfg)}
-                onApplyRestoredCloudSettings={handleApplyRestoredCloudSettings}
-                onOpenOnboardingModal={() => setIsOnboardingOpen(true)}
-                onLogoutProvider={handleLogoutProvider}
-                serverIntegrations={serverIntegrations}
-                serverConfigPath={serverConfigPath}
-                onUpdateServerIntegrations={(next) => {
-                  setServerIntegrations(next);
-                }}
-                onSaveServerConfigNow={async () => {
-                  await saveConfigToServer(serverIntegrations);
-                  setToastMessage(
-                    `💾 Saved configuration & keys to ${serverConfigPath}`
-                  );
-                }}
-                onLockDeviceForLogin={handleLockDeviceForLogin}
-                currentUser={authSession.user}
-                requireLogin={authSession.requireLogin}
-                onAuthConfigChanged={(nextRequireLogin) => {
-                  setAuthSession((prev) => ({
-                    ...prev,
-                    requireLogin: nextRequireLogin,
-                  }));
-                }}
-                onLockAndSignOut={handleLockAndSignOut}
-                onShowToast={(msg) => setToastMessage(msg)}
-              />
-            )}
+              {/* Right Content Panel */}
+              <div className="lg:col-span-9 min-w-0 space-y-6">
+                {(settingsSubTab === 'sources' ||
+                  settingsSubTab === 'downloaders' ||
+                  settingsSubTab === 'android' ||
+                  settingsSubTab === 'security') && (
+                  <SourcesHubView
+                    providers={providers}
+                    onUpdateProviders={handleUpdateProviders}
+                    onMergeRemoteTracks={handleMergeRemoteTracks}
+                    onMergeRemotePlaylists={handleMergeRemotePlaylists}
+                    storagePersistStatus={storagePersistStatus}
+                    cloudSyncStatus={cloudSyncStatus}
+                    onPushCloudSettings={() => handlePushCloudSettings()}
+                    onPullCloudSettings={(cfg) => handlePullCloudSettings(cfg)}
+                    onApplyRestoredCloudSettings={
+                      handleApplyRestoredCloudSettings
+                    }
+                    onOpenOnboardingModal={() => setIsOnboardingOpen(true)}
+                    onLogoutProvider={handleLogoutProvider}
+                    serverIntegrations={serverIntegrations}
+                    serverConfigPath={serverConfigPath}
+                    onUpdateServerIntegrations={(next) => {
+                      setServerIntegrations(next);
+                    }}
+                    onSaveServerConfigNow={async () => {
+                      await saveConfigToServer(serverIntegrations);
+                      setToastMessage(
+                        `💾 Saved configuration & keys to ${serverConfigPath}`
+                      );
+                    }}
+                    onLockDeviceForLogin={handleLockDeviceForLogin}
+                    currentUser={authSession.user}
+                    requireLogin={authSession.requireLogin}
+                    onAuthConfigChanged={(nextRequireLogin) => {
+                      setAuthSession((prev) => ({
+                        ...prev,
+                        requireLogin: nextRequireLogin,
+                      }));
+                    }}
+                    onLockAndSignOut={handleLockAndSignOut}
+                    onShowToast={(msg) => setToastMessage(msg)}
+                    sectionFilter={
+                      settingsSubTab === 'sources'
+                        ? 'storage'
+                        : settingsSubTab
+                    }
+                  />
+                )}
 
-            {settingsSubTab === 'audiolab' && (
-              <div className="space-y-6">
-                <div className="winamp-bezel rounded-2xl border border-zinc-700/80 p-4 flex flex-wrap items-center justify-between gap-4">
-                  <div className="space-y-0.5">
-                    <div className="text-xs font-mono font-bold text-[#00ff66] uppercase">
-                      Road-Trip &amp; Dead-Zone Mode
+                {settingsSubTab === 'audiolab' && (
+                  <div className="space-y-6">
+                    <div className="winamp-bezel rounded-2xl border border-zinc-700/80 p-4 flex flex-wrap items-center justify-between gap-4">
+                      <div className="space-y-0.5">
+                        <div className="text-xs font-mono font-bold text-[#00ff66] uppercase">
+                          Road-Trip &amp; Dead-Zone Mode
+                        </div>
+                        <p className="text-xs text-zinc-300">
+                          Turn on Offline Only Mode when driving through areas
+                          with weak cell service so Brokeify only plays songs
+                          already stored on your device.
+                        </p>
+                      </div>
+                      <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 px-3.5 py-2 flex items-center">
+                        <SlidingToggle
+                          checked={offlineOnlyMode}
+                          onChange={setOfflineOnlyMode}
+                          label={`Offline Only Mode (${audio.cachedTrackIds.size} cached)`}
+                          ariaLabel="Toggle Offline Only Mode"
+                          size="sm"
+                          testId="settings-toggle-offline-mode"
+                        />
+                      </div>
                     </div>
-                    <p className="text-xs text-zinc-300">
-                      Turn on Offline Only Mode when driving through areas with
-                      weak cell service so Brokeify only plays songs already
-                      stored on your device.
-                    </p>
-                  </div>
-                  <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 px-3.5 py-2 flex items-center">
-                    <SlidingToggle
-                      checked={offlineOnlyMode}
-                      onChange={setOfflineOnlyMode}
-                      label={`Offline Only Mode (${audio.cachedTrackIds.size} cached)`}
-                      ariaLabel="Toggle Offline Only Mode"
-                      size="sm"
-                      testId="settings-toggle-offline-mode"
+
+                    <AudioLabVaultView
+                      currentTrack={audio.currentTrack}
+                      allTracks={allTracks}
+                      carVolumeLeveler={audio.carVolumeLeveler}
+                      onToggleCarVolumeLeveler={audio.setCarVolumeLeveler}
+                      stabilizerStrength={audio.stabilizerStrength}
+                      onChangeStabilizerStrength={audio.setStabilizerStrength}
+                      lufsNormalizationEnabled={audio.lufsNormalizationEnabled}
+                      onToggleLufsNormalization={
+                        audio.setLufsNormalizationEnabled
+                      }
+                      smartAntiRepeatEnabled={audio.smartAntiRepeatEnabled}
+                      onToggleSmartAntiRepeat={audio.setSmartAntiRepeatEnabled}
+                      crossfadeSeconds={audio.crossfadeSeconds}
+                      onChangeCrossfadeSeconds={audio.setCrossfadeSeconds}
+                      offlinePreloadCount={audio.offlinePreloadCount}
+                      onChangeOfflinePreloadCount={
+                        audio.setOfflinePreloadCount
+                      }
+                      streamBufferSeconds={audio.streamBufferSeconds}
+                      onChangeStreamBufferSeconds={
+                        audio.setStreamBufferSeconds
+                      }
+                      bufferedAheadSeconds={audio.bufferedAheadSeconds}
+                      eqPreset={audio.eqPreset}
+                      eqGains={audio.eqGains}
+                      onApplyPreset={audio.applyEqPreset}
+                      onUpdateBand={audio.updateEqBand}
+                      cachedTrackIds={audio.cachedTrackIds}
+                      vaultTotalBytes={audio.vaultTotalBytes}
+                      onRefreshVault={audio.refreshVaultState}
+                      onPlayTrack={(track) =>
+                        audio.playSpecificTrack(track, allTracks)
+                      }
                     />
                   </div>
-                </div>
+                )}
 
-                <AudioLabVaultView
-                  currentTrack={audio.currentTrack}
-                  allTracks={allTracks}
-                  carVolumeLeveler={audio.carVolumeLeveler}
-                  onToggleCarVolumeLeveler={audio.setCarVolumeLeveler}
-                  stabilizerStrength={audio.stabilizerStrength}
-                  onChangeStabilizerStrength={audio.setStabilizerStrength}
-                  lufsNormalizationEnabled={audio.lufsNormalizationEnabled}
-                  onToggleLufsNormalization={audio.setLufsNormalizationEnabled}
-                  smartAntiRepeatEnabled={audio.smartAntiRepeatEnabled}
-                  onToggleSmartAntiRepeat={audio.setSmartAntiRepeatEnabled}
-                  crossfadeSeconds={audio.crossfadeSeconds}
-                  onChangeCrossfadeSeconds={audio.setCrossfadeSeconds}
-                  offlinePreloadCount={audio.offlinePreloadCount}
-                  onChangeOfflinePreloadCount={audio.setOfflinePreloadCount}
-                  streamBufferSeconds={audio.streamBufferSeconds}
-                  onChangeStreamBufferSeconds={audio.setStreamBufferSeconds}
-                  bufferedAheadSeconds={audio.bufferedAheadSeconds}
-                  eqPreset={audio.eqPreset}
-                  eqGains={audio.eqGains}
-                  onApplyPreset={audio.applyEqPreset}
-                  onUpdateBand={audio.updateEqBand}
-                  cachedTrackIds={audio.cachedTrackIds}
-                  vaultTotalBytes={audio.vaultTotalBytes}
-                  onRefreshVault={audio.refreshVaultState}
-                  onPlayTrack={(track) =>
-                    audio.playSpecificTrack(track, allTracks)
-                  }
-                />
+                {settingsSubTab === 'themes' && (
+                  <ThemesCustomCssView
+                    visualTheme={audio.visualTheme}
+                    onChangeVisualTheme={audio.setVisualTheme}
+                    customTheme={customTheme}
+                    onChangeCustomTheme={setCustomTheme}
+                    onSaveThemeToServer={async (nextTheme) => {
+                      await saveConfigToServer(
+                        serverIntegrations,
+                        discoveryFilters,
+                        nextTheme
+                      );
+                    }}
+                    onShowToast={(msg) => setToastMessage(msg)}
+                  />
+                )}
+
+                {settingsSubTab === 'debug' && (
+                  <DebugLogsView
+                    onShowToast={(msg) => setToastMessage(msg)}
+                  />
+                )}
               </div>
-            )}
-
-            {settingsSubTab === 'themes' && (
-              <ThemesCustomCssView
-                visualTheme={audio.visualTheme}
-                onChangeVisualTheme={audio.setVisualTheme}
-                customTheme={customTheme}
-                onChangeCustomTheme={setCustomTheme}
-                onSaveThemeToServer={async (nextTheme) => {
-                  await saveConfigToServer(
-                    serverIntegrations,
-                    discoveryFilters,
-                    nextTheme
-                  );
-                }}
-                onShowToast={(msg) => setToastMessage(msg)}
-              />
-            )}
-
-            {settingsSubTab === 'debug' && (
-              <DebugLogsView
-                onShowToast={(msg) => setToastMessage(msg)}
-              />
-            )}
+            </div>
           </section>
         )}
       </main>

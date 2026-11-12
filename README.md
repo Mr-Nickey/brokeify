@@ -72,15 +72,14 @@ services:
       - BROKEIFY_DATA_DIR=/data
       - BROKEIFY_MUSIC_DIR=/music
       # Optional downloader & scrobbler integrations (can also be configured in Web UI Settings):
-      # - SLSKD_URL=http://192.168.1.175:5030
+      # - SLSKD_URL=http://slskd:5030
       # - SLSKD_API_KEY=your_slskd_api_key
       # - LISTENBRAINZ_USER=your_listenbrainz_username
     volumes:
-      - /c/docker/brokeify/data:/data
+      - /path/to/brokeify/data:/data
       # Mount your local hard drive or NAS music folder to /music inside the container:
-      # Windows Docker / WSL2 example: /d/Message:/music:rw
-      # Linux / NAS example: /mnt/nas/music:/music:rw
-      - /d/Message:/music:rw
+      # Linux / NAS example: /mnt/nas/music:/music:ro
+      - /path/to/your/music:/music:ro
 ```
 
 4. Click **Deploy** (and whenever a new version is pushed to GitHub, click **Update** in Dockge or run `docker compose pull && docker compose up -d`).
@@ -136,8 +135,8 @@ Download the Android app (**Android-only for now**) from **[github.com/Mr-Nickey
 {
   "app": "brokeify",
   "v": 1,
-  "serverUrl": "http://192.168.1.175:3487",
-  "localUrl": "http://192.168.1.175:3487",
+  "serverUrl": "https://your-brokeify-server.com",
+  "localUrl": "http://192.168.1.100:3487",
   "token": "pair_a1b2c3d4e5f6...",
   "apiKey": "brk_9f8e7d6c5b4a...",
   "endpoints": {

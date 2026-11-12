@@ -2193,7 +2193,7 @@ function detectLanIpv4(): string {
   } catch {
     // ignore
   }
-  return '192.168.1.175';
+  return '127.0.0.1';
 }
 
 interface PairedAndroidDevice {
@@ -3319,7 +3319,7 @@ app.get('/api/history/recent', (req, res) => {
 // 2C. DYNAMIC API HANDSHAKE SPECIFICATION (/api/system/spec)
 // ============================================================================
 
-app.get('/api/system/spec', (req, res) => {
+app.get(['/api/system/spec', '/api/docs/handshake'], (req, res) => {
   const port = Number(process.env.PORT || 3487);
   const proto = String(
     req.headers['x-forwarded-proto'] || req.protocol || 'http'
@@ -3331,7 +3331,16 @@ app.get('/api/system/spec', (req, res) => {
   )
     .split(',')[0]
     .trim();
-  const baseUrl = `${proto}://${host}`;
+  const includeCurrentUrl =
+    req.query.includeCurrentUrl === '1' ||
+    req.query.includeCurrentUrl === 'true';
+  const customBaseUrl =
+    typeof req.query.baseUrl === 'string' && req.query.baseUrl.trim()
+      ? req.query.baseUrl.trim().replace(/\/+$/, '')
+      : null;
+  const baseUrl =
+    customBaseUrl ||
+    (includeCurrentUrl ? `${proto}://${host}` : 'https://your-brokeify-server.com');
   const counts = getLocalLibraryStats();
   const cfg = readServerConfig();
 
@@ -5319,7 +5328,7 @@ app.post('/api/slskd/test', async (req, res) => {
       return res.status(400).json({
         ok: false,
         error:
-          'Enter your slskd URL first (e.g. http://192.168.1.175:5030 or http://slskd:5030).',
+          'Enter your slskd URL first (e.g. http://slskd:5030 or http://192.168.1.100:5030).',
       });
     }
 
@@ -5362,7 +5371,7 @@ app.post('/api/slskd/test', async (req, res) => {
       return res.status(502).json({
         ok: false,
         error: `Unreachable at ${slskdUrl}: ${errMsg}`,
-        hint: `If slskd is on another Docker compose stack, use your host LAN IP like http://192.168.1.175:5030.`,
+        hint: `If slskd is on another Docker compose stack, use http://slskd:5030 or your host LAN IP.`,
       });
     }
 
@@ -5409,7 +5418,7 @@ app.post('/api/listenbrainz/test', async (req, res) => {
     if (!username) {
       return res.status(400).json({
         ok: false,
-        error: 'Enter your ListenBrainz username first (e.g. crazynick17).',
+        error: 'Enter your ListenBrainz username first (e.g. your_username).',
       });
     }
 
@@ -5543,7 +5552,7 @@ app.post('/api/services/test-all', async (req, res) => {
       slskdStatus = {
         ok: false,
         message: `Unreachable at ${slskdCreds.slskdUrl}`,
-        hint: 'Use host LAN IP (http://192.168.1.175:5030) or share Docker network.',
+        hint: 'Use http://slskd:5030 on a shared Docker network or your host LAN IP.',
       };
     }
   }

@@ -80,7 +80,7 @@ const AndroidQrPairingPanel: React.FC<AndroidQrContentProps> = ({
   const browserOrigin =
     typeof window !== 'undefined'
       ? window.location.origin.replace(/\/+$/, '')
-      : 'http://192.168.1.175:3487';
+      : 'http://localhost:3487';
 
   const isCustomDomainInBrowser = useMemo(() => {
     if (typeof window === 'undefined') return false;
@@ -153,7 +153,7 @@ const AndroidQrPairingPanel: React.FC<AndroidQrContentProps> = ({
       browserOrigin ||
       pairInfo?.detectedBrowserUrl ||
       pairInfo?.serverUrl ||
-      'http://192.168.1.175:3487'
+      'http://localhost:3487'
     ).replace(/\/+$/, '');
   }, [browserOrigin, pairInfo?.detectedBrowserUrl, pairInfo?.serverUrl]);
 
@@ -162,7 +162,7 @@ const AndroidQrPairingPanel: React.FC<AndroidQrContentProps> = ({
       return (
         pairInfo?.localUrl ||
         pairInfo?.lanUrl ||
-        'http://192.168.1.175:3487'
+        'http://localhost:3487'
       ).replace(/\/+$/, '');
     }
     if (urlMode === 'custom') {
@@ -232,7 +232,7 @@ const AndroidQrPairingPanel: React.FC<AndroidQrContentProps> = ({
   const qrPayloadString = useMemo(() => {
     const apiKey = pairInfo?.apiKey || 'brk_standalone';
     const localUrl =
-      pairInfo?.localUrl || pairInfo?.lanUrl || 'http://192.168.1.175:3487';
+      pairInfo?.localUrl || pairInfo?.lanUrl || 'http://localhost:3487';
 
     if (payloadFormat === 'deeplink') {
       const params = new URLSearchParams({
@@ -631,7 +631,7 @@ const AndroidQrPairingPanel: React.FC<AndroidQrContentProps> = ({
                   setUrlMode('custom');
                   setCustomServerUrl(e.target.value);
                 }}
-                placeholder="https://music.flockingreeds.farm or http://192.168.1.175:3487"
+                placeholder="https://your-brokeify-server.com or http://192.168.1.100:3487"
                 data-testid="android-qr-server-url-input"
                 className="flex-1 rounded-xl border border-zinc-700 bg-zinc-900 px-3.5 py-2.5 text-xs sm:text-sm font-mono text-white focus:border-[#00ff66] focus:outline-none"
               />

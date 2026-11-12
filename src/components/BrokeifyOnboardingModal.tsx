@@ -66,16 +66,14 @@ const DOCKER_COMPOSE_LOCAL_EXAMPLE = `services:
       - PORT=3487
       - BROKEIFY_DATA_DIR=/data
       - BROKEIFY_MUSIC_DIR=/music
-      - SLSKD_URL=http://192.168.1.175:5030
+      - SLSKD_URL=http://slskd:5030
       - SLSKD_API_KEY=your_slskd_api_key
       - LISTENBRAINZ_USER=your_username
     volumes:
       # 1. Persistent SQLite database (/data/brokeify.db), cover cache & config.json
-      - /c/docker/brokeify/data:/data
+      - /path/to/brokeify/data:/data
       # 2. Mount your hard drive / music folder into /music inside the container:
-      #    Windows / Dockge WSL2 example: /d/Message:/music:rw  (or D:/Message:/music:rw)
-      #    Linux host example:            /mnt/music:/music:rw
-      - /d/Message:/music:rw
+      - /path/to/your/music:/music:ro
 networks: {}`;
 
 const DOCKER_COMPOSE_NAS_SMB_EXAMPLE = `services:
@@ -521,7 +519,7 @@ export const BrokeifyOnboardingModal: React.FC<BrokeifyOnboardingModalProps> = (
                   '/mnt/music',
                   '/mnt/nas/music',
                   '/media/music',
-                  '/d/Message',
+                  '/mnt/user/Music',
                 ].map((preset) => (
                   <button
                     key={preset}
@@ -628,17 +626,16 @@ export const BrokeifyOnboardingModal: React.FC<BrokeifyOnboardingModalProps> = (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs font-mono">
               <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-3.5 space-y-1.5">
                 <div className="text-[#00ff66] font-bold">
-                  🪟 Windows / Dockge (WSL2) Drive MountTips
+                  🪟 Windows / Dockge (WSL2) Drive Mount Tips
                 </div>
                 <p className="text-zinc-300 leading-relaxed">
-                  If your music is on your Windows <code>D:\Message</code> drive:
+                  If your music is on an external or secondary Windows drive:
                   <br />• In WSL2 / Dockge on Linux VM, use{' '}
-                  <code className="text-white">/mnt/d/Message:/music:rw</code> or{' '}
-                  <code className="text-white">D:/Message:/music:rw</code>.
-                  <br />• If <code>/d/Message</code> appears empty inside the
-                  container, switch the left side of the volume to{' '}
-                  <code className="text-[#00ff66]">D:/Message:/music:rw</code>{' '}
-                  or <code className="text-[#00ff66]">/mnt/d/Message:/music:rw</code>!
+                  <code className="text-white">/mnt/drive/Music:/music:ro</code> or{' '}
+                  <code className="text-white">/path/to/your/music:/music:ro</code>.
+                  <br />• If the mount appears empty inside the container, verify
+                  the host path in Docker Desktop / WSL2 settings and use{' '}
+                  <code className="text-[#00ff66]">/path/to/your/music:/music:ro</code>!
                 </p>
               </div>
 

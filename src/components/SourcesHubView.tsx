@@ -62,6 +62,7 @@ interface SourcesHubViewProps {
   onAuthConfigChanged?: (nextRequireLogin: boolean) => void;
   onLockAndSignOut?: () => void;
   onShowToast?: (msg: string) => void;
+  sectionFilter?: 'all' | 'storage' | 'downloaders' | 'android' | 'security';
 }
 
 export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
@@ -80,6 +81,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
   onAuthConfigChanged,
   onLockAndSignOut,
   onShowToast,
+  sectionFilter = 'all',
 }) => {
   const [isSavingConfigFile, setIsSavingConfigFile] = useState<boolean>(false);
   const [isTestingLidarr, setIsTestingLidarr] = useState<boolean>(false);
@@ -386,17 +388,24 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
     }
   };
 
+  const showStorage = sectionFilter === 'all' || sectionFilter === 'storage';
+  const showDownloaders =
+    sectionFilter === 'all' || sectionFilter === 'downloaders';
+  const showAndroid = sectionFilter === 'all' || sectionFilter === 'android';
+  const showSecurity = sectionFilter === 'all' || sectionFilter === 'security';
+
   return (
     <div className="space-y-8">
       {/* GitHub Repository Version & Update Checker */}
-      <VersionChecker />
+      {showStorage && <VersionChecker />}
 
       {/* Standalone SQLite Music Engine (/data/brokeify.db) + Chokidar /music Scanner + Android Auto REST API */}
-      <section
-        aria-label="Brokeify Standalone SQLite Engine & Android Auto REST API"
-        data-testid="standalone-sqlite-engine-section"
-        className="rounded-2xl border border-[#00ff66]/50 bg-zinc-900/70 p-5 sm:p-6 space-y-5"
-      >
+      {showStorage && (
+        <section
+          aria-label="Brokeify Standalone SQLite Engine & Android Auto REST API"
+          data-testid="standalone-sqlite-engine-section"
+          className="rounded-2xl border border-[#00ff66]/50 bg-zinc-900/70 p-5 sm:p-6 space-y-5"
+        >
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-zinc-800/80 pb-4">
           <div className="space-y-1.5">
             <div className="flex items-center gap-2.5">
@@ -583,9 +592,10 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
           </div>
         </div>
       </section>
+      )}
 
       {/* Section 0: Persistent Docker Server Storage (/app/data/config.json) + slskd, Lidarr, YouTube Music & ListenBrainz Keys */}
-      {serverIntegrations && onUpdateServerIntegrations && (
+      {showDownloaders && serverIntegrations && onUpdateServerIntegrations && (
         <section
           aria-labelledby="docker-config-heading"
           data-testid="docker-persistent-config-section"
@@ -950,12 +960,12 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                       onClick={() =>
                         onUpdateServerIntegrations({
                           ...serverIntegrations,
-                          slskdUrl: 'http://192.168.1.175:5030',
+                          slskdUrl: 'http://slskd:5030',
                         })
                       }
                       className="text-[10px] font-mono text-[#00ff66] hover:underline"
                     >
-                      Use Host LAN IP (192.168.1.175:5030)
+                      Use Docker Service URL (http://slskd:5030)
                     </button>
                   </div>
                   <input
@@ -967,7 +977,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                         slskdUrl: e.target.value,
                       })
                     }
-                    placeholder="http://slskd:5030 or http://192.168.1.175:5030"
+                    placeholder="http://slskd:5030 or http://192.168.1.100:5030"
                     data-testid="input-slskd-url"
                     className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
                   />
@@ -1396,25 +1406,28 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
       )}
 
       {/* Section 1: Connect Android App (6-Digit Quick Connect, High-Contrast QR Code, Auto-Detected Browser URL) */}
-      <ConnectAndroidAppSection />
+      {showAndroid && <ConnectAndroidAppSection />}
 
       {/* Section 1B: Public Domain Security Gate, Friends & Family Accounts & Anti-Bot Shield */}
-      <SecurityAndUsersManagerSection
-        currentUser={currentUser || null}
-        requireLogin={Boolean(requireLogin)}
-        onAuthConfigChanged={(next) => {
-          if (onAuthConfigChanged) onAuthConfigChanged(next);
-        }}
-        onLockAndSignOut={() => {
-          if (onLockAndSignOut) onLockAndSignOut();
-        }}
-        onShowToast={(msg) => {
-          if (onShowToast) onShowToast(msg);
-          else showSavedCard('top', msg);
-        }}
-      />
+      {showSecurity && (
+        <SecurityAndUsersManagerSection
+          currentUser={currentUser || null}
+          requireLogin={Boolean(requireLogin)}
+          onAuthConfigChanged={(next) => {
+            if (onAuthConfigChanged) onAuthConfigChanged(next);
+          }}
+          onLockAndSignOut={() => {
+            if (onLockAndSignOut) onLockAndSignOut();
+          }}
+          onShowToast={(msg) => {
+            if (onShowToast) onShowToast(msg);
+            else showSavedCard('top', msg);
+          }}
+        />
+      )}
 
       {/* Section 2: Disk-Backed Artwork Cache & Browser Storage Persistence */}
+      {showStorage && (
       <section
         aria-labelledby="artwork-cache-heading"
         className="rounded-2xl border border-zinc-800/90 bg-zinc-900/40 p-5 sm:p-6 space-y-4"
@@ -1481,6 +1494,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
           </div>
         </div>
       </section>
+      )}
     </div>
   );
 };

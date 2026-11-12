@@ -1269,7 +1269,7 @@ export function inspectMusicDrive(targetDir?: string): MusicDriveStatus {
 /**
  * Recursively traverses `/music/**` across all nested Artist / Album / Disc subfolders.
  * Uses `fs.statSync(fullPath)` rather than relying on `Dirent.isDirectory()` so Windows
- * NTFS bind mounts (`D:/...:/music`), WSL2 9P, SMB/CIFS, NFS, and symlinks are always
+ * NTFS bind mounts, WSL2 9P, SMB/CIFS, NFS, and symlinks are always
  * traversed deeply without stopping at the root folder.
  */
 export function walkMusicDirectory(

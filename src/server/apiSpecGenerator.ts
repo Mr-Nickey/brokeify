@@ -10,7 +10,7 @@ export interface ApiSpecOptions {
 }
 
 export function generateBrokeifyApiSpecMarkdown(options: ApiSpecOptions = {}): string {
-  const baseUrl = (options.baseUrl || 'https://music.yourdomain.com').replace(/\/+$/, '');
+  const baseUrl = (options.baseUrl || 'https://your-brokeify-server.com').replace(/\/+$/, '');
   const version = options.version || '3.0.0-standalone';
   const port = options.port || 3487;
   const generatedAt = new Date().toISOString();
