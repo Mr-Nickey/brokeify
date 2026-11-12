@@ -26,7 +26,7 @@ function resolveWritableDir(preferredPaths: string[]): string {
 }
 
 export const DATA_DIR = resolveWritableDir([
-  process.env.BROKEIFY_DATA_DIR || '/data',
+  process.env.DATA_DIR || process.env.BROKEIFY_DATA_DIR || '/data',
   '/app/data',
   path.resolve(process.cwd(), 'data'),
 ]);
@@ -54,7 +54,7 @@ function resolveMusicDir(preferredPaths: string[]): string {
 }
 
 export let MUSIC_DIR = resolveMusicDir([
-  process.env.BROKEIFY_MUSIC_DIR || '/music',
+  process.env.MUSIC_DIR || process.env.BROKEIFY_MUSIC_DIR || '/music',
   '/music',
   '/app/downloads',
   path.resolve(process.cwd(), 'music'),
@@ -62,6 +62,26 @@ export let MUSIC_DIR = resolveMusicDir([
 
 export function getMusicDir(): string {
   return MUSIC_DIR;
+}
+
+export function isSafePathWithinAllowedRoots(
+  candidatePath: string,
+  extraAllowedRoots: string[] = []
+): boolean {
+  if (!candidatePath || typeof candidatePath !== 'string') return false;
+  if (candidatePath.includes('\0')) return false;
+  const resolvedCandidate = path.resolve(candidatePath);
+  const allowedRoots = [
+    path.resolve(MUSIC_DIR),
+    path.resolve(DATA_DIR),
+    path.resolve(COVERS_DIR),
+    ...extraAllowedRoots.map((r) => path.resolve(r)),
+  ];
+  return allowedRoots.some(
+    (root) =>
+      resolvedCandidate === root ||
+      resolvedCandidate.startsWith(`${root}${path.sep}`)
+  );
 }
 
 const SUPPORTED_AUDIO_EXTENSIONS = new Set([
@@ -323,12 +343,27 @@ class BrokeifyEmbeddedDatabase {
     }
   }
 
-  pragma(_statement: string): void {
-    // No-op compatibility method
+  pragmaState: { journal_mode: string; busy_timeout: number } = {
+    journal_mode: 'WAL',
+    busy_timeout: 5000,
+  };
+
+  pragma(statement: string): any {
+    const clean = String(statement || '').trim();
+    if (/journal_mode\s*=\s*wal/i.test(clean)) {
+      this.pragmaState.journal_mode = 'WAL';
+      return 'wal';
+    }
+    const timeoutMatch = clean.match(/busy_timeout\s*=\s*(\d+)/i);
+    if (timeoutMatch) {
+      this.pragmaState.busy_timeout = Number(timeoutMatch[1]) || 5000;
+      return this.pragmaState.busy_timeout;
+    }
+    return this.pragmaState;
   }
 
   exec(_sql: string): void {
-    // No-op compatibility method
+    // Compatibility method
   }
 
   transaction<T extends (...args: any[]) => any>(fn: T): T {
@@ -422,6 +457,11 @@ class BrokeifyEmbeddedDatabase {
 }
 
 export const db = new BrokeifyEmbeddedDatabase();
+db.pragma('journal_mode = WAL');
+db.pragma('busy_timeout = 5000');
+console.log(
+  `[Brokeify][DB][INFO] SQLite persistence initialized at ${DB_PATH} (PRAGMA journal_mode = ${db.pragmaState.journal_mode}; PRAGMA busy_timeout = ${db.pragmaState.busy_timeout}ms)`
+);
 
 let syncDbTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -1519,14 +1559,25 @@ export interface FormattedTrackPayload {
 export function queryTracks(filters?: {
   albumId?: string;
   artistId?: string;
+  genre?: string;
   search?: string;
+  sort?: string;
+  order?: 'asc' | 'desc' | string;
   limit?: number;
+  offset?: number;
 }): FormattedTrackPayload[] {
   const searchLower = filters?.search?.trim().toLowerCase() || '';
+  const genreLower = filters?.genre?.trim().toLowerCase() || '';
 
   const matched = Array.from(db.tracks.values()).filter((t) => {
     if (filters?.albumId && t.album_id !== filters.albumId) return false;
     if (filters?.artistId && t.artist_id !== filters.artistId) return false;
+    if (genreLower) {
+      const al = t.album_id ? db.albums.get(t.album_id) : undefined;
+      if (!String(al?.genre || '').toLowerCase().includes(genreLower)) {
+        return false;
+      }
+    }
     if (searchLower) {
       const ar = t.artist_id ? db.artists.get(t.artist_id) : undefined;
       const al = t.album_id ? db.albums.get(t.album_id) : undefined;
@@ -1536,30 +1587,57 @@ export function queryTracks(filters?: {
     return true;
   });
 
+  const sortBy = String(filters?.sort || '').toLowerCase();
+  const sortDesc = String(filters?.order || 'asc').toLowerCase() === 'desc';
+
   matched.sort((a, b) => {
-    const arA = (a.artist_id ? db.artists.get(a.artist_id)?.sort_name : '') || '';
-    const arB = (b.artist_id ? db.artists.get(b.artist_id)?.sort_name : '') || '';
-    const cmpAr = arA.localeCompare(arB, undefined, { sensitivity: 'base' });
-    if (cmpAr !== 0) return cmpAr;
-
-    const alA = (a.album_id ? db.albums.get(a.album_id)?.title : '') || '';
-    const alB = (b.album_id ? db.albums.get(b.album_id)?.title : '') || '';
-    const cmpAl = alA.localeCompare(alB, undefined, { sensitivity: 'base' });
-    if (cmpAl !== 0) return cmpAl;
-
-    if ((a.disc_number || 1) !== (b.disc_number || 1)) {
-      return (a.disc_number || 1) - (b.disc_number || 1);
+    let cmp = 0;
+    if (sortBy === 'title') {
+      cmp = a.title.localeCompare(b.title, undefined, { sensitivity: 'base' });
+    } else if (sortBy === 'album') {
+      const alA = (a.album_id ? db.albums.get(a.album_id)?.title : '') || '';
+      const alB = (b.album_id ? db.albums.get(b.album_id)?.title : '') || '';
+      cmp = alA.localeCompare(alB, undefined, { sensitivity: 'base' });
+    } else if (sortBy === 'year') {
+      const yA = (a.album_id ? db.albums.get(a.album_id)?.year : 0) || 0;
+      const yB = (b.album_id ? db.albums.get(b.album_id)?.year : 0) || 0;
+      cmp = yA - yB;
+    } else if (sortBy === 'playcount' || sortBy === 'play_count' || sortBy === 'plays') {
+      cmp = (a.play_count || 0) - (b.play_count || 0);
+    } else if (sortBy === 'duration') {
+      cmp = (a.duration_ms || 0) - (b.duration_ms || 0);
+    } else if (sortBy === 'addedat' || sortBy === 'added_at' || sortBy === 'recent') {
+      cmp = (a.file_mtime_ms || 0) - (b.file_mtime_ms || 0);
+    } else {
+      const arA = (a.artist_id ? db.artists.get(a.artist_id)?.sort_name : '') || '';
+      const arB = (b.artist_id ? db.artists.get(b.artist_id)?.sort_name : '') || '';
+      cmp = arA.localeCompare(arB, undefined, { sensitivity: 'base' });
+      if (cmp === 0) {
+        const alA = (a.album_id ? db.albums.get(a.album_id)?.title : '') || '';
+        const alB = (b.album_id ? db.albums.get(b.album_id)?.title : '') || '';
+        cmp = alA.localeCompare(alB, undefined, { sensitivity: 'base' });
+      }
+      if (cmp === 0 && (a.disc_number || 1) !== (b.disc_number || 1)) {
+        cmp = (a.disc_number || 1) - (b.disc_number || 1);
+      }
+      if (cmp === 0 && (a.track_number || 1) !== (b.track_number || 1)) {
+        cmp = (a.track_number || 1) - (b.track_number || 1);
+      }
+      if (cmp === 0) {
+        cmp = a.title.localeCompare(b.title, undefined, { sensitivity: 'base' });
+      }
     }
-    if ((a.track_number || 1) !== (b.track_number || 1)) {
-      return (a.track_number || 1) - (b.track_number || 1);
-    }
-    return a.title.localeCompare(b.title, undefined, { sensitivity: 'base' });
+    return sortDesc ? -cmp : cmp;
   });
 
+  const startOffset =
+    filters?.offset && filters.offset > 0 ? Math.floor(Number(filters.offset)) : 0;
   const sliced =
     filters?.limit && filters.limit > 0
-      ? matched.slice(0, Number(filters.limit))
-      : matched;
+      ? matched.slice(startOffset, startOffset + Math.floor(Number(filters.limit)))
+      : startOffset > 0
+        ? matched.slice(startOffset)
+        : matched;
 
   return sliced.map((r) => {
     const ar = r.artist_id ? db.artists.get(r.artist_id) : undefined;
@@ -1606,9 +1684,37 @@ export function queryTracks(filters?: {
       sourceName: 'Brokeify Native Engine',
       streamUrl: `/api/stream/${encodeURIComponent(String(r.id))}`,
       artworkUrl: `/api/cover/album/${encodeURIComponent(String(coverTargetId))}`,
+      coverUrl: `/api/covers/${encodeURIComponent(String(coverTargetId))}`,
       accentColor: pickAccentColor(String(r.id)),
     };
   });
+}
+
+export function countMatchingTracks(filters?: {
+  albumId?: string;
+  artistId?: string;
+  genre?: string;
+  search?: string;
+}): number {
+  const searchLower = filters?.search?.trim().toLowerCase() || '';
+  const genreLower = filters?.genre?.trim().toLowerCase() || '';
+  let count = 0;
+  for (const t of db.tracks.values()) {
+    if (filters?.albumId && t.album_id !== filters.albumId) continue;
+    if (filters?.artistId && t.artist_id !== filters.artistId) continue;
+    if (genreLower) {
+      const al = t.album_id ? db.albums.get(t.album_id) : undefined;
+      if (!String(al?.genre || '').toLowerCase().includes(genreLower)) continue;
+    }
+    if (searchLower) {
+      const ar = t.artist_id ? db.artists.get(t.artist_id) : undefined;
+      const al = t.album_id ? db.albums.get(t.album_id) : undefined;
+      const hay = `${t.title} ${ar?.name || ''} ${al?.title || ''} ${al?.genre || ''}`.toLowerCase();
+      if (!hay.includes(searchLower)) continue;
+    }
+    count++;
+  }
+  return count;
 }
 
 export function queryArtists(search?: string) {
@@ -1868,24 +1974,39 @@ const MIME_BY_EXT: Record<string, string> = {
 };
 
 export function handleStreamTrack(req: Request, res: Response) {
-  const trackId = String(req.params.trackId || '').trim();
-  if (!trackId) {
-    return res.status(400).json({ error: 'Missing trackId' });
+  const trackId = String(req.params.trackId || req.params.id || '').trim();
+  if (!trackId || trackId.includes('..') || trackId.includes('/') || trackId.includes('\\')) {
+    return res.status(400).json({ ok: false, error: 'Invalid track ID' });
   }
 
   const row = db.tracks.get(trackId);
-  if (!row || !row.file_path || !fs.existsSync(row.file_path)) {
-    return res.status(404).json({ error: 'Track audio file not found on disk' });
+  if (!row || !row.file_path) {
+    return res.status(404).json({ ok: false, error: 'Track not found in database' });
   }
 
-  const filePath = row.file_path;
-  const stat = fs.statSync(filePath);
+  const resolvedFilePath = path.resolve(row.file_path);
+  if (!isSafePathWithinAllowedRoots(resolvedFilePath)) {
+    console.warn(
+      `[Brokeify][SECURITY][WARN] Blocked path traversal attempt on /api/stream/${trackId} -> ${resolvedFilePath}`
+    );
+    return res.status(403).json({
+      ok: false,
+      error: 'Forbidden: Audio file path outside configured MUSIC_DIR',
+    });
+  }
+
+  if (!fs.existsSync(resolvedFilePath)) {
+    return res.status(404).json({ ok: false, error: 'Track audio file not found on disk' });
+  }
+
+  const stat = fs.statSync(resolvedFilePath);
   const fileSize = stat.size;
-  const ext = path.extname(filePath).toLowerCase();
+  const ext = path.extname(resolvedFilePath).toLowerCase();
   const contentType = MIME_BY_EXT[ext] || 'application/octet-stream';
 
   res.setHeader('Accept-Ranges', 'bytes');
   res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
 
   const range = req.headers.range;
   if (range) {
@@ -1896,6 +2017,7 @@ export function handleStreamTrack(req: Request, res: Response) {
     if (
       Number.isNaN(start) ||
       Number.isNaN(end) ||
+      start < 0 ||
       start >= fileSize ||
       end >= fileSize ||
       start > end
@@ -1910,9 +2032,10 @@ export function handleStreamTrack(req: Request, res: Response) {
       'Accept-Ranges': 'bytes',
       'Content-Length': chunkSize,
       'Content-Type': contentType,
+      'Cross-Origin-Resource-Policy': 'cross-origin',
     });
 
-    const stream = fs.createReadStream(filePath, { start, end });
+    const stream = fs.createReadStream(resolvedFilePath, { start, end });
     stream.on('error', () => {
       if (!res.headersSent) res.status(500).end();
     });
@@ -1923,8 +2046,9 @@ export function handleStreamTrack(req: Request, res: Response) {
     'Content-Length': fileSize,
     'Content-Type': contentType,
     'Accept-Ranges': 'bytes',
+    'Cross-Origin-Resource-Policy': 'cross-origin',
   });
-  const stream = fs.createReadStream(filePath);
+  const stream = fs.createReadStream(resolvedFilePath);
   stream.on('error', () => {
     if (!res.headersSent) res.status(500).end();
   });
@@ -1956,14 +2080,48 @@ function generateCoverSvg(title: string, subtitle: string, accent: string): stri
 }
 
 export function handleServeCover(req: Request, res: Response) {
-  const type = String(req.params.type || 'album').toLowerCase();
+  let type = String(req.params.type || '').toLowerCase();
   const id = String(req.params.id || '').trim();
+
+  if (!id || id.includes('..') || id.includes('/') || id.includes('\\')) {
+    return res.status(400).json({ ok: false, error: 'Invalid cover ID' });
+  }
+
+  // If called via /api/covers/:id without a :type param, auto-detect from ID prefix or DB maps
+  if (!type) {
+    if (db.albums.has(id) || id.startsWith('alb-')) {
+      type = 'album';
+    } else if (db.tracks.has(id) || id.startsWith('trk-')) {
+      type = 'track';
+    } else if (db.artists.has(id) || id.startsWith('art-')) {
+      type = 'artist';
+    } else if (db.playlists.has(id) || id.startsWith('pl-')) {
+      type = 'playlist';
+    } else {
+      type = 'album';
+    }
+  }
 
   let coverPath: string | null = null;
   let title = 'Brokeify';
   let subtitle = 'Music Library';
 
-  if (type === 'album') {
+  if (type === 'track') {
+    const tr = db.tracks.get(id);
+    if (tr) {
+      title = tr.title;
+      const ar = tr.artist_id ? db.artists.get(tr.artist_id) : undefined;
+      subtitle = ar?.name || 'Track';
+      const al = tr.album_id ? db.albums.get(tr.album_id) : undefined;
+      if (al) {
+        coverPath = al.cover_path;
+        const diskCandidate = path.join(COVERS_DIR, `${al.id}.jpg`);
+        if (!coverPath && fs.existsSync(diskCandidate)) {
+          coverPath = diskCandidate;
+        }
+      }
+    }
+  } else if (type === 'album') {
     const alb = db.albums.get(id);
     if (alb) {
       title = alb.title;
@@ -2007,22 +2165,42 @@ export function handleServeCover(req: Request, res: Response) {
     }
   }
 
-  if (coverPath && fs.existsSync(coverPath)) {
-    const ext = path.extname(coverPath).toLowerCase();
-    const mime =
-      ext === '.png'
-        ? 'image/png'
-        : ext === '.webp'
-          ? 'image/webp'
-          : 'image/jpeg';
-    res.setHeader('Content-Type', mime);
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-    return fs.createReadStream(coverPath).pipe(res);
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+
+  if (coverPath) {
+    const resolvedCover = path.resolve(coverPath);
+    if (isSafePathWithinAllowedRoots(resolvedCover) && fs.existsSync(resolvedCover)) {
+      try {
+        const st = fs.statSync(resolvedCover);
+        const etag = `W/"${st.size.toString(16)}-${Math.round(st.mtimeMs).toString(16)}"`;
+        if (req.headers['if-none-match'] === etag) {
+          return res.status(304).end();
+        }
+        const ext = path.extname(resolvedCover).toLowerCase();
+        const mime =
+          ext === '.png'
+            ? 'image/png'
+            : ext === '.webp'
+              ? 'image/webp'
+              : 'image/jpeg';
+        res.setHeader('Content-Type', mime);
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        res.setHeader('ETag', etag);
+        return fs.createReadStream(resolvedCover).pipe(res);
+      } catch {
+        // Fall through to SVG cover generator
+      }
+    }
   }
 
   const svg = generateCoverSvg(title, subtitle, pickAccentColor(id || title));
+  const svgEtag = `W/"svg-${crypto.createHash('sha1').update(svg).digest('hex').slice(0, 12)}"`;
+  if (req.headers['if-none-match'] === svgEtag) {
+    return res.status(304).end();
+  }
   res.setHeader('Content-Type', 'image/svg+xml');
-  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+  res.setHeader('ETag', svgEtag);
   return res.send(svg);
 }
 
@@ -2245,3 +2423,252 @@ export function toggleLikedTrack(
     likedTrackIds: Array.from(db.likedTrackIds),
   };
 }
+
+export function getArtistById(artistId: string) {
+  const id = String(artistId || '').trim();
+  const row = db.artists.get(id);
+  if (!row) return null;
+
+  const albums = queryAlbums({ artistId: id });
+  const tracks = queryTracks({ artistId: id });
+  const topTracks = [...tracks].sort((a, b) => (b.playCount || 0) - (a.playCount || 0)).slice(0, 20);
+
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    sortName: String(row.sort_name || row.name),
+    musicbrainzId: row.musicbrainz_id || null,
+    imageUrl: `/api/cover/artist/${encodeURIComponent(String(row.id))}`,
+    coverUrl: `/api/covers/${encodeURIComponent(String(row.id))}`,
+    albumCount: albums.length,
+    trackCount: tracks.length,
+    albums,
+    topTracks,
+    tracks,
+  };
+}
+
+export function getAlbumById(albumId: string) {
+  const id = String(albumId || '').trim();
+  const row = db.albums.get(id);
+  if (!row) return null;
+
+  const ar = row.artist_id ? db.artists.get(row.artist_id) : undefined;
+  const tracks = queryTracks({ albumId: id });
+  const totalDurationSec = tracks.reduce((acc, t) => acc + (t.duration || 0), 0);
+
+  return {
+    id: String(row.id),
+    artistId: row.artist_id ? String(row.artist_id) : null,
+    artistName: String(ar?.name || 'Unknown Artist'),
+    title: String(row.title),
+    year: row.year ? Number(row.year) : null,
+    genre: row.genre ? String(row.genre) : 'Music',
+    coverUrl: `/api/covers/${encodeURIComponent(String(row.id))}`,
+    artworkUrl: `/api/cover/album/${encodeURIComponent(String(row.id))}`,
+    musicbrainzId: row.musicbrainz_id || null,
+    trackCount: tracks.length,
+    totalDurationSec,
+    tracks,
+  };
+}
+
+export function buildSongRadioQueue(
+  seedTrackId: string,
+  limit = 25
+): { seedTrack: FormattedTrackPayload | null; queue: FormattedTrackPayload[] } {
+  const allTracks = queryTracks();
+  const seedTrack = allTracks.find((t) => t.id === seedTrackId) || null;
+  if (!seedTrack) {
+    return { seedTrack: null, queue: allTracks.slice(0, limit) };
+  }
+
+  const seedArtistLower = seedTrack.artist.toLowerCase();
+  const seedGenreLower = (seedTrack.genre || '').toLowerCase();
+  const seedLufs = seedTrack.loudnessLufs ?? -14;
+
+  const scored = allTracks
+    .filter((t) => t.id !== seedTrack.id)
+    .map((candidate) => {
+      let score = 0;
+      if (candidate.artist.toLowerCase() === seedArtistLower) {
+        score += 45;
+      }
+      if (candidate.albumId && candidate.albumId === seedTrack.albumId) {
+        score += 20;
+      }
+      if (
+        seedGenreLower &&
+        seedGenreLower !== 'music' &&
+        (candidate.genre || '').toLowerCase() === seedGenreLower
+      ) {
+        score += 30;
+      }
+      if (seedTrack.year && candidate.year) {
+        const yearDiff = Math.abs(seedTrack.year - candidate.year);
+        if (yearDiff <= 3) score += 15;
+        else if (yearDiff <= 8) score += 8;
+      }
+      const candLufs = candidate.loudnessLufs ?? -14;
+      const lufsDiff = Math.abs(seedLufs - candLufs);
+      if (lufsDiff <= 2.5) score += 12;
+      if (db.likedTrackIds.has(candidate.id)) score += 10;
+      score += Math.min(10, candidate.playCount || 0);
+      return { candidate, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  return {
+    seedTrack,
+    queue: [seedTrack, ...scored.slice(0, Math.max(1, limit - 1)).map((s) => s.candidate)],
+  };
+}
+
+export function addTracksToPlaylist(
+  playlistId: string,
+  trackIdsToAdd: string[],
+  options?: { force?: boolean }
+): { addedCount: number; skippedDuplicates: number; trackIds: string[] } | null {
+  const pl = db.playlists.get(playlistId);
+  if (!pl) return null;
+
+  const current = [...(db.playlistTracks.get(playlistId) || [])];
+  const seen = new Set(current);
+  let addedCount = 0;
+  let skippedDuplicates = 0;
+
+  for (const rawId of trackIdsToAdd) {
+    const tid = String(rawId || '').trim();
+    if (!tid || !db.tracks.has(tid)) continue;
+    if (!options?.force && seen.has(tid)) {
+      skippedDuplicates++;
+      continue;
+    }
+    seen.add(tid);
+    current.push(tid);
+    addedCount++;
+  }
+
+  db.playlistTracks.set(playlistId, current);
+  pl.updated_at = new Date().toISOString();
+  syncDatabaseToPersistentDisk();
+
+  return {
+    addedCount,
+    skippedDuplicates,
+    trackIds: current,
+  };
+}
+
+export function removeTrackFromPlaylist(
+  playlistId: string,
+  trackIdToRemove: string
+): { removed: boolean; trackIds: string[] } | null {
+  const pl = db.playlists.get(playlistId);
+  if (!pl) return null;
+
+  const current = db.playlistTracks.get(playlistId) || [];
+  const next = current.filter((tid) => tid !== trackIdToRemove);
+  const removed = next.length !== current.length;
+
+  db.playlistTracks.set(playlistId, next);
+  if (removed) {
+    pl.updated_at = new Date().toISOString();
+    syncDatabaseToPersistentDisk();
+  }
+
+  return {
+    removed,
+    trackIds: next,
+  };
+}
+
+export function reorderPlaylistTracks(
+  playlistId: string,
+  orderedTrackIds: string[]
+): { trackIds: string[] } | null {
+  const pl = db.playlists.get(playlistId);
+  if (!pl) return null;
+
+  setPlaylistTrackIds(playlistId, orderedTrackIds);
+  return {
+    trackIds: getPlaylistTrackIds(playlistId),
+  };
+}
+
+export function exportPlaylistM3u8(playlistId: string): {
+  filename: string;
+  content: string;
+} | null {
+  const pl = db.playlists.get(playlistId);
+  if (!pl) return null;
+
+  const trackIds = db.playlistTracks.get(playlistId) || [];
+  const lines: string[] = [
+    '#EXTM3U',
+    `#PLAYLIST:${pl.name}`,
+    `#EXTENC:UTF-8`,
+  ];
+
+  for (const tid of trackIds) {
+    const t = db.tracks.get(tid);
+    if (!t) continue;
+    const ar = t.artist_id ? db.artists.get(t.artist_id) : undefined;
+    const durSec = Math.max(1, Math.round((t.duration_ms || 180000) / 1000));
+    const artistName = ar?.name || 'Unknown Artist';
+    lines.push(`#EXTINF:${durSec},${artistName} - ${t.title}`);
+    const relPath = path.relative(MUSIC_DIR, t.file_path).replace(/\\/g, '/');
+    lines.push(relPath.startsWith('..') ? t.file_path : relPath);
+  }
+
+  const safeFilename = `${pl.name.replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '') || 'playlist'}.m3u8`;
+  return {
+    filename: safeFilename,
+    content: `${lines.join('\n')}\n`,
+  };
+}
+
+export function getRecentPlayHistory(limit = 50) {
+  const allTracks = queryTracks();
+  const trackMap = new Map(allTracks.map((t) => [t.id, t]));
+
+  const recentFromScrobbles = [...db.scrobbles]
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, limit)
+    .map((scr) => {
+      const track = trackMap.get(scr.track_id);
+      if (!track) return null;
+      return {
+        id: scr.id,
+        trackId: scr.track_id,
+        playedAt: new Date(scr.timestamp * 1000).toISOString(),
+        timestamp: scr.timestamp,
+        syncedListenBrainz: Boolean(scr.synced_listenbrainz),
+        track,
+      };
+    })
+    .filter(Boolean);
+
+  if (recentFromScrobbles.length > 0) {
+    return recentFromScrobbles;
+  }
+
+  // Fallback to tracks ordered by lastPlayedAt if scrobbles list is empty
+  return allTracks
+    .filter((t) => t.lastPlayedAt || (t.playCount || 0) > 0)
+    .sort((a, b) =>
+      String(b.lastPlayedAt || '').localeCompare(String(a.lastPlayedAt || ''))
+    )
+    .slice(0, limit)
+    .map((track) => ({
+      id: `hist-${track.id}`,
+      trackId: track.id,
+      playedAt: track.lastPlayedAt || new Date().toISOString(),
+      timestamp: track.lastPlayedAt
+        ? Math.floor(new Date(track.lastPlayedAt).getTime() / 1000)
+        : Math.floor(Date.now() / 1000),
+      syncedListenBrainz: false,
+      track,
+    }));
+}
+

@@ -259,24 +259,36 @@ export const PlaylistDetailView: React.FC<PlaylistDetailViewProps> = ({
     return list;
   }, [unifiedItems, statusFilter, searchQuery]);
 
-  // Counts for status filters
+  // Counts for status filters & Staggered Drip Queue breakdown
   const counts = useMemo(() => {
     let ready = 0;
+    let queued = 0;
+    let searching = 0;
+    let downloadingNow = 0;
     let downloading = 0;
     let failed = 0;
     for (const item of unifiedItems) {
-      if (item.status === 'ready') ready++;
-      else if (
-        item.status === 'downloading' ||
-        item.status === 'queued' ||
-        item.status === 'searching'
-      )
+      if (item.status === 'ready') {
+        ready++;
+      } else if (item.status === 'queued') {
+        queued++;
         downloading++;
-      else if (item.status === 'failed') failed++;
+      } else if (item.status === 'searching') {
+        searching++;
+        downloading++;
+      } else if (item.status === 'downloading') {
+        downloadingNow++;
+        downloading++;
+      } else if (item.status === 'failed') {
+        failed++;
+      }
     }
     return {
       all: unifiedItems.length,
       ready,
+      queued,
+      searching,
+      downloadingNow,
       downloading,
       failed,
     };
@@ -547,6 +559,39 @@ export const PlaylistDetailView: React.FC<PlaylistDetailViewProps> = ({
               </button>
             )}
           </div>
+
+          {counts.downloading > 0 && (
+            <div
+              data-testid="playlist-drip-queue-banner"
+              className="mt-2 rounded-xl border border-amber-500/40 bg-amber-950/25 px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs font-mono"
+            >
+              <div className="flex items-center gap-2 text-amber-200">
+                <Loader2 className="w-4 h-4 animate-spin text-amber-400 shrink-0" />
+                <span>
+                  <strong className="text-amber-300">
+                    Staggered Drip Queue Active (5 tracks/batch):
+                  </strong>{' '}
+                  Processing steadily in the background (survives page refreshes).
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                <span className="rounded bg-zinc-900/90 border border-zinc-700 px-2 py-0.5 text-zinc-200">
+                  Queued: <strong>{counts.queued}</strong>
+                </span>
+                <span className="rounded bg-cyan-950/60 border border-cyan-500/40 px-2 py-0.5 text-cyan-300">
+                  Searching: <strong>{counts.searching}</strong>
+                </span>
+                <span className="rounded bg-emerald-950/60 border border-emerald-500/40 px-2 py-0.5 text-[#00ff66]">
+                  Downloading: <strong>{counts.downloadingNow}</strong>
+                </span>
+                {counts.failed > 0 && (
+                  <span className="rounded bg-rose-950/60 border border-rose-500/40 px-2 py-0.5 text-rose-300">
+                    Failed: <strong>{counts.failed}</strong>
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 

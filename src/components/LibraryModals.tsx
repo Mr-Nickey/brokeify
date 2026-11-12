@@ -64,6 +64,7 @@ export const SpotifyPlaylistImporterModal: React.FC<
   const [customPlaylistName, setCustomPlaylistName] = useState<string>(
     initialPlaylist?.name || ''
   );
+  const [maxTracks, setMaxTracks] = useState<string>('1000');
   const [sourceMode, setSourceMode] = useState<string>(
     preferredDownloader || 'auto'
   );
@@ -74,6 +75,12 @@ export const SpotifyPlaylistImporterModal: React.FC<
   const [showManualFallback, setShowManualFallback] = useState<boolean>(false);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [liveProgress, setLiveProgress] = useState<{
+    loadedTracks: number;
+    totalTracks: number;
+    playlistTitle: string;
+    statusMessage: string;
+  } | null>(null);
 
   useEffect(() => {
     if (isOpen) {
@@ -88,6 +95,7 @@ export const SpotifyPlaylistImporterModal: React.FC<
       setSourceMode(preferredDownloader || 'auto');
       setSchedule(initialSchedule || 'weekly');
       setErrorMsg(null);
+      setLiveProgress(null);
     }
   }, [
     isOpen,
@@ -96,6 +104,35 @@ export const SpotifyPlaylistImporterModal: React.FC<
     initialSchedule,
     preferredDownloader,
   ]);
+
+  useEffect(() => {
+    if (!isSubmitting) {
+      setLiveProgress(null);
+      return;
+    }
+    const timer = setInterval(async () => {
+      try {
+        const resp = await fetch('/api/spotify/import-progress');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (data?.ok && (data.active || Number(data.loadedTracks) > 0)) {
+          const loaded = Number(data.loadedTracks || 0);
+          const total = Number(data.totalTracks || loaded || 0);
+          setLiveProgress({
+            loadedTracks: loaded,
+            totalTracks: total,
+            playlistTitle: String(data.playlistTitle || 'Spotify Playlist'),
+            statusMessage:
+              String(data.statusMessage || '') ||
+              `Fetching tracks from Spotify: ${loaded} / ${total || '?'}...`,
+          });
+        }
+      } catch {
+        // ignore transient poll errors
+      }
+    }, 350);
+    return () => clearInterval(timer);
+  }, [isSubmitting]);
 
   if (!isOpen) return null;
 
@@ -110,6 +147,13 @@ export const SpotifyPlaylistImporterModal: React.FC<
 
     setIsSubmitting(true);
     setErrorMsg(null);
+    setLiveProgress({
+      loadedTracks: 0,
+      totalTracks: maxTracks === 'all' ? 1000 : Number(maxTracks),
+      playlistTitle: customPlaylistName.trim() || 'Spotify Playlist',
+      statusMessage: 'Fetching tracks from Spotify (paginating 100/page)...',
+    });
+
     try {
       const resp = await fetch('/api/playlists/import-spotify', {
         method: 'POST',
@@ -123,6 +167,7 @@ export const SpotifyPlaylistImporterModal: React.FC<
               ? customPlaylistName.trim()
               : playlists.find((p) => p.id === targetPlaylistId)?.name ||
                 customPlaylistName.trim(),
+          maxTracks: maxTracks === 'all' ? 'all' : Number(maxTracks),
           autoDownloadMissing,
           sourceMode,
           schedule,
@@ -146,6 +191,10 @@ export const SpotifyPlaylistImporterModal: React.FC<
           data.message ||
           `Imported "${data.playlist?.name || 'Spotify Playlist'}"!`,
       });
+      onShowToast(
+        data.message ||
+          `Imported "${data.playlist?.name || 'Spotify Playlist'}"!`
+      );
       onClose();
     } catch (err) {
       setErrorMsg(
@@ -175,18 +224,20 @@ export const SpotifyPlaylistImporterModal: React.FC<
             <h3 className="text-base sm:text-lg font-bold text-white font-mono flex items-center gap-2">
               <Sparkles className="w-5 h-5 text-[#00ff66] shrink-0" />
               <span>
-                Import Spotify Playlist &amp; Auto-Download Missing Songs
+                Import / Sync Spotify Playlist (Up to 1,000+ Tracks)
               </span>
             </h3>
             <p className="text-xs text-zinc-300 leading-relaxed">
-              Every song from Spotify will populate inside your playlist right
-              away: songs already in <code className="text-[#00ff66]">/music</code>{' '}
-              appear as playable tracks, and missing songs appear as{' '}
-              <strong className="text-purple-300">Ghost Songs</strong> with live
-              real-time download status (<code className="text-zinc-200">slskd</code>,{' '}
-              <code className="text-zinc-200">Lidarr</code>, or{' '}
-              <code className="text-zinc-200">YouTube Music</code>) so you never
-              have to guess what is missing or downloading.
+              Every song from Spotify will paginate in strides of 100 with polite
+              rate-limit spacing and save straight to SQLite: songs already in{' '}
+              <code className="text-[#00ff66]">/music</code> are marked{' '}
+              <strong className="text-[#00ff66]">In Library</strong>, and missing
+              songs are marked <strong className="text-purple-300">Missing</strong>{' '}
+              and processed in controlled batches via the{' '}
+              <strong className="text-emerald-300">
+                Staggered Drip Queue (5 tracks/batch)
+              </strong>
+              .
             </p>
           </div>
           <button
@@ -200,7 +251,7 @@ export const SpotifyPlaylistImporterModal: React.FC<
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div className="grid grid-cols-1 sm:grid-cols-12 gap-3">
-            <div className="sm:col-span-12">
+            <div className="sm:col-span-8">
               <label className="block text-xs font-mono font-bold text-zinc-200 mb-1">
                 1. Spotify Playlist or Album Link
               </label>
@@ -214,6 +265,28 @@ export const SpotifyPlaylistImporterModal: React.FC<
               />
             </div>
 
+            <div className="sm:col-span-4">
+              <label
+                htmlFor="modal-spotify-max-tracks"
+                className="block text-xs font-mono font-bold text-[#00ff66] mb-1"
+              >
+                Max Songs to Import
+              </label>
+              <select
+                id="modal-spotify-max-tracks"
+                value={maxTracks}
+                onChange={(e) => setMaxTracks(e.target.value)}
+                data-testid="modal-spotify-max-tracks"
+                className="w-full rounded-xl border border-[#00ff66]/50 bg-zinc-900 px-3 py-2.5 text-xs font-mono font-bold text-[#00ff66] focus:border-[#00ff66] focus:outline-none"
+              >
+                <option value="100">100</option>
+                <option value="250">250</option>
+                <option value="500">500</option>
+                <option value="1000">1,000 (Default)</option>
+                <option value="all">Full Playlist</option>
+              </select>
+            </div>
+
             <div className="sm:col-span-6">
               <label className="block text-xs font-mono font-bold text-zinc-200 mb-1">
                 2. Target Playlist
@@ -225,7 +298,12 @@ export const SpotifyPlaylistImporterModal: React.FC<
                   setTargetPlaylistId(val);
                   if (val !== '__new__') {
                     const found = playlists.find((p) => p.id === val);
-                    if (found) setCustomPlaylistName(found.name);
+                    if (found) {
+                      setCustomPlaylistName(found.name);
+                      if (found.linkedSpotifyUrl && !spotifyUrl) {
+                        setSpotifyUrl(found.linkedSpotifyUrl);
+                      }
+                    }
                   } else {
                     setCustomPlaylistName('');
                   }
@@ -237,7 +315,7 @@ export const SpotifyPlaylistImporterModal: React.FC<
                 </option>
                 {playlists.map((pl) => (
                   <option key={pl.id} value={pl.id}>
-                    Add to: {pl.name} ({pl.trackIds.length} in library
+                    Sync into: {pl.name} ({pl.trackIds.length} in library
                     {pl.ghostTracks?.length
                       ? ` / ${pl.ghostTracks.length} total`
                       : ''}
@@ -308,7 +386,9 @@ export const SpotifyPlaylistImporterModal: React.FC<
                 className="w-4 h-4 accent-[#00ff66] rounded"
               />
               <span>
-                <strong>Auto-download missing Ghost Songs immediately</strong>{' '}
+                <strong>
+                  Queue missing Ghost Songs in Staggered Drip Queue (5 tracks/batch)
+                </strong>{' '}
                 (shows live status per song inside the playlist)
               </span>
             </label>
@@ -340,6 +420,51 @@ export const SpotifyPlaylistImporterModal: React.FC<
             </div>
           )}
 
+          {isSubmitting && liveProgress && (
+            <div
+              data-testid="spotify-live-import-progress"
+              className="rounded-2xl border border-[#00ff66]/50 bg-emerald-950/30 p-3.5 space-y-2"
+            >
+              <div className="flex items-center justify-between gap-2 text-xs font-mono">
+                <span className="text-[#00ff66] font-bold inline-flex items-center gap-2">
+                  <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+                  <span>{liveProgress.statusMessage}</span>
+                </span>
+                {liveProgress.totalTracks > 0 && (
+                  <span className="text-zinc-200 font-bold tabular-nums">
+                    {liveProgress.loadedTracks} / {liveProgress.totalTracks}
+                  </span>
+                )}
+              </div>
+              <div className="w-full h-2 rounded-full bg-zinc-900 overflow-hidden border border-zinc-800">
+                <div
+                  className="h-full bg-[#00ff66] transition-all duration-300"
+                  style={{
+                    width: `${
+                      liveProgress.totalTracks > 0
+                        ? Math.min(
+                            100,
+                            Math.max(
+                              8,
+                              Math.round(
+                                (liveProgress.loadedTracks /
+                                  liveProgress.totalTracks) *
+                                  100
+                              )
+                            )
+                          )
+                        : 25
+                    }%`,
+                  }}
+                />
+              </div>
+              <p className="text-[11px] font-mono text-zinc-400">
+                Polite 300ms rate-limit spacing active · Saving fetched pages into{' '}
+                <code className="text-zinc-200">/data/brokeify.db</code>...
+              </p>
+            </div>
+          )}
+
           {errorMsg && (
             <div className="rounded-xl border border-rose-500/50 bg-rose-950/50 px-3.5 py-2.5 text-xs font-mono text-rose-200">
               ⚠️ {errorMsg}
@@ -363,14 +488,18 @@ export const SpotifyPlaylistImporterModal: React.FC<
               {isSubmitting ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  <span>Importing &amp; Matching Library...</span>
+                  <span>
+                    {liveProgress
+                      ? liveProgress.statusMessage
+                      : 'Importing & Matching Library...'}
+                  </span>
                 </>
               ) : (
                 <>
                   <ArrowDownToLine className="w-4 h-4" />
                   <span>
                     {autoDownloadMissing
-                      ? 'Import Playlist & Auto-Download Missing'
+                      ? 'Import Playlist & Queue Missing'
                       : 'Import Playlist with Ghost Songs'}
                   </span>
                 </>

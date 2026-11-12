@@ -1,52 +1,59 @@
 # ==============================================================================
-# STAGE 1: Builder (Debian glibc for Vite 8 Rolldown & Tailwind Oxide build tools)
-#          This stage is discarded after compiling dist/ and server.js.
+# Stage 1: Build Frontend (Vite + React) & Bundle Standalone Server (esbuild)
 # ==============================================================================
-FROM node:20-bookworm-slim AS builder
+FROM node:22-alpine AS builder
 
-WORKDIR /build
+WORKDIR /app
 
-COPY package*.json .npmrc* ./
+# Copy package manifests and install dependencies for building
+COPY package*.json ./
 RUN npm install --legacy-peer-deps
 
+# Copy source code and build both client (dist/) and standalone server.js
 COPY . .
 RUN npm run build
 
 # ==============================================================================
-# STAGE 2: Ultra-Lean Production Runtime (~80 MB total, < 3.5 MB app payload)
-#          Zero node_modules, zero C++ native .node addons (no exit code 139).
+# Stage 2: Lean Production Runtime (Zero native C++ addons = Zero SIGSEGV crashes)
 # ==============================================================================
-FROM node:20-alpine AS runner
+FROM node:22-alpine
 
-LABEL org.opencontainers.image.title="Brokeify"
-LABEL org.opencontainers.image.description="Brokeify Standalone Music Server, Chokidar Watcher & Audio Streaming Engine"
-LABEL org.opencontainers.image.source="https://github.com/Mr-Nickey/brokeify"
-LABEL org.opencontainers.image.licenses="MIT"
+# Install ffmpeg (EBU R128 LUFS audio analyzer), yt-dlp, and ca-certificates
+RUN apk add --no-cache \
+    ffmpeg \
+    yt-dlp \
+    ca-certificates \
+    tzdata
 
 WORKDIR /app
 
-# Install only ffmpeg (for EBU R128 LUFS audio normalization) and ca-certificates
-RUN apk add --no-cache ffmpeg ca-certificates
+# Copy only the compiled frontend assets and self-contained server bundle
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/server.js ./server.js
+COPY --from=builder /app/package.json ./package.json
 
-# Copy only the compiled production artifacts (< 3.5 MB total, no node_modules!)
-COPY --from=builder /build/dist ./dist
-COPY --from=builder /build/server.js ./server.js
-COPY --from=builder /build/version.json ./version.json
-COPY --from=builder /build/package.json ./package.json
-
-# Create persistent /data (/data/brokeify.db, /data/covers, /data/config.json) and /music directories
-RUN mkdir -p /data /data/covers /music /app/data /app/downloads /tmp
-
-ARG GIT_COMMIT_SHA=""
-ARG BUILD_TIMESTAMP=""
+# Create persistent directories for database (/data/brokeify.db), cover art (/data/covers),
+# and mounted music library (/music), owned by the non-root `node` user (UID 1000 / GID 1000)
+RUN mkdir -p /data/covers /music && \
+    chown -R node:node /app /data /music
 
 ENV NODE_ENV=production
 ENV PORT=3487
+ENV DATA_DIR=/data
+ENV MUSIC_DIR=/music
 ENV BROKEIFY_DATA_DIR=/data
 ENV BROKEIFY_MUSIC_DIR=/music
-ENV BROKEIFY_COMMIT_SHA=${GIT_COMMIT_SHA}
-ENV BROKEIFY_BUILD_TIME=${BUILD_TIMESTAMP}
+ENV TRUST_PROXY=1
+ENV ALLOW_SIGNUP=false
+
+VOLUME ["/data", "/music"]
 
 EXPOSE 3487
+
+# Run as non-root user for internet-exposed container security
+USER node
+
+# Container healthcheck hitting the public handshake endpoint using Node's built-in fetch
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD node -e "fetch('http://127.0.0.1:3487/api/ping').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 CMD ["node", "server.js"]

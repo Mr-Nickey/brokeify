@@ -1940,35 +1940,50 @@ export default function App() {
   };
 
   const handleDownloadMissingGhostTracks = async (targetPl: Playlist) => {
-    const ghosts = targetPl.ghostTracks || [];
+    const ghosts = (targetPl.ghostTracks || []).filter(
+      (g) => !g.matchedTrackId
+    );
     if (ghosts.length === 0) {
-      setToastMessage('No ghost tracks to download in this playlist.');
+      setToastMessage('No missing ghost tracks to download in this playlist.');
       return;
     }
 
-    setToastMessage(`Queuing download for ${ghosts.length} ghost tracks...`);
-    let queued = 0;
-    for (const ghost of ghosts) {
-      try {
-        await fetch('/api/slskd/grab-job', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            type: 'track',
-            artist: ghost.artist,
-            title: ghost.title,
+    setToastMessage(
+      `Enqueuing ${ghosts.length} missing tracks into Staggered Drip Queue (5 tracks/batch)...`
+    );
+    try {
+      const resp = await fetch('/api/slskd/grab', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'playlist',
+          playlistId: targetPl.id,
+          sourceMode: serverIntegrations.preferredDownloader || 'auto',
+          tracks: ghosts.map((g) => ({
+            id: g.id,
+            ghostTrackId: g.id,
             playlistId: targetPl.id,
-            ghostTrackId: ghost.id,
-            sourceEngine: serverIntegrations.preferredDownloader || 'auto',
-          }),
-        });
-        queued++;
-      } catch {
-        // continue
+            artist: g.artist,
+            title: g.title,
+            album: g.album || '',
+          })),
+        }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      fetchSlskdStatus();
+      if (resp.ok && data.ok) {
+        setToastMessage(
+          data.message ||
+            `Queued ${ghosts.length} tracks in Staggered Drip Queue (5 tracks/batch)!`
+        );
+      } else {
+        setToastMessage(
+          data.error || `Failed to queue missing tracks for "${targetPl.name}".`
+        );
       }
+    } catch {
+      setToastMessage(`Network error queuing tracks for "${targetPl.name}".`);
     }
-    fetchSlskdStatus();
-    setToastMessage(`Queued ${queued} tracks into download manager!`);
   };
 
   const handleRetryGhostTrackDownload = async (ghost: PlaylistGhostTrack) => {
@@ -2923,7 +2938,17 @@ export default function App() {
                   type="button"
                   role="tab"
                   aria-selected={librarySubTab === 'playlists'}
-                  onClick={() => setLibrarySubTab('playlists')}
+                  onClick={() => {
+                    setLibrarySubTab('playlists');
+                    if (selectedPlaylistId) {
+                      handleBackToPlaylists();
+                    }
+                  }}
+                  title={
+                    selectedPlaylistId
+                      ? 'Return to All Playlists'
+                      : 'View All Playlists'
+                  }
                   data-testid="subtab-playlists"
                   className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold transition-colors whitespace-nowrap min-h-[34px] ${
                     librarySubTab === 'playlists'
@@ -2932,7 +2957,11 @@ export default function App() {
                   }`}
                 >
                   <ListMusic className="w-3.5 h-3.5" />
-                  <span>Playlists ({visiblePlaylists.length})</span>
+                  <span>
+                    {selectedPlaylistId && librarySubTab === 'playlists'
+                      ? `← All Playlists (${visiblePlaylists.length})`
+                      : `Playlists (${visiblePlaylists.length})`}
+                  </span>
                 </button>
 
                 <button

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   AlertCircle,
@@ -48,6 +48,30 @@ interface ServerRuntimeInfo {
   memoryRssMb: number;
 }
 
+interface LivePingTelemetry {
+  ok: boolean;
+  latencyMs: number;
+  version: string;
+  uptimeSec: number;
+  memoryRssMb: number;
+  checkedAt: string;
+  sqlite?: {
+    path: string;
+    journalMode: string;
+    busyTimeoutMs: number;
+    readable: boolean;
+    writable: boolean;
+  };
+  musicMount?: {
+    path: string;
+    readable: boolean;
+    totalTracks: number;
+    totalAlbums: number;
+    totalArtists: number;
+    totalPlaylists: number;
+  };
+}
+
 interface DebugLogsViewProps {
   onShowToast?: (msg: string) => void;
 }
@@ -66,7 +90,14 @@ export const DebugLogsView: React.FC<DebugLogsViewProps> = ({
   const [isLoadingLogs, setIsLoadingLogs] = useState<boolean>(false);
   const [isRunningDiagnostics, setIsRunningDiagnostics] =
     useState<boolean>(false);
-  const [autoRefresh, setAutoRefresh] = useState<boolean>(true);
+  // OFF by default so it uses zero background resources until turned on
+  const [systemHealthEnabled, setSystemHealthEnabled] =
+    useState<boolean>(false);
+  const [autoRefresh, setAutoRefresh] = useState<boolean>(false);
+  const [pingTelemetry, setPingTelemetry] = useState<LivePingTelemetry | null>(
+    null
+  );
+  const [copiedKumaUrl, setCopiedKumaUrl] = useState<boolean>(false);
   const [levelFilter, setLevelFilter] = useState<DebugLogLevel | 'all'>('all');
   const [categoryFilter, setCategoryFilter] = useState<
     DebugLogCategory | 'all'
@@ -75,7 +106,7 @@ export const DebugLogsView: React.FC<DebugLogsViewProps> = ({
   const [expandedLogIds, setExpandedLogIds] = useState<Set<string>>(new Set());
   const [copiedReport, setCopiedReport] = useState<boolean>(false);
 
-  const fetchServerLogs = async () => {
+  const fetchServerLogs = useCallback(async () => {
     setIsLoadingLogs(true);
     try {
       const resp = await fetch('/api/debug/logs');
@@ -100,7 +131,93 @@ export const DebugLogsView: React.FC<DebugLogsViewProps> = ({
     } finally {
       setIsLoadingLogs(false);
     }
-  };
+  }, []);
+
+  const runSelfChecks = useCallback(
+    async (silent = false) => {
+      setIsRunningDiagnostics(true);
+      try {
+        // 1. Measure real client -> /api/ping round-trip latency + inspect SQLite & /music telemetry
+        const pingStart = performance.now();
+        try {
+          const pingResp = await fetch('/api/ping', { cache: 'no-store' });
+          const pingLatencyMs = Math.max(
+            1,
+            Math.round(performance.now() - pingStart)
+          );
+          if (pingResp.ok) {
+            const pingData = await pingResp.json();
+            setPingTelemetry({
+              ok: Boolean(pingData.ok),
+              latencyMs: pingLatencyMs,
+              version: pingData.version || '1.3.0',
+              uptimeSec: Number(pingData.uptimeSec || 0),
+              memoryRssMb: Number(pingData.memoryRssMb || 0),
+              checkedAt: new Date().toLocaleTimeString(),
+              sqlite: pingData.sqlite,
+              musicMount: pingData.musicMount,
+            });
+          } else {
+            setPingTelemetry((prev) => ({
+              ok: false,
+              latencyMs: pingLatencyMs,
+              version: prev?.version || '1.3.0',
+              uptimeSec: prev?.uptimeSec || 0,
+              memoryRssMb: prev?.memoryRssMb || 0,
+              checkedAt: new Date().toLocaleTimeString(),
+              sqlite: prev?.sqlite,
+              musicMount: prev?.musicMount,
+            }));
+          }
+        } catch {
+          setPingTelemetry((prev) => ({
+            ok: false,
+            latencyMs: 0,
+            version: prev?.version || '1.3.0',
+            uptimeSec: prev?.uptimeSec || 0,
+            memoryRssMb: prev?.memoryRssMb || 0,
+            checkedAt: new Date().toLocaleTimeString(),
+            sqlite: prev?.sqlite,
+            musicMount: prev?.musicMount,
+          }));
+        }
+
+        // 2. Run deep backend diagnostics (/api/ping, /data/brokeify.db WAL, /music mount, slskd, Lidarr, MusicBrainz, LRCLIB)
+        const resp = await fetch('/api/debug/diagnostics', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok && Array.isArray(data.checks)) {
+          setHealthChecks(data.checks);
+          if (Array.isArray(data.logs)) {
+            setServerLogs(data.logs);
+          }
+          if (!silent) {
+            const errCount = data.checks.filter(
+              (c: HomelabDiagnosticCheck) => c.status === 'error'
+            ).length;
+            onShowToast?.(
+              errCount === 0
+                ? '✅ System Health & Diagnostics complete — all services healthy!'
+                : `⚠️ Diagnostics detected ${errCount} connection issue(s). See badges below.`
+            );
+          }
+        }
+      } catch (err) {
+        logDebugEvent(
+          'error',
+          'system',
+          `System Health Diagnostics failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      } finally {
+        setIsRunningDiagnostics(false);
+      }
+    },
+    [onShowToast]
+  );
 
   useEffect(() => {
     fetchServerLogs();
@@ -108,7 +225,17 @@ export const DebugLogsView: React.FC<DebugLogsViewProps> = ({
       setClientLogs([...nextClientLogs]);
     });
     return () => unsub();
-  }, []);
+  }, [fetchServerLogs]);
+
+  // Periodic self-checks ONLY run when System Health & Diagnostics is toggled ON (off by default = 0 background overhead)
+  useEffect(() => {
+    if (!systemHealthEnabled) return;
+    runSelfChecks(true);
+    const timer = setInterval(() => {
+      runSelfChecks(true);
+    }, 15000);
+    return () => clearInterval(timer);
+  }, [systemHealthEnabled, runSelfChecks]);
 
   useEffect(() => {
     if (!autoRefresh) return;
@@ -116,40 +243,33 @@ export const DebugLogsView: React.FC<DebugLogsViewProps> = ({
       fetchServerLogs();
     }, 5000);
     return () => clearInterval(timer);
-  }, [autoRefresh]);
+  }, [autoRefresh, fetchServerLogs]);
+
+  const handleToggleSystemHealth = () => {
+    setSystemHealthEnabled((prev) => {
+      const next = !prev;
+      onShowToast?.(
+        next
+          ? '🩺 System Health & Diagnostics ENABLED — running live self-checks every 15s (Dozzle & Uptime Kuma telemetry active).'
+          : '⏸️ System Health & Diagnostics OFF — background self-checks stopped (0 background resources).'
+      );
+      return next;
+    });
+  };
 
   const handleRunHomelabDiagnostics = async () => {
-    setIsRunningDiagnostics(true);
+    await runSelfChecks(false);
+  };
+
+  const handleCopyKumaEndpoint = async () => {
+    const url = `${window.location.origin}/api/ping`;
     try {
-      const resp = await fetch('/api/debug/diagnostics', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-      });
-      const data = await resp.json().catch(() => ({}));
-      if (resp.ok && Array.isArray(data.checks)) {
-        setHealthChecks(data.checks);
-        if (Array.isArray(data.logs)) {
-          setServerLogs(data.logs);
-        }
-        const errCount = data.checks.filter(
-          (c: HomelabDiagnosticCheck) => c.status === 'error'
-        ).length;
-        onShowToast?.(
-          errCount === 0
-            ? '✅ Homelab Health Check complete — all configured services responded!'
-            : `⚠️ Health Check found ${errCount} connection issue(s). See details below.`
-        );
-      }
-    } catch (err) {
-      logDebugEvent(
-        'error',
-        'system',
-        `Homelab Diagnostics request failed: ${
-          err instanceof Error ? err.message : String(err)
-        }`
-      );
-    } finally {
-      setIsRunningDiagnostics(false);
+      await navigator.clipboard.writeText(url);
+      setCopiedKumaUrl(true);
+      setTimeout(() => setCopiedKumaUrl(false), 2500);
+      onShowToast?.(`📋 Copied Uptime Kuma monitor URL: ${url}`);
+    } catch {
+      onShowToast?.(`Uptime Kuma URL: ${url}`);
     }
   };
 
@@ -214,6 +334,26 @@ export const DebugLogsView: React.FC<DebugLogsViewProps> = ({
     return { errors, warnings, total: combinedLogs.length };
   }, [combinedLogs]);
 
+  // Lookup helpers for the 4 core diagnostic groups
+  const checkById = useMemo(() => {
+    const map = new Map<string, HomelabDiagnosticCheck>();
+    for (const c of healthChecks) {
+      map.set(c.id, c);
+    }
+    return map;
+  }, [healthChecks]);
+
+  const apiPingCheck = checkById.get('api-ping');
+  const sqliteCheck = checkById.get('sqlite');
+  const musicMountCheck = checkById.get('music-mount');
+  const optionalIntegrationChecks = useMemo(
+    () =>
+      (['slskd', 'lidarr', 'musicbrainz', 'lrclib'] as const)
+        .map((id) => checkById.get(id))
+        .filter((c): c is HomelabDiagnosticCheck => Boolean(c)),
+    [checkById]
+  );
+
   const toggleExpand = (id: string) => {
     setExpandedLogIds((prev) => {
       const next = new Set(prev);
@@ -229,6 +369,7 @@ export const DebugLogsView: React.FC<DebugLogsViewProps> = ({
       userAgent:
         typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown',
       serverInfo,
+      pingTelemetry,
       healthChecks,
       logs: filteredLogs.slice(0, 100),
     };
@@ -250,6 +391,7 @@ export const DebugLogsView: React.FC<DebugLogsViewProps> = ({
       userAgent:
         typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown',
       serverInfo,
+      pingTelemetry,
       healthChecks,
       logs: combinedLogs,
     };
@@ -274,6 +416,322 @@ export const DebugLogsView: React.FC<DebugLogsViewProps> = ({
     <div className="space-y-6" data-testid="debug-logs-view">
       {/* GitHub Repository Version & Update Checker */}
       <VersionChecker onShowToast={onShowToast} />
+
+      {/* Toggleable System Health & Diagnostics Panel (Off by Default = Zero Background Overhead) */}
+      <div
+        className={`winamp-bezel rounded-2xl border p-5 space-y-4 transition-colors ${
+          systemHealthEnabled
+            ? 'border-[#00ff66]/60 bg-zinc-950/95 shadow-[0_0_25px_rgba(0,255,102,0.08)]'
+            : 'border-zinc-800 bg-zinc-950/90'
+        }`}
+        data-testid="system-health-diagnostics-panel"
+      >
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div className="space-y-1">
+            <div className="inline-flex items-center gap-2 text-xs font-mono uppercase tracking-wider text-[#00ff66]">
+              <Activity
+                className={`w-4 h-4 ${
+                  systemHealthEnabled ? 'animate-pulse text-[#00ff66]' : 'text-zinc-400'
+                }`}
+              />
+              <span>
+                System Health &amp; Diagnostics // Uptime Kuma &amp; Dozzle Telemetry
+              </span>
+              <span
+                className={`rounded px-2 py-0.5 text-[10px] font-bold uppercase ${
+                  systemHealthEnabled
+                    ? 'bg-emerald-500/20 text-[#00ff66] border border-emerald-500/40'
+                    : 'bg-zinc-900 text-zinc-400 border border-zinc-800'
+                }`}
+              >
+                {systemHealthEnabled
+                  ? 'LIVE POLLING (15S)'
+                  : 'OFF BY DEFAULT (0 BACKGROUND CPU)'}
+              </span>
+            </div>
+            <h2 className="text-base sm:text-lg font-bold text-white font-mono">
+              Toggleable Self-Check Monitor &amp; Container Observability
+            </h2>
+            <p className="text-xs text-zinc-300 max-w-3xl leading-relaxed">
+              Off by default so Brokeify uses{' '}
+              <strong className="text-white">zero background resources</strong>{' '}
+              during normal listening. Flip the switch below to run periodic
+              self-checks on <code className="text-[#00ff66]">/api/ping</code>,{' '}
+              <code className="text-[#00ff66]">/data/brokeify.db</code> (WAL
+              mode), <code className="text-[#00ff66]">/music</code> library
+              mount, and optional integrations (<strong className="text-white">slskd</strong>,{' '}
+              <strong className="text-white">Lidarr</strong>,{' '}
+              <strong className="text-white">MusicBrainz</strong>,{' '}
+              <strong className="text-white">LRCLIB</strong>), while streaming
+              structured <code className="text-amber-300">[DOZZLE-HEALTHCHECK]</code>{' '}
+              lines to container stdout for <strong className="text-white">Dozzle</strong>.
+            </p>
+          </div>
+
+          {/* Toggle Switch + Uptime Kuma Copy Button */}
+          <div className="flex flex-wrap items-center gap-3 shrink-0">
+            <button
+              type="button"
+              role="switch"
+              aria-checked={systemHealthEnabled}
+              onClick={handleToggleSystemHealth}
+              data-testid="toggle-system-health-diagnostics"
+              className={`inline-flex items-center gap-3 rounded-xl border px-4 py-2.5 text-xs font-mono font-bold transition-all min-h-[44px] ${
+                systemHealthEnabled
+                  ? 'border-[#00ff66] bg-emerald-500/15 text-white shadow-md'
+                  : 'border-zinc-700 bg-zinc-900 hover:border-zinc-600 text-zinc-300'
+              }`}
+            >
+              <span
+                className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                  systemHealthEnabled ? 'bg-[#00ff66]' : 'bg-zinc-700'
+                }`}
+              >
+                <span
+                  className={`inline-block h-3.5 w-3.5 transform rounded-full bg-zinc-950 transition-transform ${
+                    systemHealthEnabled ? 'translate-x-4' : 'translate-x-1'
+                  }`}
+                />
+              </span>
+              <div className="text-left">
+                <div className="text-xs font-bold leading-tight">
+                  System Health &amp; Diagnostics:{' '}
+                  <span
+                    className={
+                      systemHealthEnabled ? 'text-[#00ff66]' : 'text-zinc-400'
+                    }
+                  >
+                    {systemHealthEnabled ? 'ON' : 'OFF'}
+                  </span>
+                </div>
+                <div className="text-[10px] font-normal text-zinc-400">
+                  {systemHealthEnabled
+                    ? `Last check: ${pingTelemetry?.checkedAt || 'running...'}`
+                    : 'Zero background polling'}
+                </div>
+              </div>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleCopyKumaEndpoint}
+              data-testid="btn-copy-uptime-kuma-url"
+              className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-900 hover:border-[#00ff66]/50 px-3.5 py-2.5 text-xs font-mono font-bold text-zinc-200 hover:text-white transition-colors min-h-[44px]"
+              title="Copy /api/ping endpoint URL for Uptime Kuma HTTP(s) or JSON Query monitor"
+            >
+              {copiedKumaUrl ? (
+                <ClipboardCheck className="w-4 h-4 text-[#00ff66]" />
+              ) : (
+                <Copy className="w-4 h-4 text-[#00ff66]" />
+              )}
+              <span>
+                {copiedKumaUrl ? 'Copied /api/ping!' : 'Uptime Kuma URL'}
+              </span>
+            </button>
+          </div>
+        </div>
+
+        {/* Live Status Badges (Shown when System Health switch is ON or after a manual 1-Click Health Check) */}
+        {(systemHealthEnabled || healthChecks.length > 0 || pingTelemetry) && (
+          <div
+            className="pt-3 border-t border-zinc-800/90 space-y-3"
+            data-testid="live-health-status-badges"
+          >
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+              {/* 1. API Server & Response Latency (/api/ping) */}
+              <div
+                data-testid="health-badge-api-ping"
+                className={`rounded-xl border p-3.5 space-y-1.5 ${
+                  pingTelemetry?.ok !== false && apiPingCheck?.status !== 'error'
+                    ? 'border-emerald-500/40 bg-emerald-950/20'
+                    : 'border-rose-500/50 bg-rose-950/25'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-mono font-bold text-white">
+                    1. API Server (`/api/ping`)
+                  </span>
+                  <span
+                    className={`inline-flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-mono font-bold uppercase ${
+                      pingTelemetry?.ok !== false &&
+                      apiPingCheck?.status !== 'error'
+                        ? 'bg-emerald-500/20 text-[#00ff66]'
+                        : 'bg-rose-500/25 text-rose-300'
+                    }`}
+                  >
+                    {isRunningDiagnostics && !pingTelemetry ? (
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                    ) : pingTelemetry?.ok !== false ? (
+                      `${pingTelemetry?.latencyMs ?? apiPingCheck?.latencyMs ?? 1}ms ONLINE`
+                    ) : (
+                      'UNREACHABLE'
+                    )}
+                  </span>
+                </div>
+                <p className="text-xs text-zinc-200 font-mono">
+                  {apiPingCheck?.summary ||
+                    (pingTelemetry
+                      ? `HTTP 200 OK · Round-trip latency ${pingTelemetry.latencyMs}ms · Uptime ${Math.floor(
+                          pingTelemetry.uptimeSec / 60
+                        )}m`
+                      : 'Measuring /api/ping response latency...')}
+                </p>
+                <p className="text-[11px] text-zinc-400 font-mono">
+                  Uptime Kuma ready (`/api/ping`) · Dozzle stdout structured logs active
+                </p>
+              </div>
+
+              {/* 2. SQLite Database (/data/brokeify.db read/write & WAL status) */}
+              <div
+                data-testid="health-badge-sqlite"
+                className={`rounded-xl border p-3.5 space-y-1.5 ${
+                  sqliteCheck?.status === 'error' ||
+                  pingTelemetry?.sqlite?.writable === false
+                    ? 'border-rose-500/50 bg-rose-950/25'
+                    : 'border-emerald-500/40 bg-emerald-950/20'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-mono font-bold text-white">
+                    2. SQLite DB (`/data/brokeify.db`)
+                  </span>
+                  <span
+                    className={`inline-flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-mono font-bold uppercase ${
+                      sqliteCheck?.status === 'error' ||
+                      pingTelemetry?.sqlite?.writable === false
+                        ? 'bg-rose-500/25 text-rose-300'
+                        : 'bg-emerald-500/20 text-[#00ff66]'
+                    }`}
+                  >
+                    {sqliteCheck?.status === 'error'
+                      ? 'LOCKED / ERROR'
+                      : `R/W OK · ${(
+                          pingTelemetry?.sqlite?.journalMode || 'WAL'
+                        ).toUpperCase()}`}
+                  </span>
+                </div>
+                <p className="text-xs text-zinc-200 font-mono">
+                  {sqliteCheck?.summary ||
+                    (pingTelemetry?.sqlite
+                      ? `Read/Write OK · journal_mode=${pingTelemetry.sqlite.journalMode.toUpperCase()} · busy_timeout=${pingTelemetry.sqlite.busyTimeoutMs}ms`
+                      : 'Verifying /data/brokeify.db WAL & write probe...')}
+                </p>
+                <p className="text-[11px] text-zinc-400 font-mono truncate">
+                  {sqliteCheck?.details ||
+                    pingTelemetry?.sqlite?.path ||
+                    '/data/brokeify.db'}
+                </p>
+              </div>
+
+              {/* 3. Music Library Mount (/music readable & track count) */}
+              <div
+                data-testid="health-badge-music-mount"
+                className={`rounded-xl border p-3.5 space-y-1.5 ${
+                  musicMountCheck?.status === 'error'
+                    ? 'border-rose-500/50 bg-rose-950/25'
+                    : musicMountCheck?.status === 'warn' ||
+                        pingTelemetry?.musicMount?.readable === false
+                      ? 'border-amber-500/40 bg-amber-950/20'
+                      : 'border-emerald-500/40 bg-emerald-950/20'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-mono font-bold text-white">
+                    3. Music Mount (`/music`)
+                  </span>
+                  <span
+                    className={`inline-flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-mono font-bold uppercase ${
+                      musicMountCheck?.status === 'ok' ||
+                      pingTelemetry?.musicMount?.readable
+                        ? 'bg-emerald-500/20 text-[#00ff66]'
+                        : 'bg-amber-500/20 text-amber-300'
+                    }`}
+                  >
+                    {musicMountCheck?.status === 'ok' ||
+                    pingTelemetry?.musicMount?.readable
+                      ? `READABLE · ${
+                          pingTelemetry?.musicMount?.totalTracks ?? 0
+                        } TRACKS`
+                      : 'EMPTY / UNMOUNTED'}
+                  </span>
+                </div>
+                <p className="text-xs text-zinc-200 font-mono">
+                  {musicMountCheck?.summary ||
+                    (pingTelemetry?.musicMount
+                      ? `${
+                          pingTelemetry.musicMount.readable
+                            ? 'Mount readable'
+                            : 'Mount not found (safe fallback)'
+                        } · ${pingTelemetry.musicMount.totalTracks} tracks, ${
+                          pingTelemetry.musicMount.totalAlbums
+                        } albums`
+                      : 'Checking /music mount & indexed track count...')}
+                </p>
+                <p className="text-[11px] text-zinc-400 font-mono truncate">
+                  {musicMountCheck?.details ||
+                    pingTelemetry?.musicMount?.path ||
+                    '/music'}
+                </p>
+              </div>
+
+              {/* 4. Optional Integrations (slskd, Lidarr, MusicBrainz, LRCLIB reachability) */}
+              <div
+                data-testid="health-badge-optional-integrations"
+                className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-3.5 space-y-2"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-mono font-bold text-white">
+                    4. Optional Integrations
+                  </span>
+                  <span className="inline-flex items-center gap-1 rounded bg-zinc-800 px-2 py-0.5 text-[10px] font-mono font-bold uppercase text-zinc-300">
+                    {optionalIntegrationChecks.filter((c) => c.status === 'ok')
+                      .length}{' '}
+                    / 4 ONLINE
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-1.5 pt-0.5">
+                  {(
+                    [
+                      { id: 'slskd', label: 'slskd' },
+                      { id: 'lidarr', label: 'Lidarr' },
+                      { id: 'musicbrainz', label: 'MusicBrainz' },
+                      { id: 'lrclib', label: 'LRCLIB' },
+                    ] as const
+                  ).map((svc) => {
+                    const chk = checkById.get(svc.id);
+                    const status = chk?.status || 'unconfigured';
+                    return (
+                      <div
+                        key={svc.id}
+                        data-testid={`health-subbadge-${svc.id}`}
+                        title={chk?.summary || `${svc.label}: not checked yet`}
+                        className={`flex items-center justify-between gap-1 rounded-lg border px-2 py-1 text-[11px] font-mono ${
+                          status === 'ok'
+                            ? 'border-emerald-500/40 bg-emerald-950/30 text-[#00ff66]'
+                            : status === 'error'
+                              ? 'border-rose-500/50 bg-rose-950/30 text-rose-300'
+                              : 'border-zinc-800 bg-zinc-950/70 text-zinc-400'
+                        }`}
+                      >
+                        <span className="font-bold truncate">{svc.label}</span>
+                        <span className="text-[10px] uppercase shrink-0">
+                          {status === 'ok'
+                            ? chk?.latencyMs
+                              ? `${chk.latencyMs}ms`
+                              : 'OK'
+                            : status === 'error'
+                              ? 'ERR'
+                              : 'OPT'}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
 
       {/* Top Banner: Plain-English Diagnostic & Error Hunter Overview */}
       <div className="winamp-bezel rounded-2xl border border-emerald-500/40 bg-zinc-950/90 p-5 space-y-4">
@@ -416,12 +874,12 @@ export const DebugLogsView: React.FC<DebugLogsViewProps> = ({
           </div>
         )}
 
-        {/* Health Check Results Grid (shown when user clicks 1-Click Health Check) */}
+        {/* Health Check Results Grid (shown when user clicks 1-Click Health Check or enables System Health) */}
         {healthChecks.length > 0 && (
           <div className="pt-3 border-t border-zinc-800/80 space-y-2.5">
             <div className="text-xs font-mono font-bold uppercase tracking-wider text-zinc-300 flex items-center gap-2">
               <Server className="w-3.5 h-3.5 text-[#00ff66]" />
-              <span>Homelab Service Health Check Results</span>
+              <span>Detailed Service Diagnostic Breakdown</span>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
               {healthChecks.map((chk) => (
@@ -449,7 +907,9 @@ export const DebugLogsView: React.FC<DebugLogsViewProps> = ({
                       }`}
                     >
                       {chk.status === 'ok'
-                        ? 'ONLINE'
+                        ? chk.latencyMs
+                          ? `ONLINE (${chk.latencyMs}ms)`
+                          : 'ONLINE'
                         : chk.status === 'error'
                           ? 'ERROR'
                           : 'OPTIONAL'}

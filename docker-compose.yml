@@ -1,29 +1,32 @@
 services:
   brokeify:
+    build: .
     image: ghcr.io/mr-nickey/brokeify:latest
-    pull_policy: always
     container_name: brokeify
     restart: unless-stopped
     ports:
-      - "3487:3487"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - "${PORT:-3487}:3487"
     environment:
       - NODE_ENV=production
       - PORT=3487
+      - DATA_DIR=/data
+      - MUSIC_DIR=/music
       - BROKEIFY_DATA_DIR=/data
       - BROKEIFY_MUSIC_DIR=/music
-      # Optional downloader & scrobbler integrations (can also be configured in the Web UI Settings):
-      # - SLSKD_URL=http://192.168.1.175:5030
-      # - SLSKD_API_KEY=your_key_here
-      # - LIDARR_URL=http://192.168.1.175:8686
-      # - LIDARR_API_KEY=your_lidarr_key_here
-      # - LISTENBRAINZ_USER=your_user_here
-      # - LISTENBRAINZ_TOKEN=your_token_here
+      - TRUST_PROXY=${TRUST_PROXY:-1}
+      - ALLOW_SIGNUP=${ALLOW_SIGNUP:-false}
+      - CORS_ORIGIN=${CORS_ORIGIN:-*}
+      - JWT_SECRET=${JWT_SECRET:-}
+      # Optional External Downloader & Scrobbler Integrations:
+      - SLSKD_URL=${SLSKD_URL:-}
+      - SLSKD_API_KEY=${SLSKD_API_KEY:-}
+      - LIDARR_URL=${LIDARR_URL:-}
+      - LIDARR_API_KEY=${LIDARR_API_KEY:-}
+      - LISTENBRAINZ_USER=${LISTENBRAINZ_USER:-}
+      - LISTENBRAINZ_TOKEN=${LISTENBRAINZ_TOKEN:-}
     volumes:
-      # Persistent SQLite database (/data/brokeify.db), cover art cache (/data/covers), and config.json:
+      # Persistent SQLite database (/data/brokeify.db), JWT secret, and extracted album cover cache
       - ./data:/data
-      # Mount your local hard drive or NAS music folder to /music inside the container:
-      # Example (Windows / WSL2): /d/Message:/music:rw
-      # Example (Linux / NAS):    /mnt/nas/music:/music:rw
-      - /path/to/your/music:/music:rw
+      # Mount your local music collection (:ro for read-only safety, or :rw if using built-in downloaders/taggers)
+      - /path/to/your/music:/music:ro
+

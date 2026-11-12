@@ -25,6 +25,7 @@ import {
   DB_PATH,
   MUSIC_DIR,
   getMusicDir,
+  isSafePathWithinAllowedRoots,
   inspectMusicDrive,
   setMusicDirectory,
   db,
@@ -45,6 +46,7 @@ import {
   importM3uPlaylistFile,
   reconcilePlaylistsWithLibrary,
   queryTracks,
+  countMatchingTracks,
   queryArtists,
   queryAlbums,
   queryPlaylists,
@@ -54,7 +56,16 @@ import {
   updateTrackMetadataInDb,
   getLikedTrackIds,
   toggleLikedTrack,
+  getArtistById,
+  getAlbumById,
+  buildSongRadioQueue,
+  addTracksToPlaylist,
+  removeTrackFromPlaylist,
+  reorderPlaylistTracks,
+  exportPlaylistM3u8,
+  getRecentPlayHistory,
 } from './src/server/libraryEngine.ts';
+import { generateBrokeifyApiSpecMarkdown } from './src/server/apiSpecGenerator.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -62,12 +73,114 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(cors());
+
+// Reverse-Proxy-Aware client IP resolution (Nginx Proxy Manager / Cloudflare / Traefik)
+const TRUST_PROXY_HOPS = Number(process.env.TRUST_PROXY ?? 1);
+app.set('trust proxy', Number.isFinite(TRUST_PROXY_HOPS) ? TRUST_PROXY_HOPS : 1);
+
+// Configurable CORS policy
+const CORS_ORIGIN_ENV = String(process.env.CORS_ORIGIN || '*').trim();
+app.use(
+  cors({
+    origin:
+      CORS_ORIGIN_ENV === '*'
+        ? true
+        : CORS_ORIGIN_ENV.split(',').map((o) => o.trim()).filter(Boolean),
+    credentials: true,
+    exposedHeaders: [
+      'Content-Range',
+      'Accept-Ranges',
+      'Content-Length',
+      'ETag',
+      'RateLimit-Limit',
+      'RateLimit-Remaining',
+      'Retry-After',
+    ],
+  })
+);
 app.use(express.json({ limit: '15mb' }));
 
 const CONFIG_FILE_PATH = path.join(DATA_DIR, 'config.json');
+const JWT_SECRET_FILE_PATH = path.join(DATA_DIR, '.jwt_secret');
 const DEBUG_LOGS_FILE_PATH = path.join(DATA_DIR, 'debug-logs.json');
 const MAX_SERVER_DEBUG_LOGS = 300;
+
+// Zero Hardcoded Secrets: Load JWT_SECRET from env or persist a random 64-byte cryptographic secret in /data/.jwt_secret
+function resolveJwtSecret(): string {
+  const envSecret = String(process.env.JWT_SECRET || '').trim();
+  if (envSecret.length >= 16) {
+    return envSecret;
+  }
+  try {
+    if (fs.existsSync(JWT_SECRET_FILE_PATH)) {
+      const existing = fs.readFileSync(JWT_SECRET_FILE_PATH, 'utf-8').trim();
+      if (existing.length >= 32) {
+        return existing;
+      }
+    }
+    const generated = crypto.randomBytes(64).toString('hex');
+    fs.mkdirSync(path.dirname(JWT_SECRET_FILE_PATH), { recursive: true });
+    fs.writeFileSync(JWT_SECRET_FILE_PATH, generated, {
+      encoding: 'utf-8',
+      mode: 0o600,
+    });
+    console.warn(
+      `[Brokeify][SECURITY][WARN] JWT_SECRET not set in environment. Generated and persisted a cryptographic secret at ${JWT_SECRET_FILE_PATH}. For production deployments, consider setting JWT_SECRET in .env.`
+    );
+    return generated;
+  } catch {
+    return crypto.randomBytes(64).toString('hex');
+  }
+}
+
+const ACTIVE_JWT_SECRET = resolveJwtSecret();
+
+function signJwtToken(
+  payload: Record<string, any>,
+  expiresInSeconds = 30 * 24 * 3600
+): { token: string; expiresAt: string } {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const expSec = nowSec + expiresInSeconds;
+  const headerB64 = Buffer.from(
+    JSON.stringify({ alg: 'HS256', typ: 'JWT' })
+  ).toString('base64url');
+  const bodyB64 = Buffer.from(
+    JSON.stringify({ ...payload, iat: nowSec, exp: expSec })
+  ).toString('base64url');
+  const signature = crypto
+    .createHmac('sha256', ACTIVE_JWT_SECRET)
+    .update(`${headerB64}.${bodyB64}`)
+    .digest('base64url');
+  return {
+    token: `${headerB64}.${bodyB64}.${signature}`,
+    expiresAt: new Date(expSec * 1000).toISOString(),
+  };
+}
+
+function verifyJwtToken(token: string): Record<string, any> | null {
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length !== 3) return null;
+    const [headerB64, bodyB64, sigB64] = parts;
+    const expectedSig = crypto
+      .createHmac('sha256', ACTIVE_JWT_SECRET)
+      .update(`${headerB64}.${bodyB64}`)
+      .digest('base64url');
+    const sigBuf = Buffer.from(sigB64);
+    const expBuf = Buffer.from(expectedSig);
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      return null;
+    }
+    const payload = JSON.parse(Buffer.from(bodyB64, 'base64url').toString('utf-8'));
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (typeof payload.exp === 'number' && payload.exp < nowSec) {
+      return null;
+    }
+    return payload;
+  } catch {
+    return null;
+  }
+}
 
 function redactSecrets(text) {
   if (!text) return '';
@@ -280,13 +393,17 @@ const DEFAULT_SERVER_CONFIG = {
   updatedAt: new Date().toISOString(),
   auth: {
     username: process.env.BROKEIFY_USERNAME || 'admin',
-    password: process.env.BROKEIFY_PASSWORD || 'brokeify',
-    apiToken: process.env.BROKEIFY_API_TOKEN || 'brokeify-standalone-token',
+    password: process.env.BROKEIFY_PASSWORD || '',
+    apiToken:
+      process.env.BROKEIFY_API_TOKEN ||
+      `brk_${crypto.randomBytes(16).toString('hex')}`,
     requireLogin:
       process.env.BROKEIFY_REQUIRE_LOGIN === 'true' ||
       Boolean(process.env.BROKEIFY_PASSWORD),
     autoLockPublicDomain: true,
+    setupCompleted: Boolean(process.env.BROKEIFY_PASSWORD),
     guestUsers: [],
+    apiKeys: [],
   },
   integrations: {
     jellyfinUrl: '',
@@ -402,6 +519,9 @@ function readServerConfig() {
         guestUsers: Array.isArray(parsed.auth?.guestUsers)
           ? parsed.auth.guestUsers
           : [],
+        apiKeys: Array.isArray(parsed.auth?.apiKeys)
+          ? parsed.auth.apiKeys
+          : [],
       },
       integrations: {
         ...DEFAULT_SERVER_CONFIG.integrations,
@@ -466,6 +586,9 @@ function writeServerConfig(nextConfig) {
         guestUsers: Array.isArray(nextConfig.auth.guestUsers)
           ? nextConfig.auth.guestUsers
           : current.auth?.guestUsers || [],
+        apiKeys: Array.isArray(nextConfig.auth.apiKeys)
+          ? nextConfig.auth.apiKeys
+          : current.auth?.apiKeys || [],
       };
     }
     if (nextConfig.integrations) {
@@ -565,6 +688,58 @@ function getSqliteAudioFingerprints() {
 // 1. STANDALONE COMPANION REST API FOR ANDROID, ANDROID AUTO & WEB PLAYER
 // ============================================================================
 
+// GET /api/ping -> Public Handshake Endpoint for Docker HEALTHCHECK, Uptime Kuma, Android / Android Auto & External Clients
+app.get('/api/ping', (_req, res) => {
+  const cfg = readServerConfig();
+  const hasCustomAdminPassword =
+    Boolean(cfg.auth?.password) && cfg.auth?.password !== 'brokeify';
+  const setupRequired = !hasCustomAdminPassword && !cfg.auth?.setupCompleted;
+  const authRequired = Boolean(cfg.auth?.requireLogin);
+  const counts = getLocalLibraryStats();
+
+  let dbWritable = false;
+  try {
+    fs.accessSync(DATA_DIR, fs.constants.R_OK | fs.constants.W_OK);
+    dbWritable = true;
+  } catch {}
+
+  let musicReadable = false;
+  try {
+    fs.accessSync(MUSIC_DIR, fs.constants.R_OK);
+    musicReadable = true;
+  } catch {}
+
+  const mem = process.memoryUsage();
+
+  res.json({
+    ok: true,
+    status: 'ok',
+    name: 'Brokeify',
+    version: '3.0.0-standalone',
+    uptimeSec: Math.round(process.uptime()),
+    memoryRssMb: Math.round((mem.rss || 0) / (1024 * 1024)),
+    setupRequired,
+    authRequired,
+    allowSignup: process.env.ALLOW_SIGNUP === 'true',
+    serverTime: new Date().toISOString(),
+    sqlite: {
+      path: DB_PATH,
+      journalMode: db.pragmaState.journal_mode,
+      busyTimeoutMs: db.pragmaState.busy_timeout,
+      readable: dbWritable,
+      writable: dbWritable,
+    },
+    musicMount: {
+      path: MUSIC_DIR,
+      readable: musicReadable,
+      totalTracks: counts.totalTracks,
+      totalAlbums: counts.totalAlbums,
+      totalArtists: counts.totalArtists,
+      totalPlaylists: counts.totalPlaylists,
+    },
+  });
+});
+
 // GET /api/health -> Returns server status, version, drive connection status, and total indexed track/album/artist counts
 app.get('/api/health', (_req, res) => {
   const counts = getLocalLibraryStats();
@@ -583,16 +758,48 @@ app.get('/api/health', (_req, res) => {
     musicDir: getMusicDir(),
     dbPath: DB_PATH,
     coversDir: COVERS_DIR,
+    sqlite: {
+      journalMode: db.pragmaState.journal_mode,
+      busyTimeoutMs: db.pragmaState.busy_timeout,
+    },
     scanner: scannerState,
     driveStatus,
   });
 });
 
-// GET /api/library/likes -> Returns array of liked track IDs persisted in /data/brokeify.db
-app.get('/api/library/likes', (_req, res) => {
+// GET /api/library/stats -> Returns total tracks, albums, artists, playlists, liked songs, and last scan timestamp
+app.get('/api/library/stats', (_req, res) => {
+  const counts = getLocalLibraryStats();
+  const driveStatus = inspectMusicDrive();
   res.json({
     ok: true,
-    likedTrackIds: getLikedTrackIds(),
+    totalTracks: counts.totalTracks,
+    totalAlbums: counts.totalAlbums,
+    totalArtists: counts.totalArtists,
+    totalPlaylists: counts.totalPlaylists,
+    totalScrobbles: counts.totalScrobbles,
+    likedCount: getLikedTrackIds().length,
+    lastScanAt: scannerState.lastScanAt,
+    isScanning: scannerState.isScanning,
+    musicDir: getMusicDir(),
+    driveConnected: driveStatus.driveConnected,
+    sqlite: {
+      journalMode: db.pragmaState.journal_mode,
+      busyTimeoutMs: db.pragmaState.busy_timeout,
+    },
+  });
+});
+
+// GET /api/library/likes & GET /api/liked -> Returns array of liked track IDs & full track objects persisted in /data/brokeify.db
+app.get(['/api/library/likes', '/api/liked'], (_req, res) => {
+  const likedTrackIds = getLikedTrackIds();
+  const likedSet = new Set(likedTrackIds);
+  const tracks = queryTracks().filter((t) => likedSet.has(t.id));
+  res.json({
+    ok: true,
+    total: tracks.length,
+    likedTrackIds,
+    tracks,
   });
 });
 
@@ -609,19 +816,61 @@ app.post('/api/library/likes/toggle', (req, res) => {
   const result = toggleLikedTrack(trackId, liked);
   res.json({
     ok: true,
+    trackId,
     ...result,
   });
 });
 
-// GET /api/lyrics -> Fetches synchronized (.lrc) and plain lyrics from LRCLIB for Spotify-style Sing-Along Lyrics
+// POST /api/liked/:trackId -> Marks trackId as liked in SQLite
+app.post('/api/liked/:trackId', (req, res) => {
+  const trackId = String(req.params.trackId || '').trim();
+  if (!trackId) {
+    return res.status(400).json({ ok: false, error: 'Missing trackId' });
+  }
+  const result = toggleLikedTrack(trackId, true);
+  res.json({
+    ok: true,
+    trackId,
+    ...result,
+  });
+});
+
+// DELETE /api/liked/:trackId -> Unmarks trackId as liked in SQLite
+app.delete('/api/liked/:trackId', (req, res) => {
+  const trackId = String(req.params.trackId || '').trim();
+  if (!trackId) {
+    return res.status(400).json({ ok: false, error: 'Missing trackId' });
+  }
+  const result = toggleLikedTrack(trackId, false);
+  res.json({
+    ok: true,
+    trackId,
+    ...result,
+  });
+});
+
+// GET /api/lyrics -> Fetches synchronized (.lrc) and plain lyrics from LRCLIB (supports ?trackId= or ?title=&artist=)
 app.get('/api/lyrics', async (req, res) => {
-  const title = String(req.query.title || '').trim();
-  const artist = String(req.query.artist || '').trim();
-  const album = String(req.query.album || '').trim();
-  const duration = Number(req.query.duration || 0);
+  const trackId = String(req.query.trackId || req.query.id || '').trim();
+  let title = String(req.query.title || '').trim();
+  let artist = String(req.query.artist || '').trim();
+  let album = String(req.query.album || '').trim();
+  let duration = Number(req.query.duration || 0);
+
+  if (trackId && !title) {
+    const lookedUp = getTrackWithArtistAlbum(trackId);
+    if (lookedUp) {
+      title = lookedUp.title;
+      artist = lookedUp.artist;
+      album = lookedUp.album;
+      duration = Math.round((lookedUp.duration_ms || 180000) / 1000);
+    }
+  }
 
   if (!title) {
-    return res.status(400).json({ ok: false, error: 'Missing track title' });
+    return res
+      .status(400)
+      .json({ ok: false, error: 'Missing track title or valid trackId' });
   }
 
   try {
@@ -768,11 +1017,21 @@ interface RateLimitEntry {
 }
 
 const authRateLimitMap = new Map<string, RateLimitEntry>();
-const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
 const RATE_LIMIT_LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
-const MAX_AUTH_FAILURES = 5;
+const MAX_AUTH_FAILURES = 10;
+
+// Sliding window rate limiter for auth endpoints (max 10 requests per 15 minutes per IP)
+const authRequestWindowMap = new Map<string, { count: number; resetAt: number }>();
+// Generous sliding window rate limiter for general /api/* routes (excluding /api/stream/* & /api/covers/*)
+const generalApiWindowMap = new Map<string, { count: number; resetAt: number }>();
+const GENERAL_API_WINDOW_MS = 60 * 1000; // 1 minute
+const GENERAL_API_MAX_REQ = 600; // 600 req/min per IP
 
 function getClientIp(req): string {
+  if (req.ip) {
+    return String(req.ip).replace(/^::ffff:/, '').trim();
+  }
   return String(
     req.headers['cf-connecting-ip'] ||
       req.headers['x-real-ip'] ||
@@ -781,7 +1040,37 @@ function getClientIp(req): string {
       'unknown'
   )
     .split(',')[0]
+    .replace(/^::ffff:/, '')
     .trim();
+}
+
+function checkAuthEndpointRateLimit(req, res): boolean {
+  const ip = getClientIp(req);
+  const now = Date.now();
+  let bucket = authRequestWindowMap.get(ip);
+  if (!bucket || bucket.resetAt <= now) {
+    bucket = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+    authRequestWindowMap.set(ip, bucket);
+  }
+  bucket.count += 1;
+  const remaining = Math.max(0, MAX_AUTH_FAILURES - bucket.count);
+  const retryAfterSec = Math.max(1, Math.ceil((bucket.resetAt - now) / 1000));
+  res.setHeader('RateLimit-Limit', String(MAX_AUTH_FAILURES));
+  res.setHeader('RateLimit-Remaining', String(remaining));
+  if (bucket.count > MAX_AUTH_FAILURES) {
+    res.setHeader('Retry-After', String(retryAfterSec));
+    securityStats.blockedBruteForceCount += 1;
+    securityStats.lastBlockedAt = new Date().toISOString();
+    res.status(429).json({
+      ok: false,
+      error: `Too many authentication attempts from your IP (${ip}). Please try again in ${Math.ceil(
+        retryAfterSec / 60
+      )} minute(s).`,
+      retryAfterSeconds: retryAfterSec,
+    });
+    return false;
+  }
+  return true;
 }
 
 function checkIpRateLimit(ip: string): {
@@ -832,6 +1121,7 @@ function recordAuthFailure(ip: string, reason: string) {
 
 function clearAuthFailures(ip: string) {
   authRateLimitMap.delete(ip);
+  authRequestWindowMap.delete(ip);
 }
 
 // Strict /robots.txt to keep search engines, AI crawlers, and web scrapers out
@@ -847,14 +1137,17 @@ app.get('/robots.txt', (_req, res) => {
     );
 });
 
-// Global Security Headers & Bot/Scraper Blocker Middleware
+// Global Helmet-Compatible Security Headers, Anti-Bot Shield & General API Rate Limiter
 app.use((req, res, next) => {
   res.setHeader(
     'X-Robots-Tag',
     'noindex, nofollow, noarchive, nosnippet, noimageindex'
   );
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'same-origin');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('X-XSS-Protection', '0');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
 
   const ua = String(req.headers['user-agent'] || '');
   if (ua && BOT_SCRAPER_UA_REGEX.test(ua)) {
@@ -870,6 +1163,33 @@ app.use((req, res, next) => {
     );
     return res.status(403).send('Forbidden');
   }
+
+  // Apply generous rate limit to general /api/* routes (excluding /api/stream/* and /api/cover(s)/* so audio buffering is never throttled)
+  if (
+    req.path.startsWith('/api/') &&
+    !req.path.startsWith('/api/stream/') &&
+    !req.path.startsWith('/api/cover/') &&
+    !req.path.startsWith('/api/covers/')
+  ) {
+    const ip = getClientIp(req);
+    const now = Date.now();
+    let bucket = generalApiWindowMap.get(ip);
+    if (!bucket || bucket.resetAt <= now) {
+      bucket = { count: 0, resetAt: now + GENERAL_API_WINDOW_MS };
+      generalApiWindowMap.set(ip, bucket);
+    }
+    bucket.count += 1;
+    if (bucket.count > GENERAL_API_MAX_REQ) {
+      const retryAfterSec = Math.max(1, Math.ceil((bucket.resetAt - now) / 1000));
+      res.setHeader('Retry-After', String(retryAfterSec));
+      return res.status(429).json({
+        ok: false,
+        error: 'Rate limit exceeded. Please slow down API requests.',
+        retryAfterSeconds: retryAfterSec,
+      });
+    }
+  }
+
   next();
 });
 
@@ -894,7 +1214,7 @@ function computeUserSessionToken(
   role: string
 ): string {
   return crypto
-    .createHash('sha256')
+    .createHmac('sha256', ACTIVE_JWT_SECRET)
     .update(`brokeify-session:${username.toLowerCase()}:${password}:${role}`)
     .digest('hex');
 }
@@ -930,6 +1250,7 @@ interface AuthenticatedUser {
   username: string;
   displayName: string;
   role: 'admin' | 'listener';
+  isAdmin: boolean;
 }
 
 function resolveRequestAuth(req): {
@@ -955,6 +1276,22 @@ function resolveRequestAuth(req): {
     return { authenticated: false, user: null };
   }
 
+  // 1. Check signed JWT Bearer token
+  const jwtPayload = verifyJwtToken(providedToken);
+  if (jwtPayload && jwtPayload.sub && jwtPayload.username) {
+    const role = jwtPayload.role === 'listener' ? 'listener' : 'admin';
+    return {
+      authenticated: true,
+      user: {
+        id: String(jwtPayload.sub),
+        username: String(jwtPayload.username),
+        displayName: String(jwtPayload.displayName || jwtPayload.username),
+        role,
+        isAdmin: role === 'admin',
+      },
+    };
+  }
+
   const adminUser = String(cfg.auth?.username || 'admin').trim();
   const adminPass = String(cfg.auth?.password || 'brokeify').trim();
   const adminApiToken = String(cfg.auth?.apiToken || '').trim();
@@ -964,6 +1301,7 @@ function resolveRequestAuth(req): {
     'admin'
   );
 
+  // 2. Check Admin API token or session token
   if (
     (adminApiToken && providedToken === adminApiToken) ||
     providedToken === adminSessionToken
@@ -975,10 +1313,30 @@ function resolveRequestAuth(req): {
         username: adminUser,
         displayName: adminUser,
         role: 'admin',
+        isAdmin: true,
       },
     };
   }
 
+  // 3. Check Personal API Keys (long-lived tokens generated in Settings for Android / Android Auto)
+  const apiKeys = Array.isArray(cfg.auth?.apiKeys) ? cfg.auth.apiKeys : [];
+  for (const keyObj of apiKeys) {
+    if (keyObj?.token && providedToken === keyObj.token) {
+      const role = keyObj.role === 'listener' ? 'listener' : 'admin';
+      return {
+        authenticated: true,
+        user: {
+          id: keyObj.userId || 'usr-brokeify-admin',
+          username: keyObj.username || adminUser,
+          displayName: keyObj.name || adminUser,
+          role,
+          isAdmin: role === 'admin',
+        },
+      };
+    }
+  }
+
+  // 4. Check Friends & Family (guestUsers) accounts
   const guestUsers = Array.isArray(cfg.auth?.guestUsers)
     ? cfg.auth.guestUsers
     : [];
@@ -998,6 +1356,7 @@ function resolveRequestAuth(req): {
           username: guest.username,
           displayName: guest.displayName || guest.username,
           role: guestRole,
+          isAdmin: guestRole === 'admin',
         },
       };
     }
@@ -1006,16 +1365,20 @@ function resolveRequestAuth(req): {
   return { authenticated: false, user: null };
 }
 
-// API Auth & Role Enforcement Middleware
+// API Auth & Role Enforcement (`isAdmin`) Middleware
 app.use((req, res, next) => {
   if (!req.path.startsWith('/api/')) return next();
 
-  // Always allow public handshake / login / health check endpoints
+  // Public Handshake, Login, Setup, Token Refresh & Quick Connect Pairing Endpoints
   if (
+    req.path === '/api/ping' ||
+    req.path === '/api/health' ||
     req.path === '/api/auth/status' ||
     req.path === '/api/auth/login' ||
+    req.path === '/api/auth/setup' ||
+    req.path === '/api/auth/register' ||
+    req.path === '/api/auth/refresh' ||
     req.path === '/api/auth/logout' ||
-    req.path === '/api/health' ||
     req.path === '/api/mobile/verify' ||
     req.path.startsWith('/api/mobile/quick-connect')
   ) {
@@ -1031,30 +1394,385 @@ app.use((req, res, next) => {
       ok: false,
       requiresLogin: true,
       error:
-        'Authentication required. Please log in to access this Brokeify server.',
+        'Authentication required. Provide a valid Authorization: Bearer <token> header or log in.',
     });
   }
 
-  // If logged in as a Friends & Family 'listener' account, protect admin settings & file deletion
-  if (authResult.authenticated && authResult.user?.role === 'listener') {
-    const isAdminOnlyRoute =
-      (req.path === '/api/config' && req.method !== 'GET') ||
-      req.path.startsWith('/api/storage/') ||
-      req.path.startsWith('/api/auth/security-config') ||
-      req.path.startsWith('/api/mobile/regenerate-token') ||
-      (req.path.startsWith('/api/library/tracks') && req.method === 'DELETE') ||
-      req.path === '/api/library/tracks/bulk-delete';
+  // Lock down destructive/admin endpoints behind an `isAdmin` check
+  const isAdminOnlyRoute =
+    (req.path === '/api/config' && req.method !== 'GET') ||
+    req.path === '/api/library/rescan' ||
+    req.path === '/api/library/scan' ||
+    req.path.startsWith('/api/storage/') ||
+    req.path.startsWith('/api/auth/security-config') ||
+    (req.path.startsWith('/api/auth/api-keys') && req.method !== 'GET') ||
+    req.path.startsWith('/api/mobile/regenerate-token') ||
+    (req.path.startsWith('/api/library/tracks') && req.method === 'DELETE') ||
+    req.path === '/api/library/tracks/bulk-delete';
 
-    if (isAdminOnlyRoute) {
-      return res.status(403).json({
-        ok: false,
-        error:
-          'Admin privileges required. Friends & Family listener accounts cannot modify server settings or delete files.',
-      });
-    }
+  if (
+    isAdminOnlyRoute &&
+    authResult.authenticated &&
+    authResult.user &&
+    !authResult.user.isAdmin
+  ) {
+    return res.status(403).json({
+      ok: false,
+      error:
+        'Admin privileges required. Friends & Family listener accounts cannot modify server settings, trigger rescans, or delete files.',
+    });
   }
 
   next();
+});
+
+// POST /api/auth/setup (and /api/auth/register) -> Initial Admin Setup when setupRequired or ALLOW_SIGNUP=true
+app.post(['/api/auth/setup', '/api/auth/register'], (req, res) => {
+  if (!checkAuthEndpointRateLimit(req, res)) return;
+
+  const cfg = readServerConfig();
+  const hasCustomAdminPassword =
+    Boolean(cfg.auth?.password) && cfg.auth?.password !== 'brokeify';
+  const setupRequired = !hasCustomAdminPassword && !cfg.auth?.setupCompleted;
+  const allowSignup = process.env.ALLOW_SIGNUP === 'true';
+
+  if (!setupRequired && !allowSignup) {
+    return res.status(403).json({
+      ok: false,
+      error:
+        'Initial setup is already completed and public signup is disabled (ALLOW_SIGNUP=false).',
+    });
+  }
+
+  const username = String(req.body?.username || 'admin').trim();
+  const password = String(req.body?.password || '').trim();
+  const displayName = String(req.body?.displayName || username).trim();
+
+  if (!username || password.length < 4) {
+    return res.status(400).json({
+      ok: false,
+      error: 'A username and a password (at least 4 characters) are required.',
+    });
+  }
+
+  if (setupRequired) {
+    const nextAuth = {
+      ...cfg.auth,
+      username,
+      password,
+      setupCompleted: true,
+      requireLogin: true,
+    };
+    writeServerConfig({ auth: nextAuth });
+
+    const userObj: AuthenticatedUser = {
+      id: 'usr-brokeify-admin',
+      username,
+      displayName,
+      role: 'admin',
+      isAdmin: true,
+    };
+    const accessJwt = signJwtToken(
+      {
+        sub: userObj.id,
+        username: userObj.username,
+        displayName: userObj.displayName,
+        role: userObj.role,
+      },
+      7 * 24 * 3600
+    );
+    const refreshJwt = signJwtToken(
+      {
+        sub: userObj.id,
+        username: userObj.username,
+        displayName: userObj.displayName,
+        role: userObj.role,
+        type: 'refresh',
+      },
+      90 * 24 * 3600
+    );
+
+    res.setHeader(
+      'Set-Cookie',
+      `brokeify_session=${encodeURIComponent(
+        accessJwt.token
+      )}; Path=/; Max-Age=2592000; SameSite=Lax; HttpOnly`
+    );
+
+    pushServerLog(
+      'info',
+      'system',
+      `[Security] Completed initial admin setup for "${username}"`
+    );
+    return res.status(201).json({
+      ok: true,
+      token: accessJwt.token,
+      refreshToken: refreshJwt.token,
+      expiresAt: accessJwt.expiresAt,
+      apiKey: ensureMobileApiToken(false),
+      user: userObj,
+    });
+  }
+
+  // When ALLOW_SIGNUP=true after initial setup, create a listener guest user
+  const guestUsers = Array.isArray(cfg.auth?.guestUsers)
+    ? [...cfg.auth.guestUsers]
+    : [];
+  if (
+    username.toLowerCase() ===
+      String(cfg.auth?.username || 'admin').toLowerCase() ||
+    guestUsers.some(
+      (g) => String(g.username).toLowerCase() === username.toLowerCase()
+    )
+  ) {
+    return res.status(400).json({
+      ok: false,
+      error: `Username "${username}" is already taken.`,
+    });
+  }
+
+  const newGuest = {
+    id: `usr-${Date.now().toString(36)}`,
+    username,
+    displayName,
+    password,
+    role: 'listener' as const,
+    apiToken: `brk_guest_${crypto.randomBytes(16).toString('hex')}`,
+    createdAt: new Date().toISOString(),
+    lastLoginAt: new Date().toISOString(),
+  };
+  guestUsers.push(newGuest);
+  writeServerConfig({ auth: { ...cfg.auth, guestUsers } });
+
+  const userObj: AuthenticatedUser = {
+    id: newGuest.id,
+    username: newGuest.username,
+    displayName: newGuest.displayName,
+    role: 'listener',
+    isAdmin: false,
+  };
+  const accessJwt = signJwtToken(
+    {
+      sub: userObj.id,
+      username: userObj.username,
+      displayName: userObj.displayName,
+      role: userObj.role,
+    },
+    7 * 24 * 3600
+  );
+  const refreshJwt = signJwtToken(
+    {
+      sub: userObj.id,
+      username: userObj.username,
+      displayName: userObj.displayName,
+      role: userObj.role,
+      type: 'refresh',
+    },
+    90 * 24 * 3600
+  );
+
+  return res.status(201).json({
+    ok: true,
+    token: accessJwt.token,
+    refreshToken: refreshJwt.token,
+    expiresAt: accessJwt.expiresAt,
+    user: userObj,
+  });
+});
+
+// GET /api/auth/me -> Validates Bearer token and returns current user profile
+app.get('/api/auth/me', (req, res) => {
+  const cfg = readServerConfig();
+  const authResult = resolveRequestAuth(req);
+  if (!authResult.authenticated && cfg.auth?.requireLogin) {
+    return res.status(401).json({
+      ok: false,
+      authenticated: false,
+      error: 'Invalid or expired authentication token.',
+    });
+  }
+
+  const fallbackAdmin: AuthenticatedUser = {
+    id: 'usr-brokeify-admin',
+    username: cfg.auth?.username || 'admin',
+    displayName: cfg.auth?.username || 'admin',
+    role: 'admin',
+    isAdmin: true,
+  };
+
+  return res.json({
+    ok: true,
+    authenticated: true,
+    user: authResult.user || fallbackAdmin,
+  });
+});
+
+// POST /api/auth/refresh -> Exchanges a valid refreshToken (or Bearer token) for a fresh JWT
+app.post('/api/auth/refresh', (req, res) => {
+  const rawRefresh = String(
+    req.body?.refreshToken ||
+      req.body?.token ||
+      String(req.headers.authorization || '').replace(/^Bearer\s+/i, '') ||
+      ''
+  ).trim();
+
+  const verified = verifyJwtToken(rawRefresh);
+  if (!verified || !verified.sub || !verified.username) {
+    return res.status(401).json({
+      ok: false,
+      error: 'Invalid or expired refresh token.',
+    });
+  }
+
+  const role = verified.role === 'listener' ? 'listener' : 'admin';
+  const userObj: AuthenticatedUser = {
+    id: String(verified.sub),
+    username: String(verified.username),
+    displayName: String(verified.displayName || verified.username),
+    role,
+    isAdmin: role === 'admin',
+  };
+
+  const accessJwt = signJwtToken(
+    {
+      sub: userObj.id,
+      username: userObj.username,
+      displayName: userObj.displayName,
+      role: userObj.role,
+    },
+    7 * 24 * 3600
+  );
+  const refreshJwt = signJwtToken(
+    {
+      sub: userObj.id,
+      username: userObj.username,
+      displayName: userObj.displayName,
+      role: userObj.role,
+      type: 'refresh',
+    },
+    90 * 24 * 3600
+  );
+
+  return res.json({
+    ok: true,
+    token: accessJwt.token,
+    refreshToken: refreshJwt.token,
+    expiresAt: accessJwt.expiresAt,
+    user: userObj,
+  });
+});
+
+// GET /api/auth/api-keys -> Lists Personal API Keys for Android / Android Auto / External Clients
+app.get('/api/auth/api-keys', (_req, res) => {
+  const cfg = readServerConfig();
+  const apiKeys = (Array.isArray(cfg.auth?.apiKeys) ? cfg.auth.apiKeys : []).map(
+    (k) => ({
+      id: k.id,
+      name: k.name,
+      prefix: String(k.token || '').slice(0, 14) + '••••••••',
+      role: k.role || 'admin',
+      createdAt: k.createdAt,
+      lastUsedAt: k.lastUsedAt || null,
+    })
+  );
+  res.json({
+    ok: true,
+    apiKeys,
+  });
+});
+
+// POST /api/auth/api-keys -> Generates a new revocable Personal API Key (brk_live_...)
+app.post('/api/auth/api-keys', (req, res) => {
+  const cfg = readServerConfig();
+  const name = String(
+    req.body?.name || req.body?.deviceName || 'Android Auto / Companion Client'
+  ).trim();
+  const role = req.body?.role === 'listener' ? 'listener' : 'admin';
+
+  if (!name) {
+    return res
+      .status(400)
+      .json({ ok: false, error: 'Token name/label is required.' });
+  }
+
+  const rawToken = `brk_live_${crypto.randomBytes(24).toString('hex')}`;
+  const newKey = {
+    id: `key-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
+    name,
+    token: rawToken,
+    role,
+    userId: 'usr-brokeify-admin',
+    username: cfg.auth?.username || 'admin',
+    createdAt: new Date().toISOString(),
+    lastUsedAt: null,
+  };
+
+  const apiKeys = Array.isArray(cfg.auth?.apiKeys)
+    ? [newKey, ...cfg.auth.apiKeys]
+    : [newKey];
+  writeServerConfig({
+    auth: {
+      ...cfg.auth,
+      apiKeys,
+    },
+  });
+
+  pushServerLog(
+    'info',
+    'system',
+    `[Security] Generated Personal API Key "${name}" (${role})`
+  );
+
+  return res.status(201).json({
+    ok: true,
+    apiKey: {
+      id: newKey.id,
+      name: newKey.name,
+      token: rawToken,
+      prefix: rawToken.slice(0, 14) + '••••••••',
+      role: newKey.role,
+      createdAt: newKey.createdAt,
+    },
+    apiKeys: apiKeys.map((k) => ({
+      id: k.id,
+      name: k.name,
+      prefix: String(k.token || '').slice(0, 14) + '••••••••',
+      role: k.role || 'admin',
+      createdAt: k.createdAt,
+      lastUsedAt: k.lastUsedAt || null,
+    })),
+    message: `Created Personal API Key "${name}". Copy the token now!`,
+  });
+});
+
+// DELETE /api/auth/api-keys/:id -> Revokes a Personal API Key
+app.delete('/api/auth/api-keys/:id', (req, res) => {
+  const keyId = String(req.params.id || '').trim();
+  const cfg = readServerConfig();
+  const existing = Array.isArray(cfg.auth?.apiKeys) ? cfg.auth.apiKeys : [];
+  const nextKeys = existing.filter((k) => k.id !== keyId);
+  if (nextKeys.length === existing.length) {
+    return res.status(404).json({ ok: false, error: 'API key not found.' });
+  }
+  writeServerConfig({
+    auth: {
+      ...cfg.auth,
+      apiKeys: nextKeys,
+    },
+  });
+  return res.json({
+    ok: true,
+    revokedId: keyId,
+    apiKeys: nextKeys.map((k) => ({
+      id: k.id,
+      name: k.name,
+      prefix: String(k.token || '').slice(0, 14) + '••••••••',
+      role: k.role || 'admin',
+      createdAt: k.createdAt,
+      lastUsedAt: k.lastUsedAt || null,
+    })),
+    message: 'Personal API Key revoked.',
+  });
 });
 
 // GET /api/auth/status -> Checks current session, whether login gate is active, and public domain status
@@ -1067,7 +1785,7 @@ app.get('/api/auth/status', (req, res) => {
     req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3487'
   ).split(',')[0];
   const isDefaultPassword =
-    String(cfg.auth?.password || 'brokeify') === 'brokeify';
+    !cfg.auth?.password || String(cfg.auth?.password) === 'brokeify';
 
   res.json({
     ok: true,
@@ -1083,6 +1801,7 @@ app.get('/api/auth/status', (req, res) => {
       username: cfg.auth?.username || 'admin',
       displayName: cfg.auth?.username || 'admin',
       role: 'admin',
+      isAdmin: true,
     },
     securityStats: {
       ...securityStats,
@@ -1093,8 +1812,10 @@ app.get('/api/auth/status', (req, res) => {
   });
 });
 
-// POST /api/auth/login -> Authenticates Admin or Friends & Family user and sets HttpOnly session cookie
+// POST /api/auth/login -> Authenticates Admin or Friends & Family user, returns JWT + refreshToken + sets HttpOnly cookie
 app.post('/api/auth/login', (req, res) => {
+  if (!checkAuthEndpointRateLimit(req, res)) return;
+
   const clientIp = getClientIp(req);
   const rateCheck = checkIpRateLimit(clientIp);
   if (!rateCheck.allowed) {
@@ -1119,11 +1840,37 @@ app.post('/api/auth/login', (req, res) => {
     (inputPass === adminPass || inputPass === cfg.auth?.apiToken)
   ) {
     clearAuthFailures(clientIp);
-    const sessionToken = computeUserSessionToken(adminUser, adminPass, 'admin');
+    const userObj: AuthenticatedUser = {
+      id: 'usr-brokeify-admin',
+      username: adminUser,
+      displayName: adminUser,
+      role: 'admin',
+      isAdmin: true,
+    };
+    const accessJwt = signJwtToken(
+      {
+        sub: userObj.id,
+        username: userObj.username,
+        displayName: userObj.displayName,
+        role: userObj.role,
+      },
+      7 * 24 * 3600
+    );
+    const refreshJwt = signJwtToken(
+      {
+        sub: userObj.id,
+        username: userObj.username,
+        displayName: userObj.displayName,
+        role: userObj.role,
+        type: 'refresh',
+      },
+      90 * 24 * 3600
+    );
+
     res.setHeader(
       'Set-Cookie',
       `brokeify_session=${encodeURIComponent(
-        sessionToken
+        accessJwt.token
       )}; Path=/; Max-Age=2592000; SameSite=Lax; HttpOnly`
     );
     pushServerLog(
@@ -1133,14 +1880,11 @@ app.post('/api/auth/login', (req, res) => {
     );
     return res.json({
       ok: true,
-      token: sessionToken,
+      token: accessJwt.token,
+      refreshToken: refreshJwt.token,
+      expiresAt: accessJwt.expiresAt,
       apiKey: ensureMobileApiToken(false),
-      user: {
-        id: 'usr-brokeify-admin',
-        username: adminUser,
-        displayName: adminUser,
-        role: 'admin',
-      },
+      user: userObj,
       server: 'Brokeify Native Engine',
       mode: 'standalone',
     });
@@ -1159,18 +1903,40 @@ app.post('/api/auth/login', (req, res) => {
   if (matchedGuest) {
     clearAuthFailures(clientIp);
     const guestRole = matchedGuest.role === 'admin' ? 'admin' : 'listener';
-    const sessionToken = computeUserSessionToken(
-      matchedGuest.username,
-      matchedGuest.password,
-      guestRole
+    const userObj: AuthenticatedUser = {
+      id: matchedGuest.id || `usr-${matchedGuest.username}`,
+      username: matchedGuest.username,
+      displayName: matchedGuest.displayName || matchedGuest.username,
+      role: guestRole,
+      isAdmin: guestRole === 'admin',
+    };
+    const accessJwt = signJwtToken(
+      {
+        sub: userObj.id,
+        username: userObj.username,
+        displayName: userObj.displayName,
+        role: userObj.role,
+      },
+      7 * 24 * 3600
     );
+    const refreshJwt = signJwtToken(
+      {
+        sub: userObj.id,
+        username: userObj.username,
+        displayName: userObj.displayName,
+        role: userObj.role,
+        type: 'refresh',
+      },
+      90 * 24 * 3600
+    );
+
     matchedGuest.lastLoginAt = new Date().toISOString();
     writeServerConfig({ auth: { ...cfg.auth, guestUsers } });
 
     res.setHeader(
       'Set-Cookie',
       `brokeify_session=${encodeURIComponent(
-        sessionToken
+        accessJwt.token
       )}; Path=/; Max-Age=2592000; SameSite=Lax; HttpOnly`
     );
     pushServerLog(
@@ -1180,13 +1946,10 @@ app.post('/api/auth/login', (req, res) => {
     );
     return res.json({
       ok: true,
-      token: sessionToken,
-      user: {
-        id: matchedGuest.id || `usr-${matchedGuest.username}`,
-        username: matchedGuest.username,
-        displayName: matchedGuest.displayName || matchedGuest.username,
-        role: guestRole,
-      },
+      token: accessJwt.token,
+      refreshToken: refreshJwt.token,
+      expiresAt: accessJwt.expiresAt,
+      user: userObj,
       server: 'Brokeify Native Engine',
       mode: 'standalone',
     });
@@ -1233,14 +1996,27 @@ app.get('/api/auth/security-config', (req, res) => {
     }
   }
 
+  const apiKeys = (Array.isArray(cfg.auth?.apiKeys) ? cfg.auth.apiKeys : []).map(
+    (k) => ({
+      id: k.id,
+      name: k.name,
+      prefix: String(k.token || '').slice(0, 14) + '••••••••',
+      role: k.role || 'admin',
+      createdAt: k.createdAt,
+      lastUsedAt: k.lastUsedAt || null,
+    })
+  );
+
   res.json({
     ok: true,
     requireLogin: Boolean(cfg.auth?.requireLogin),
     autoLockPublicDomain: cfg.auth?.autoLockPublicDomain !== false,
     adminUsername: cfg.auth?.username || 'admin',
-    isDefaultPassword: String(cfg.auth?.password || 'brokeify') === 'brokeify',
+    isDefaultPassword:
+      !cfg.auth?.password || String(cfg.auth?.password) === 'brokeify',
     publicDomainDetected: isPublicInternetDomain(req),
     guestUsers,
+    apiKeys,
     pairedDevices: pairedAndroidDevices,
     securityStats,
     blockedIps,
@@ -1926,8 +2702,8 @@ const handleMobileVerifyOrQuickConnect = (req, res) => {
 app.all('/api/mobile/verify', handleMobileVerifyOrQuickConnect);
 app.all('/api/mobile/quick-connect', handleMobileVerifyOrQuickConnect);
 
-// GET /api/library/artists -> Returns all indexed artists
-app.get('/api/library/artists', (req, res) => {
+// GET /api/artists & GET /api/library/artists -> Returns all indexed artists
+app.get(['/api/artists', '/api/library/artists'], (req, res) => {
   const search = String(req.query.search || req.query.q || '').trim();
   const artists = queryArtists(search);
   res.json({
@@ -1937,8 +2713,21 @@ app.get('/api/library/artists', (req, res) => {
   });
 });
 
-// GET /api/library/albums -> Returns all albums (filterable by ?artistId= and ?search=)
-app.get('/api/library/albums', (req, res) => {
+// GET /api/artists/:id & GET /api/library/artists/:id -> Returns single artist profile + albums + top tracks
+app.get(['/api/artists/:id', '/api/library/artists/:id'], (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const artist = getArtistById(id);
+  if (!artist) {
+    return res.status(404).json({ ok: false, error: 'Artist not found' });
+  }
+  res.json({
+    ok: true,
+    artist,
+  });
+});
+
+// GET /api/albums & GET /api/library/albums -> Returns all albums (filterable by ?artistId= and ?search=/q=)
+app.get(['/api/albums', '/api/library/albums'], (req, res) => {
   const artistId = String(req.query.artistId || '').trim() || undefined;
   const search =
     String(req.query.search || req.query.q || '').trim() || undefined;
@@ -1950,18 +2739,66 @@ app.get('/api/library/albums', (req, res) => {
   });
 });
 
-// GET /api/library/tracks -> Returns tracks (filterable by ?albumId=, ?artistId=, or ?search=)
-app.get('/api/library/tracks', (req, res) => {
-  const albumId = String(req.query.albumId || '').trim() || undefined;
-  const artistId = String(req.query.artistId || '').trim() || undefined;
-  const search =
-    String(req.query.search || req.query.q || '').trim() || undefined;
-  const limit = req.query.limit ? Number(req.query.limit) : undefined;
-  const tracks = queryTracks({ albumId, artistId, search, limit });
+// GET /api/albums/:id & GET /api/library/albums/:id -> Returns single album details + ordered tracklist
+app.get(['/api/albums/:id', '/api/library/albums/:id'], (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const album = getAlbumById(id);
+  if (!album) {
+    return res.status(404).json({ ok: false, error: 'Album not found' });
+  }
   res.json({
     ok: true,
-    total: tracks.length,
+    album,
+  });
+});
+
+// GET /api/tracks & GET /api/library/tracks -> Paginated, sortable, filterable track list
+app.get(['/api/tracks', '/api/library/tracks'], (req, res) => {
+  const albumId = String(req.query.albumId || '').trim() || undefined;
+  const artistId = String(req.query.artistId || '').trim() || undefined;
+  const genre = String(req.query.genre || '').trim() || undefined;
+  const search =
+    String(req.query.search || req.query.q || '').trim() || undefined;
+  const sort = String(req.query.sort || '').trim() || undefined;
+  const order = String(req.query.order || 'asc').trim();
+  const limit = req.query.limit ? Number(req.query.limit) : undefined;
+  const offset = req.query.offset ? Number(req.query.offset) : 0;
+
+  const total = countMatchingTracks({ albumId, artistId, genre, search });
+  const tracks = queryTracks({
+    albumId,
+    artistId,
+    genre,
+    search,
+    sort,
+    order,
+    limit,
+    offset,
+  });
+
+  res.json({
+    ok: true,
+    total,
+    limit: limit ?? total,
+    offset,
     tracks,
+  });
+});
+
+// GET /api/radio/track/:id -> 1-Tap Song Radio queue seeded by track ID
+app.get('/api/radio/track/:id', (req, res) => {
+  const seedTrackId = String(req.params.id || '').trim();
+  const limit = req.query.limit ? Math.min(100, Math.max(1, Number(req.query.limit))) : 25;
+  const radio = buildSongRadioQueue(seedTrackId, limit);
+  if (!radio.seedTrack) {
+    return res.status(404).json({ ok: false, error: 'Seed track not found' });
+  }
+  res.json({
+    ok: true,
+    seedTrack: radio.seedTrack,
+    total: radio.queue.length,
+    queue: radio.queue,
+    tracks: radio.queue,
   });
 });
 
@@ -2095,7 +2932,7 @@ app.post('/api/playlists', (req, res) => {
     reconcilePlaylistsWithLibrary();
 
     const created = queryPlaylists().find((p) => p.id === id);
-    res.json({
+    res.status(201).json({
       ok: true,
       playlist: created,
       playlists: queryPlaylists(),
@@ -2108,7 +2945,7 @@ app.post('/api/playlists', (req, res) => {
   }
 });
 
-app.put('/api/playlists/:id', (req, res) => {
+const handleUpdatePlaylist = (req, res) => {
   try {
     const id = String(req.params.id || '').trim();
     const existing = db.playlists.get(id);
@@ -2164,12 +3001,154 @@ app.put('/api/playlists/:id', (req, res) => {
       error: err instanceof Error ? err.message : 'Failed to update playlist.',
     });
   }
+};
+
+app.put('/api/playlists/:id', handleUpdatePlaylist);
+app.patch('/api/playlists/:id', handleUpdatePlaylist);
+
+// POST /api/playlists/:id/tracks -> Add track(s) to playlist (prevents duplicates unless force: true)
+app.post('/api/playlists/:id/tracks', (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const rawTrackIds = Array.isArray(req.body?.trackIds)
+    ? req.body.trackIds.map(String)
+    : req.body?.trackId
+      ? [String(req.body.trackId)]
+      : [];
+  const force = Boolean(req.body?.force);
+
+  const result = addTracksToPlaylist(id, rawTrackIds, { force });
+  if (!result) {
+    return res.status(404).json({ ok: false, error: 'Playlist not found.' });
+  }
+  const updated = queryPlaylists().find((p) => p.id === id);
+  return res.json({
+    ok: true,
+    ...result,
+    playlist: updated,
+    playlists: queryPlaylists(),
+  });
+});
+
+// DELETE /api/playlists/:id/tracks/:trackId -> Remove a track from a playlist
+app.delete('/api/playlists/:id/tracks/:trackId', (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const trackId = String(req.params.trackId || '').trim();
+  const result = removeTrackFromPlaylist(id, trackId);
+  if (!result) {
+    return res.status(404).json({ ok: false, error: 'Playlist not found.' });
+  }
+  const updated = queryPlaylists().find((p) => p.id === id);
+  return res.json({
+    ok: true,
+    ...result,
+    playlist: updated,
+    playlists: queryPlaylists(),
+  });
+});
+
+// PUT /api/playlists/:id/reorder -> Update exact track ordering in SQLite
+app.put('/api/playlists/:id/reorder', (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const trackIds = Array.isArray(req.body?.trackIds)
+    ? req.body.trackIds.map(String)
+    : [];
+  const result = reorderPlaylistTracks(id, trackIds);
+  if (!result) {
+    return res.status(404).json({ ok: false, error: 'Playlist not found.' });
+  }
+  const updated = queryPlaylists().find((p) => p.id === id);
+  return res.json({
+    ok: true,
+    ...result,
+    playlist: updated,
+    playlists: queryPlaylists(),
+  });
+});
+
+// GET /api/playlists/:id/export.m3u8 -> Exports playlist in standard #EXTM3U / #EXTINF format
+app.get('/api/playlists/:id/export.m3u8', (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const exported = exportPlaylistM3u8(id);
+  if (!exported) {
+    return res.status(404).json({ ok: false, error: 'Playlist not found.' });
+  }
+  res.setHeader('Content-Type', 'audio/x-mpegurl; charset=utf-8');
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename="${exported.filename}"`
+  );
+  return res.send(exported.content);
+});
+
+// POST /api/playlists/import -> Imports a playlist from .m3u / .m3u8 text content or JSON track list
+app.post('/api/playlists/import', (req, res) => {
+  try {
+    const name = String(req.body?.name || 'Imported Playlist').trim();
+    const rawM3uContent = String(req.body?.content || req.body?.m3u || '').trim();
+    const providedTrackIds = Array.isArray(req.body?.trackIds)
+      ? req.body.trackIds.map(String)
+      : [];
+
+    const matchedIds: string[] = [...providedTrackIds];
+
+    if (rawM3uContent) {
+      const lines = rawM3uContent
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0 && !l.startsWith('#'));
+
+      const allTracks = queryTracks();
+      const byBasename = new Map<string, string>();
+      const byPath = new Map<string, string>();
+      for (const t of allTracks) {
+        byPath.set(path.resolve(t.filePath), t.id);
+        byBasename.set(path.basename(t.filePath).toLowerCase(), t.id);
+      }
+
+      for (const line of lines) {
+        const normLine = line.replace(/\\/g, '/');
+        const candidateMusic = path.resolve(
+          getMusicDir(),
+          normLine.replace(/^\/+/, '')
+        );
+        const baseName = path.basename(normLine).toLowerCase();
+        const tid = byPath.get(candidateMusic) || byBasename.get(baseName);
+        if (tid && !matchedIds.includes(tid)) {
+          matchedIds.push(tid);
+        }
+      }
+    }
+
+    const id = `pl-import-${Date.now().toString(36)}`;
+    upsertPlaylistWithTracks({
+      id,
+      name,
+      description: `Imported playlist (${matchedIds.length} matched tracks)`,
+      isSmart: false,
+      trackIds: matchedIds,
+    });
+
+    const created = queryPlaylists().find((p) => p.id === id);
+    return res.status(201).json({
+      ok: true,
+      playlist: created,
+      playlists: queryPlaylists(),
+    });
+  } catch (err) {
+    return res.status(400).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Failed to import playlist.',
+    });
+  }
 });
 
 app.delete('/api/playlists/:id', (req, res) => {
   try {
     const id = String(req.params.id || '').trim();
-    deletePlaylistById(id);
+    const existed = deletePlaylistById(id);
+    if (!existed) {
+      return res.status(404).json({ ok: false, error: 'Playlist not found.' });
+    }
     res.json({
       ok: true,
       deletedId: id,
@@ -2282,11 +3261,123 @@ app.post('/api/playlists/merge', (req, res) => {
 });
 
 // ============================================================================
+// 2B. PLAYBACK HISTORY & POSITION SYNC (/api/history, /api/history/recent)
+// ============================================================================
+
+app.post('/api/history', (req, res) => {
+  const trackId = String(req.body?.trackId || req.body?.id || '').trim();
+  const positionSec = Number(req.body?.positionSec || 0);
+  const completed = req.body?.completed !== false;
+
+  if (!trackId) {
+    return res.status(400).json({ ok: false, error: 'Missing trackId' });
+  }
+
+  const nowIso = new Date().toISOString();
+  const updatedTrack = completed
+    ? incrementTrackPlayCount(trackId, nowIso)
+    : db.tracks.get(trackId) || null;
+
+  if (completed) {
+    recordScrobbleInDb(trackId, Math.floor(Date.now() / 1000), false);
+  }
+
+  const cfg = readServerConfig();
+  if (positionSec >= 0) {
+    writeServerConfig({
+      playbackSession: {
+        ...(cfg.playbackSession || {}),
+        trackId,
+        positionSec,
+        updatedAt: nowIso,
+      },
+    });
+  }
+
+  return res.json({
+    ok: true,
+    trackId,
+    playCount: updatedTrack?.play_count ?? 0,
+    lastPlayedAt: updatedTrack?.last_played_at ?? nowIso,
+    positionSec,
+  });
+});
+
+app.get('/api/history/recent', (req, res) => {
+  const limit = req.query.limit
+    ? Math.min(200, Math.max(1, Number(req.query.limit)))
+    : 50;
+  const history = getRecentPlayHistory(limit);
+  return res.json({
+    ok: true,
+    total: history.length,
+    history,
+  });
+});
+
+// ============================================================================
+// 2C. DYNAMIC API HANDSHAKE SPECIFICATION (/api/system/spec)
+// ============================================================================
+
+app.get('/api/system/spec', (req, res) => {
+  const port = Number(process.env.PORT || 3487);
+  const proto = String(
+    req.headers['x-forwarded-proto'] || req.protocol || 'http'
+  )
+    .split(',')[0]
+    .trim();
+  const host = String(
+    req.headers['x-forwarded-host'] || req.headers.host || `localhost:${port}`
+  )
+    .split(',')[0]
+    .trim();
+  const baseUrl = `${proto}://${host}`;
+  const counts = getLocalLibraryStats();
+  const cfg = readServerConfig();
+
+  const markdown = generateBrokeifyApiSpecMarkdown({
+    baseUrl,
+    version: '3.0.0-standalone',
+    port,
+    totalTracks: counts.totalTracks,
+    totalAlbums: counts.totalAlbums,
+    totalArtists: counts.totalArtists,
+    totalPlaylists: counts.totalPlaylists,
+    authRequired: Boolean(cfg.auth?.requireLogin),
+  });
+
+  if (
+    req.query.download === '1' ||
+    req.query.download === 'true' ||
+    String(req.headers.accept || '').includes('text/markdown')
+  ) {
+    res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename="brokeify-api-handshake.md"'
+    );
+    return res.send(markdown);
+  }
+
+  return res.json({
+    ok: true,
+    filename: 'brokeify-api-handshake.md',
+    baseUrl,
+    generatedAt: new Date().toISOString(),
+    markdown,
+  });
+});
+
+// ============================================================================
 // 3. SEEKABLE HTTP 206 AUDIO STREAMING & CACHED COVER ART
 // ============================================================================
 
 app.get('/api/stream/:trackId', (req, res) => {
   return handleStreamTrack(req, res);
+});
+
+app.get('/api/covers/:id', (req, res) => {
+  return handleServeCover(req, res);
 });
 
 app.get('/api/cover/:type/:id', (req, res) => {
@@ -2922,7 +4013,74 @@ function parseRawTracklistText(rawText: string) {
   return parsed;
 }
 
-async function fetchSpotifyTracksFromUrl(rawUrl: string) {
+interface SpotifyImportProgressState {
+  active: boolean;
+  playlistId: string | null;
+  playlistTitle: string;
+  loadedTracks: number;
+  totalTracks: number;
+  currentPage: number;
+  totalPages: number;
+  maxTracks: number | 'all';
+  statusMessage: string;
+  updatedAt: string;
+}
+
+let activeSpotifyImportProgress: SpotifyImportProgressState = {
+  active: false,
+  playlistId: null,
+  playlistTitle: '',
+  loadedTracks: 0,
+  totalTracks: 0,
+  currentPage: 0,
+  totalPages: 0,
+  maxTracks: 1000,
+  statusMessage: 'Idle',
+  updatedAt: new Date().toISOString(),
+};
+
+app.get('/api/spotify/import-progress', (_req, res) => {
+  res.json({
+    ok: true,
+    ...activeSpotifyImportProgress,
+  });
+});
+
+function parseMaxTracksCap(rawMax?: number | string | null): {
+  numericCap: number;
+  label: number | 'all';
+} {
+  if (rawMax === 'all' || rawMax === 'full' || rawMax === 'unlimited') {
+    return { numericCap: 10000, label: 'all' };
+  }
+  const n = Number(rawMax);
+  if (Number.isFinite(n) && n > 0) {
+    return {
+      numericCap: Math.min(10000, Math.max(1, Math.floor(n))),
+      label: Math.floor(n),
+    };
+  }
+  return { numericCap: 1000, label: 1000 };
+}
+
+async function fetchSpotifyTracksFromUrl(
+  rawUrl: string,
+  options?: {
+    maxTracks?: number | string | null;
+    playlistId?: string | null;
+    onPageProgress?: (info: {
+      loadedTracks: number;
+      totalTracks: number;
+      playlistTitle: string;
+      tracks: Array<{
+        title: string;
+        artist: string;
+        album: string;
+        durationSec: number;
+      }>;
+    }) => void;
+  }
+) {
   const cleanUrl = String(rawUrl || '').trim();
   const match =
     cleanUrl.match(
@@ -2937,17 +4095,37 @@ async function fetchSpotifyTracksFromUrl(rawUrl: string) {
 
   const entityType = match[1].toLowerCase();
   const entityId = match[2];
+  const { numericCap, label: maxTracksLabel } = parseMaxTracksCap(
+    options?.maxTracks
+  );
   const embedUrl = `https://open.spotify.com/embed/${entityType}/${entityId}`;
 
+  activeSpotifyImportProgress = {
+    active: true,
+    playlistId: options?.playlistId || entityId,
+    playlistTitle: `Spotify ${entityType}`,
+    loadedTracks: 0,
+    totalTracks: 0,
+    currentPage: 1,
+    totalPages: 1,
+    maxTracks: maxTracksLabel,
+    statusMessage: `Connecting to Spotify for ${entityType} ${entityId}...`,
+    updatedAt: new Date().toISOString(),
+  };
+
+  const browserHeaders = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    Accept: 'text/html,application/xhtml+xml,application/json',
+  };
+
   const resp = await fetch(embedUrl, {
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-      Accept: 'text/html,application/xhtml+xml',
-    },
+    headers: browserHeaders,
   });
 
   if (!resp.ok) {
+    activeSpotifyImportProgress.active = false;
+    activeSpotifyImportProgress.statusMessage = `Spotify returned HTTP ${resp.status}`;
     throw new Error(
       `Spotify returned HTTP ${resp.status} for ${entityType} ${entityId}. Make sure the playlist is public.`
     );
@@ -2962,12 +4140,21 @@ async function fetchSpotifyTracksFromUrl(rawUrl: string) {
     durationSec: number;
   }> = [];
 
+  let embedAccessToken = '';
+  let reportedTotalTracks = 0;
+
   const nextDataMatch = html.match(
     /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/i
   );
   if (nextDataMatch && nextDataMatch[1]) {
     try {
       const nextJson = JSON.parse(nextDataMatch[1]);
+      embedAccessToken = String(
+        nextJson?.props?.pageProps?.state?.settings?.session?.accessToken ||
+          nextJson?.props?.pageProps?.session?.accessToken ||
+          ''
+      ).trim();
+
       const entity =
         nextJson?.props?.pageProps?.state?.data?.entity ||
         nextJson?.props?.pageProps?.entity ||
@@ -2976,12 +4163,16 @@ async function fetchSpotifyTracksFromUrl(rawUrl: string) {
         if (entity.name || entity.title) {
           title = entity.name || entity.title;
         }
+        if (Number(entity?.tracks?.total) > 0) {
+          reportedTotalTracks = Number(entity.tracks.total);
+        }
         const trackList =
           entity.trackList ||
           entity.tracks?.items ||
           (entity.type === 'track' ? [entity] : []);
 
         for (const item of trackList) {
+          if (tracks.length >= numericCap) break;
           const tObj = item.track || item;
           const trackTitle = tObj.title || tObj.name || '';
           const trackArtist =
@@ -2991,12 +4182,14 @@ async function fetchSpotifyTracksFromUrl(rawUrl: string) {
               : '') ||
             entity.subtitle ||
             'Unknown Artist';
+          const trackAlbum =
+            tObj.album?.name || (entityType === 'album' ? title : '');
           const durationMs = Number(tObj.duration || tObj.duration_ms || 0);
           if (trackTitle) {
             tracks.push({
               title: String(trackTitle).replace(/\u00a0/g, ' ').trim(),
               artist: String(trackArtist).replace(/\u00a0/g, ' ').trim(),
-              album: entityType === 'album' ? title : '',
+              album: String(trackAlbum || '').replace(/\u00a0/g, ' ').trim(),
               durationSec:
                 durationMs > 0 ? Math.round(durationMs / 1000) : 210,
             });
@@ -3017,10 +4210,209 @@ async function fetchSpotifyTracksFromUrl(rawUrl: string) {
     }
   }
 
+  const effectiveTotalInitial = Math.min(
+    numericCap,
+    Math.max(reportedTotalTracks, tracks.length)
+  );
+  activeSpotifyImportProgress = {
+    ...activeSpotifyImportProgress,
+    playlistTitle: title,
+    loadedTracks: tracks.length,
+    totalTracks: effectiveTotalInitial,
+    currentPage: 1,
+    totalPages: Math.max(1, Math.ceil(effectiveTotalInitial / 100)),
+    statusMessage: `Fetching tracks from Spotify: ${tracks.length} / ${effectiveTotalInitial || tracks.length}...`,
+    updatedAt: new Date().toISOString(),
+  };
+
+  if (options?.onPageProgress && tracks.length > 0) {
+    try {
+      options.onPageProgress({
+        loadedTracks: tracks.length,
+        totalTracks: effectiveTotalInitial,
+        playlistTitle: title,
+        tracks: [...tracks],
+      });
+    } catch {}
+  }
+
+  // Paginate beyond the first 100 tracks when importing a large public Spotify playlist
+  if (
+    entityType === 'playlist' &&
+    numericCap > 100 &&
+    (tracks.length >= 100 || embedAccessToken)
+  ) {
+    let token = embedAccessToken;
+    if (!token) {
+      try {
+        const tokResp = await fetch(
+          'https://open.spotify.com/get_access_token?reason=transport&productType=embed',
+          {
+            headers: {
+              ...browserHeaders,
+              Referer: embedUrl,
+            },
+            signal: AbortSignal.timeout(6000),
+          }
+        );
+        if (tokResp.ok) {
+          const tokData = await tokResp.json().catch(() => null);
+          if (tokData?.accessToken) {
+            token = String(tokData.accessToken).trim();
+          }
+        }
+      } catch {}
+    }
+
+    if (token) {
+      let offset = tracks.length;
+      let hasMore = tracks.length >= 100 && offset < numericCap;
+      const politeDelayMs = process.env.NODE_ENV === 'test' ? 10 : 300;
+
+      while (hasMore && tracks.length < numericCap) {
+        if (politeDelayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, politeDelayMs));
+        }
+
+        const pageLimit = Math.min(100, numericCap - tracks.length);
+        const pageUrl = `https://api.spotify.com/v1/playlists/${entityId}/tracks?offset=${offset}&limit=${pageLimit}&additional_types=track`;
+
+        let pageResp: Response | null = null;
+        try {
+          pageResp = await fetch(pageUrl, {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              Accept: 'application/json',
+              'User-Agent': browserHeaders['User-Agent'],
+            },
+            signal: AbortSignal.timeout(10000),
+          });
+
+          if (pageResp.status === 429) {
+            const retrySec = Math.min(
+              8,
+              Math.max(1, Number(pageResp.headers.get('retry-after') || 2))
+            );
+            activeSpotifyImportProgress.statusMessage = `Spotify rate limit pause (${retrySec}s) at ${tracks.length} tracks...`;
+            await new Promise((r) => setTimeout(r, retrySec * 1000));
+            pageResp = await fetch(pageUrl, {
+              headers: {
+                Authorization: `Bearer ${token}`,
+                Accept: 'application/json',
+                'User-Agent': browserHeaders['User-Agent'],
+              },
+              signal: AbortSignal.timeout(10000),
+            });
+          }
+        } catch {
+          break;
+        }
+
+        if (!pageResp || !pageResp.ok) {
+          break;
+        }
+
+        const pageData = await pageResp.json().catch(() => null);
+        if (!pageData || !Array.isArray(pageData.items)) {
+          break;
+        }
+
+        const apiTotal = Number(pageData.total || 0);
+        if (apiTotal > reportedTotalTracks) {
+          reportedTotalTracks = apiTotal;
+        }
+        const targetTotal = Math.min(
+          numericCap,
+          Math.max(reportedTotalTracks, tracks.length + pageData.items.length)
+        );
+
+        let addedInPage = 0;
+        for (const item of pageData.items) {
+          if (tracks.length >= numericCap) break;
+          const tObj = item?.track || item;
+          if (!tObj || tObj.is_local) continue;
+          const trackTitle = String(tObj.name || tObj.title || '')
+            .replace(/\u00a0/g, ' ')
+            .trim();
+          if (!trackTitle) continue;
+          const trackArtist =
+            (Array.isArray(tObj.artists)
+              ? tObj.artists
+                  .map((a: any) => a?.name)
+                  .filter(Boolean)
+                  .join(', ')
+              : '') ||
+            tObj.subtitle ||
+            'Unknown Artist';
+          const trackAlbum = String(tObj.album?.name || '')
+            .replace(/\u00a0/g, ' ')
+            .trim();
+          const durationMs = Number(tObj.duration_ms || tObj.duration || 0);
+
+          tracks.push({
+            title: trackTitle,
+            artist: String(trackArtist).replace(/\u00a0/g, ' ').trim(),
+            album: trackAlbum,
+            durationSec:
+              durationMs > 0 ? Math.round(durationMs / 1000) : 210,
+          });
+          addedInPage += 1;
+        }
+
+        const currentPageNum = Math.floor(offset / 100) + 1;
+        const totalPagesNum = Math.max(1, Math.ceil(targetTotal / 100));
+
+        activeSpotifyImportProgress = {
+          ...activeSpotifyImportProgress,
+          playlistTitle: title,
+          loadedTracks: tracks.length,
+          totalTracks: targetTotal,
+          currentPage: currentPageNum,
+          totalPages: totalPagesNum,
+          statusMessage: `Fetching tracks from Spotify: ${tracks.length} / ${targetTotal}...`,
+          updatedAt: new Date().toISOString(),
+        };
+
+        if (options?.onPageProgress && addedInPage > 0) {
+          try {
+            options.onPageProgress({
+              loadedTracks: tracks.length,
+              totalTracks: targetTotal,
+              playlistTitle: title,
+              tracks: [...tracks],
+            });
+          } catch {}
+        }
+
+        if (
+          !pageData.next ||
+          pageData.items.length === 0 ||
+          tracks.length >= targetTotal ||
+          tracks.length >= numericCap
+        ) {
+          hasMore = false;
+        } else {
+          offset += pageData.items.length;
+        }
+      }
+    }
+  }
+
+  activeSpotifyImportProgress = {
+    ...activeSpotifyImportProgress,
+    active: false,
+    playlistTitle: title,
+    loadedTracks: tracks.length,
+    totalTracks: tracks.length,
+    statusMessage: `Completed fetching ${tracks.length} tracks from "${title}".`,
+    updatedAt: new Date().toISOString(),
+  };
+
   return {
     entityType,
     entityId,
     playlistTitle: title,
+    totalAvailable: Math.max(reportedTotalTracks, tracks.length),
     tracks,
   };
 }
@@ -3028,6 +4420,7 @@ async function fetchSpotifyTracksFromUrl(rawUrl: string) {
 app.post('/api/spotify/import-url', async (req, res) => {
   try {
     const rawUrl = String(req.body?.url || '').trim();
+    const maxTracks = req.body?.maxTracks ?? 1000;
     if (!rawUrl) {
       return res.status(400).json({
         ok: false,
@@ -3035,14 +4428,15 @@ app.post('/api/spotify/import-url', async (req, res) => {
       });
     }
 
-    const { entityType, entityId, playlistTitle, tracks } =
-      await fetchSpotifyTracksFromUrl(rawUrl);
+    const { entityType, entityId, playlistTitle, totalAvailable, tracks } =
+      await fetchSpotifyTracksFromUrl(rawUrl, { maxTracks });
 
     return res.json({
       ok: true,
       entityType,
       entityId,
       playlistTitle,
+      totalAvailable,
       tracks,
       message:
         tracks.length > 0
@@ -3050,6 +4444,7 @@ app.post('/api/spotify/import-url', async (req, res) => {
           : `Resolved "${playlistTitle}", but Spotify hid the full tracklist. Paste the songs below or search directly.`,
     });
   } catch (err) {
+    activeSpotifyImportProgress.active = false;
     return res.status(400).json({
       ok: false,
       error:
@@ -3072,13 +4467,23 @@ app.post('/api/playlists/import-spotify', async (req, res) => {
     const targetPlaylistId = String(req.body?.playlistId || '').trim();
     const requestedName = String(req.body?.playlistName || '').trim();
     const autoDownloadMissing = req.body?.autoDownloadMissing !== false;
+    const maxTracks = req.body?.maxTracks ?? 1000;
     const sourceMode = String(
       req.body?.sourceMode || cfg.integrations?.preferredDownloader || 'auto'
     ).toLowerCase();
     const schedule = String(req.body?.schedule || 'weekly').toLowerCase();
     const ignoreFilters = Boolean(req.body?.ignoreFilters);
 
-    let resolvedTitle = requestedName || 'Spotify Playlist';
+    const existingPl = targetPlaylistId
+      ? queryPlaylists().find((p) => p.id === targetPlaylistId)
+      : undefined;
+    const playlistId =
+      existingPl?.id ||
+      targetPlaylistId ||
+      `pl-spotify-${Date.now().toString(36)}`;
+
+    let resolvedTitle =
+      requestedName || existingPl?.name || 'Spotify Playlist';
     let importedTracks: Array<{
       title: string;
       artist: string;
@@ -3097,8 +4502,71 @@ app.post('/api/playlists/import-spotify', async (req, res) => {
         .filter((t: any) => Boolean(t.title));
     }
 
+    const mergeAndSaveGhostTracks = (
+      tracksBatch: Array<{
+        title: string;
+        artist: string;
+        album?: string;
+        durationSec?: number;
+      }>,
+      currentTitle: string
+    ) => {
+      const currentPl =
+        queryPlaylists().find((p) => p.id === playlistId) || existingPl;
+      const baseGhosts = Array.isArray(currentPl?.ghostTracks)
+        ? [...currentPl.ghostTracks]
+        : [];
+      const seenKeys = new Set(
+        baseGhosts.map(
+          (g) => `${normalizeText(g.artist)}::${normalizeText(g.title)}`
+        )
+      );
+      const combined = [...baseGhosts];
+      for (let i = 0; i < tracksBatch.length; i++) {
+        const tr = tracksBatch[i];
+        const key = `${normalizeText(tr.artist)}::${normalizeText(tr.title)}`;
+        if (!tr.title || seenKeys.has(key)) continue;
+        seenKeys.add(key);
+        combined.push({
+          id: `ghost-${playlistId}-${combined.length + 1}-${Math.random()
+            .toString(36)
+            .slice(2, 6)}`,
+          title: tr.title,
+          artist: tr.artist || 'Unknown Artist',
+          album: tr.album,
+          durationSec: tr.durationSec || 210,
+          matchedTrackId: null,
+        });
+      }
+
+      const finalName =
+        requestedName || currentPl?.name || currentTitle || 'Spotify Playlist';
+      upsertPlaylistWithTracks({
+        id: playlistId,
+        name: finalName,
+        description: `Spotify Playlist (${combined.length} tracks)`,
+        ghostTracks: combined,
+        spotifyUrl: rawUrl || currentPl?.linkedSpotifyUrl || null,
+        trackIds: currentPl?.trackIds || [],
+      });
+      reconcilePlaylistsWithLibrary();
+      return { finalName, totalCount: combined.length };
+    };
+
     if (rawUrl && importedTracks.length === 0) {
-      const spotifyData = await fetchSpotifyTracksFromUrl(rawUrl);
+      const spotifyData = await fetchSpotifyTracksFromUrl(rawUrl, {
+        maxTracks,
+        playlistId,
+        onPageProgress: ({
+          playlistTitle: pageTitle,
+          tracks: partialTracks,
+        }) => {
+          if (!requestedName && pageTitle) {
+            resolvedTitle = pageTitle;
+          }
+          mergeAndSaveGhostTracks(partialTracks, resolvedTitle);
+        },
+      });
       if (!requestedName && spotifyData.playlistTitle) {
         resolvedTitle = spotifyData.playlistTitle;
       }
@@ -3120,58 +4588,15 @@ app.post('/api/playlists/import-spotify', async (req, res) => {
       });
     }
 
-    const existingPl = targetPlaylistId
-      ? queryPlaylists().find((p) => p.id === targetPlaylistId)
-      : undefined;
-    const playlistId =
-      existingPl?.id ||
-      targetPlaylistId ||
-      `pl-spotify-${Date.now().toString(36)}`;
-    const finalName =
-      requestedName || existingPl?.name || resolvedTitle || 'Spotify Playlist';
-
-    const existingGhosts = Array.isArray(existingPl?.ghostTracks)
-      ? [...existingPl.ghostTracks]
-      : [];
-    const seenKeys = new Set(
-      existingGhosts.map(
-        (g) => `${normalizeText(g.artist)}::${normalizeText(g.title)}`
-      )
+    const { finalName } = mergeAndSaveGhostTracks(
+      importedTracks,
+      resolvedTitle
     );
-
-    const combinedGhosts = [...existingGhosts];
-    for (let i = 0; i < importedTracks.length; i++) {
-      const tr = importedTracks[i];
-      const key = `${normalizeText(tr.artist)}::${normalizeText(tr.title)}`;
-      if (!tr.title || seenKeys.has(key)) continue;
-      seenKeys.add(key);
-      combinedGhosts.push({
-        id: `ghost-${playlistId}-${combinedGhosts.length + 1}-${Math.random()
-          .toString(36)
-          .slice(2, 6)}`,
-        title: tr.title,
-        artist: tr.artist || 'Unknown Artist',
-        album: tr.album,
-        durationSec: tr.durationSec || 210,
-        matchedTrackId: null,
-      });
-    }
-
-    upsertPlaylistWithTracks({
-      id: playlistId,
-      name: finalName,
-      description: `Spotify Playlist (${combinedGhosts.length} tracks)`,
-      ghostTracks: combinedGhosts,
-      spotifyUrl: rawUrl || existingPl?.linkedSpotifyUrl || null,
-      trackIds: existingPl?.trackIds || [],
-    });
-
-    reconcilePlaylistsWithLibrary();
 
     const updatedPlaylist = queryPlaylists().find((p) => p.id === playlistId);
     const reconciledGhosts = Array.isArray(updatedPlaylist?.ghostTracks)
       ? updatedPlaylist.ghostTracks
-      : combinedGhosts;
+      : [];
 
     const matchedCount = reconciledGhosts.filter((g) =>
       Boolean(g.matchedTrackId)
@@ -3194,6 +4619,7 @@ app.post('/api/playlists/import-spotify', async (req, res) => {
         playlistName: finalName,
         sourceUrl: rawUrl,
         spotifyUrl: rawUrl,
+        maxTracks,
         schedule: schedule === 'daily' ? 'daily' : 'weekly',
         interval: schedule === 'daily' ? 'daily' : 'weekly',
         autoDownloadMissing: Boolean(autoDownloadMissing),
@@ -3201,7 +4627,7 @@ app.post('/api/playlists/import-spotify', async (req, res) => {
         lastSyncedAt: new Date().toISOString(),
         lastAddedCount: matchedCount,
         lastMissingQueuedCount: autoDownloadMissing ? missingGhosts.length : 0,
-        statusMessage: `Imported ${reconciledGhosts.length} tracks (${matchedCount} in library, ${missingGhosts.length} ghost tracks).`,
+        statusMessage: `Imported ${reconciledGhosts.length} tracks (${matchedCount} in library, ${missingGhosts.length} missing).`,
       };
       if (existingIdx !== -1) {
         nextRules[existingIdx] = ruleObj;
@@ -3233,6 +4659,10 @@ app.post('/api/playlists/import-spotify', async (req, res) => {
       }
     }
 
+    const activeQueuedCount = createdJobs.filter(
+      (j) => j.status !== 'filtered'
+    ).length;
+
     return res.json({
       ok: true,
       playlist: queryPlaylists().find((p) => p.id === playlistId),
@@ -3241,14 +4671,15 @@ app.post('/api/playlists/import-spotify', async (req, res) => {
       totalTracks: reconciledGhosts.length,
       matchedCount,
       missingCount: missingGhosts.length,
-      queuedCount: createdJobs.filter((j) => j.status !== 'filtered').length,
-      message: `Populated "${finalName}" with ${reconciledGhosts.length} tracks: ${matchedCount} already in library, ${missingGhosts.length} ghost tracks${
-        autoDownloadMissing && missingGhosts.length > 0
-          ? ` (${createdJobs.filter((j) => j.status !== 'filtered').length} queued in downloader)`
+      queuedCount: activeQueuedCount,
+      message: `Populated "${finalName}" with ${reconciledGhosts.length} tracks: ${matchedCount} in library, ${missingGhosts.length} missing${
+        autoDownloadMissing && activeQueuedCount > 0
+          ? ` (${activeQueuedCount} queued in staggered Drip Queue — 5 tracks per batch)`
           : ''
       }!`,
     });
   } catch (err) {
+    activeSpotifyImportProgress.active = false;
     return res.status(500).json({
       ok: false,
       error:
@@ -4588,7 +6019,12 @@ app.post('/api/playback-session', (req, res) => {
   }
 });
 
-// Concurrency-controlled Download Queue so playlist imports don't overwhelm slskd/Lidarr/yt-dlp
+// ============================================================================
+// STAGGERED DRIP / STRIDE DOWNLOAD QUEUE (Persisted to /data/download-queue.json)
+// Processes missing tracks in controlled batches of 5 with polite spacing so
+// 700+ song playlists never flood slskd, Lidarr, or yt-dlp.
+// ============================================================================
+
 interface PendingGrabQueueItem {
   job: any;
   slskdUrl: string;
@@ -4599,7 +6035,14 @@ interface PendingGrabQueueItem {
 
 const pendingGrabQueue: PendingGrabQueueItem[] = [];
 let activeGrabWorkers = 0;
+const DRIP_BATCH_SIZE = 5;
 const MAX_CONCURRENT_GRAB_WORKERS = 2;
+const DRIP_STEP_DELAY_MS = process.env.NODE_ENV === 'test' ? 15 : 3200;
+let lastDripDispatchTimestamp = 0;
+let dripTimerHandle: ReturnType<typeof setTimeout> | null = null;
+let completedInCurrentStride = 0;
+
+const DRIP_QUEUE_FILE = path.join(DATA_DIR, 'download-queue.json');
 
 function formatEngineChainLabel(sourceMode: string): string {
   const mode = String(sourceMode || 'auto').toLowerCase();
@@ -4610,27 +6053,127 @@ function formatEngineChainLabel(sourceMode: string): string {
   return 'Auto (slskd → Lidarr → YouTube)';
 }
 
+function saveDripQueueState() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const serializedJobs = Array.from(slskdJobs.values()).slice(-1500);
+    const pendingIds = pendingGrabQueue.map((item) => ({
+      jobId: item.job?.id,
+      sourceMode: item.sourceMode,
+    }));
+    fs.writeFileSync(
+      DRIP_QUEUE_FILE,
+      JSON.stringify(
+        {
+          updatedAt: new Date().toISOString(),
+          jobs: serializedJobs,
+          pending: pendingIds,
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+  } catch {
+    // ignore write errors in ephemeral sandboxes
+  }
+}
+
+function loadDripQueueStateOnBoot() {
+  try {
+    if (!fs.existsSync(DRIP_QUEUE_FILE)) return;
+    const raw = JSON.parse(fs.readFileSync(DRIP_QUEUE_FILE, 'utf8'));
+    const savedJobs = Array.isArray(raw?.jobs) ? raw.jobs : [];
+    const cfg = readServerConfig();
+    const { slskdUrl, slskdApiKey } = getSlskdConfig();
+    const defaultSourceMode =
+      cfg.integrations?.preferredDownloader || 'auto';
+
+    for (const j of savedJobs) {
+      if (!j || !j.id) continue;
+      if (j.status === 'queued' || j.status === 'searching') {
+        j.status = 'queued';
+        slskdJobs.set(j.id, j);
+        pendingGrabQueue.push({
+          job: j,
+          slskdUrl,
+          slskdApiKey,
+          sourceMode: j.sourceMode || defaultSourceMode,
+          filtersConfig: cfg.discoveryFilters || null,
+        });
+      } else {
+        slskdJobs.set(j.id, j);
+      }
+    }
+    if (pendingGrabQueue.length > 0) {
+      updatePendingQueuePositions();
+      setTimeout(() => pumpGrabQueue(), 1500);
+    }
+  } catch {
+    // ignore corrupt queue file
+  }
+}
+
 function updatePendingQueuePositions() {
   for (let i = 0; i < pendingGrabQueue.length; i++) {
     const item = pendingGrabQueue[i];
     if (item.job && item.job.status === 'queued') {
-      item.job.queuePosition = i + 1;
-      item.job.message = `Waiting in queue (#${i + 1}) · ${formatEngineChainLabel(item.sourceMode)}`;
+      const pos = i + 1;
+      const batchNum = Math.ceil(pos / DRIP_BATCH_SIZE);
+      const totalBatches = Math.max(
+        1,
+        Math.ceil(pendingGrabQueue.length / DRIP_BATCH_SIZE)
+      );
+      item.job.queuePosition = pos;
+      item.job.batchNumber = batchNum;
+      item.job.totalBatches = totalBatches;
+      item.job.message = `Queued (#${pos} · Batch ${batchNum}/${totalBatches}) · ${formatEngineChainLabel(item.sourceMode)}`;
     }
   }
 }
 
 function pumpGrabQueue() {
   updatePendingQueuePositions();
+  if (
+    activeGrabWorkers >= MAX_CONCURRENT_GRAB_WORKERS ||
+    pendingGrabQueue.length === 0
+  ) {
+    return;
+  }
+
+  const now = Date.now();
+  const requiredDelay =
+    completedInCurrentStride > 0 &&
+    completedInCurrentStride % DRIP_BATCH_SIZE === 0
+      ? DRIP_STEP_DELAY_MS * 1.5
+      : lastDripDispatchTimestamp === 0
+        ? 0
+        : DRIP_STEP_DELAY_MS;
+
+  const elapsed = now - lastDripDispatchTimestamp;
+  if (elapsed < requiredDelay && process.env.NODE_ENV !== 'test') {
+    if (!dripTimerHandle) {
+      dripTimerHandle = setTimeout(() => {
+        dripTimerHandle = null;
+        pumpGrabQueue();
+      }, Math.max(50, requiredDelay - elapsed));
+    }
+    return;
+  }
+
   while (
     activeGrabWorkers < MAX_CONCURRENT_GRAB_WORKERS &&
     pendingGrabQueue.length > 0
   ) {
     const nextItem = pendingGrabQueue.shift();
     if (!nextItem) break;
+    lastDripDispatchTimestamp = Date.now();
+    completedInCurrentStride += 1;
     updatePendingQueuePositions();
     activeGrabWorkers += 1;
     nextItem.job.queuePosition = undefined;
+    saveDripQueueState();
+
     executeSlskdGrabJob(
       nextItem.job,
       nextItem.slskdUrl,
@@ -4642,10 +6185,27 @@ function pumpGrabQueue() {
       .finally(() => {
         activeGrabWorkers = Math.max(0, activeGrabWorkers - 1);
         reconcilePlaylistsWithLibrary();
+        saveDripQueueState();
         pumpGrabQueue();
       });
+
+    if (
+      pendingGrabQueue.length > 0 &&
+      activeGrabWorkers < MAX_CONCURRENT_GRAB_WORKERS &&
+      process.env.NODE_ENV !== 'test'
+    ) {
+      if (!dripTimerHandle) {
+        dripTimerHandle = setTimeout(() => {
+          dripTimerHandle = null;
+          pumpGrabQueue();
+        }, DRIP_STEP_DELAY_MS);
+      }
+      break;
+    }
   }
 }
+
+loadDripQueueStateOnBoot();
 
 function createAndEnqueueTrackGrabJob(params: {
   artist: string;
@@ -4682,7 +6242,6 @@ function createAndEnqueueTrackGrabJob(params: {
           ? 'lidarr'
           : 'slskd';
 
-  // Deduplicate if there is already an active or queued job for the same track
   const normSearch = normalizeText(`${artist} ${title}`);
   for (const existingJob of slskdJobs.values()) {
     if (
@@ -4711,6 +6270,7 @@ function createAndEnqueueTrackGrabJob(params: {
         id: `job-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         type: 'track',
         sourceEngine: initialEngine,
+        sourceMode,
         label: jobLabel,
         artist,
         title,
@@ -4726,22 +6286,26 @@ function createAndEnqueueTrackGrabJob(params: {
         completedAt: null,
       };
       slskdJobs.set(filteredJob.id, filteredJob);
+      saveDripQueueState();
       return filteredJob;
     }
   }
 
   const queuePos = pendingGrabQueue.length + 1;
+  const batchNum = Math.ceil(queuePos / DRIP_BATCH_SIZE);
   const job = {
     id: `job-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     type: 'track',
     sourceEngine: initialEngine,
+    sourceMode,
     label: jobLabel,
     artist,
     title,
     searchText: `${artist} ${title}`.trim(),
     status: 'queued',
     queuePosition: queuePos,
-    message: `Waiting in queue (#${queuePos}) · ${formatEngineChainLabel(sourceMode)}`,
+    batchNumber: batchNum,
+    message: `Queued (#${queuePos} · Batch ${batchNum}) · ${formatEngineChainLabel(sourceMode)}`,
     matchedPeer: null,
     matchedFormat: null,
     files: [],
@@ -4760,17 +6324,20 @@ function createAndEnqueueTrackGrabJob(params: {
     filtersConfig: ignoreFilters ? null : activeFilters,
   });
   pumpGrabQueue();
+  saveDripQueueState();
   return job;
 }
 
-// POST /api/slskd/grab
-app.post('/api/slskd/grab', async (req, res) => {
+const handleSlskdGrabRequest = async (req: any, res: any) => {
   try {
     const cfg = readServerConfig();
     const { slskdUrl, slskdApiKey } = getSlskdConfig(req.body || {});
     const { lidarrUrl, lidarrApiKey } = getLidarrConfig(req.body || {});
     const sourceMode = String(
-      req.body?.sourceMode || cfg.integrations?.preferredDownloader || 'auto'
+      req.body?.sourceMode ||
+        req.body?.sourceEngine ||
+        cfg.integrations?.preferredDownloader ||
+        'auto'
     ).toLowerCase();
     const ignoreFilters = Boolean(req.body?.ignoreFilters);
     const activeFilters = req.body?.filters || cfg.discoveryFilters;
@@ -4806,7 +6373,7 @@ app.post('/api/slskd/grab', async (req, res) => {
       const createdJobs = [];
       let skippedCount = 0;
 
-      for (const tr of tracks.slice(0, 100)) {
+      for (const tr of tracks.slice(0, 2500)) {
         const job = createAndEnqueueTrackGrabJob({
           artist: String(tr.artist || 'Unknown Artist').trim(),
           title: String(tr.title || '').trim(),
@@ -4824,10 +6391,18 @@ app.post('/api/slskd/grab', async (req, res) => {
       }
 
       const activeCount = createdJobs.length - skippedCount;
+      const totalBatches = Math.max(
+        1,
+        Math.ceil(activeCount / DRIP_BATCH_SIZE)
+      );
       return res.json({
         ok: true,
         jobs: createdJobs,
-        message: `Queued ${activeCount} track(s) via ${formatEngineChainLabel(sourceMode)}${
+        queuedCount: activeCount,
+        skippedCount,
+        batchSize: DRIP_BATCH_SIZE,
+        totalBatches,
+        message: `Queued ${activeCount} track(s) in Staggered Drip Queue (${DRIP_BATCH_SIZE} tracks/batch across ${totalBatches} batch${totalBatches === 1 ? '' : 'es'}) via ${formatEngineChainLabel(sourceMode)}${
           skippedCount > 0
             ? ` (${skippedCount} skipped by Exclusion Filters)`
             : ''
@@ -4890,6 +6465,7 @@ app.post('/api/slskd/grab', async (req, res) => {
             : sourceMode === 'lidarr'
               ? 'lidarr'
               : 'slskd',
+      sourceMode,
       label,
       artist,
       title,
@@ -4916,6 +6492,7 @@ app.post('/api/slskd/grab', async (req, res) => {
       filtersConfig: ignoreFilters ? null : activeFilters,
     });
     pumpGrabQueue();
+    saveDripQueueState();
 
     return res.json({
       ok: true,
@@ -4928,17 +6505,48 @@ app.post('/api/slskd/grab', async (req, res) => {
       error: err instanceof Error ? err.message : 'Failed to start download.',
     });
   }
-});
+};
+
+app.post('/api/slskd/grab', handleSlskdGrabRequest);
+app.post('/api/slskd/grab-job', handleSlskdGrabRequest);
 
 app.get('/api/slskd/status', (_req, res) => {
   updatePendingQueuePositions();
   const jobs = Array.from(slskdJobs.values()).sort((a, b) =>
     b.createdAt.localeCompare(a.createdAt)
   );
+  let queuedCount = 0;
+  let searchingCount = 0;
+  let downloadingCount = 0;
+  let completedCount = 0;
+  let failedCount = 0;
+  let filteredCount = 0;
+
+  for (const j of jobs) {
+    if (j.status === 'queued') queuedCount++;
+    else if (j.status === 'searching') searchingCount++;
+    else if (j.status === 'downloading') downloadingCount++;
+    else if (j.status === 'completed') completedCount++;
+    else if (j.status === 'failed') failedCount++;
+    else if (j.status === 'filtered') filteredCount++;
+  }
+
   res.json({
     ok: true,
     jobs,
     notifications: readyNotifications,
+    dripQueue: {
+      batchSize: DRIP_BATCH_SIZE,
+      dripDelayMs: DRIP_STEP_DELAY_MS,
+      activeWorkers: activeGrabWorkers,
+      queuedCount,
+      searchingCount,
+      downloadingCount,
+      completedCount,
+      failedCount,
+      filteredCount,
+      totalBatchesRemaining: Math.ceil(queuedCount / DRIP_BATCH_SIZE),
+    },
   });
 });
 
@@ -5325,7 +6933,10 @@ async function runSingleAutopilotRule(ruleId) {
   }
   const rule = rules[ruleIdx];
   const rawUrl = String(rule.sourceUrl || rule.spotifyUrl || '').trim();
-  const { playlistTitle, tracks } = await fetchSpotifyTracksFromUrl(rawUrl);
+  const { playlistTitle, tracks } = await fetchSpotifyTracksFromUrl(rawUrl, {
+    maxTracks: rule.maxTracks ?? 1000,
+    playlistId: rule.playlistId,
+  });
 
   const targetPl = queryPlaylists().find((p) => p.id === rule.playlistId);
   const playlistId = rule.playlistId || `pl-spotify-${Date.now().toString(36)}`;
@@ -5633,194 +7244,286 @@ app.delete('/api/debug/logs', (_req, res) => {
   return res.json({ ok: true, logs: serverDebugLogs });
 });
 
-app.post('/api/debug/diagnostics', async (_req, res) => {
+const handleRunDiagnosticsCheck = async (_req: any, res: any) => {
   const cfg = readServerConfig();
   const counts = getLocalLibraryStats();
-  const checks = [];
+  const checks: any[] = [];
+  const tStart = Date.now();
 
-  // 1. Embedded SQLite Database & /data Storage Check
+  // 1. API Server & Response Latency (/api/ping)
+  const mem = process.memoryUsage();
+  const rssMb = Math.round((mem.rss || 0) / (1024 * 1024));
+  const uptimeSec = Math.round(process.uptime());
+  checks.push({
+    id: 'api-ping',
+    name: 'API Server & Response Latency (/api/ping)',
+    category: 'system',
+    status: 'ok',
+    latencyMs: Math.max(1, Date.now() - tStart),
+    summary: `ONLINE · HTTP 200 OK · Uptime ${Math.floor(uptimeSec / 60)}m ${uptimeSec % 60}s · RAM ${rssMb} MB`,
+    details: `Port ${PORT} (0.0.0.0) | Node ${process.version} | Uptime Kuma Endpoint: /api/ping`,
+  });
+
+  // 2. SQLite Database (/data/brokeify.db read/write & WAL status)
   try {
     const t0 = Date.now();
-    fs.accessSync(DATA_DIR, fs.constants.W_OK);
+    fs.accessSync(DATA_DIR, fs.constants.R_OK | fs.constants.W_OK);
+    let dbSizeKb = 0;
+    try {
+      if (fs.existsSync(DB_PATH)) {
+        dbSizeKb = Math.round(fs.statSync(DB_PATH).size / 1024);
+      }
+    } catch {}
+    const walMode = String(db.pragmaState?.journal_mode || 'wal').toUpperCase();
+    const busyTimeout = Number(db.pragmaState?.busy_timeout || 5000);
+    const latencyMs = Math.max(1, Date.now() - t0);
     checks.push({
       id: 'sqlite',
-      name: 'Embedded SQLite Database (better-sqlite3)',
+      name: 'SQLite Database (/data/brokeify.db)',
       category: 'system',
       status: 'ok',
-      latencyMs: Date.now() - t0,
-      summary: `Online at ${DB_PATH} (${counts.totalTracks} tracks, ${counts.totalAlbums} albums, ${counts.totalArtists} artists)`,
-      details: `Music Root: ${MUSIC_DIR} | Covers Cache: ${COVERS_DIR}`,
+      latencyMs,
+      summary: `READ/WRITE OK · journal_mode=${walMode} · busy_timeout=${busyTimeout}ms (${latencyMs}ms)`,
+      details: `DB Path: ${DB_PATH} (${dbSizeKb} KB) | Covers Cache: ${COVERS_DIR}`,
     });
   } catch (err) {
     checks.push({
       id: 'sqlite',
-      name: 'Embedded SQLite Database (better-sqlite3)',
+      name: 'SQLite Database (/data/brokeify.db)',
       category: 'system',
       status: 'error',
-      summary: `Cannot write to ${DATA_DIR}`,
+      summary: `Cannot read/write ${DATA_DIR}`,
+      details: err instanceof Error ? err.message : String(err),
+      hint: 'Verify Docker volume permissions on /data (owned by UID 1000 / node).',
+    });
+  }
+
+  // 3. Music Library Mount (/music readable & track count)
+  try {
+    const t0 = Date.now();
+    const driveInfo = inspectMusicDrive();
+    const [ytDlpInfo, ffmpegInfo] = await Promise.all([
+      checkBinaryInstalled('yt-dlp'),
+      checkBinaryInstalled('ffmpeg'),
+    ]);
+    const latencyMs = Math.max(1, Date.now() - t0);
+    const isMountedAndReadable = Boolean(driveInfo.exists);
+    checks.push({
+      id: 'music-mount',
+      name: 'Music Library Mount (/music)',
+      category: 'audio',
+      status: isMountedAndReadable
+        ? counts.totalTracks > 0
+          ? 'ok'
+          : 'warn'
+        : 'error',
+      latencyMs,
+      summary: isMountedAndReadable
+        ? `READABLE · ${counts.totalTracks} tracks, ${counts.totalAlbums} albums, ${counts.totalArtists} artists (${latencyMs}ms)`
+        : `UNMOUNTED OR UNREADABLE (${MUSIC_DIR})`,
+      details: `Mount: ${MUSIC_DIR} | Playlists: ${counts.totalPlaylists} | EBU R128 LUFS: ${
+        ffmpegInfo.installed ? 'ffmpeg active' : 'ReplayGain tag fallback'
+      } | yt-dlp: ${ytDlpInfo.installed ? ytDlpInfo.version : 'fallback'}`,
+      hint:
+        counts.totalTracks === 0
+          ? 'Mount your music folder to /music:ro in docker-compose.yml or download songs via Request / Discover.'
+          : undefined,
+    });
+  } catch (err) {
+    checks.push({
+      id: 'music-mount',
+      name: 'Music Library Mount (/music)',
+      category: 'audio',
+      status: 'error',
+      summary: `Error inspecting ${MUSIC_DIR}`,
       details: err instanceof Error ? err.message : String(err),
     });
   }
 
-  // 2. Chokidar /music Scanner & EBU R128 LUFS Engine Check
-  const [ytDlpInfo, ffmpegInfo] = await Promise.all([
-    checkBinaryInstalled('yt-dlp'),
-    checkBinaryInstalled('ffmpeg'),
-  ]);
-  checks.push({
-    id: 'scanner',
-    name: 'Chokidar /music Watcher & EBU R128 LUFS Engine',
-    category: 'audio',
-    status: 'ok',
-    summary: `Monitoring ${MUSIC_DIR} (${
-      ffmpegInfo.installed
-        ? 'ffmpeg EBU R128 LUFS active'
-        : 'metadata ReplayGain active'
-    })`,
-    details: `Last scan: ${scannerState.lastScanAt || 'In progress'} | LUFS Queue: ${scannerState.lufsQueueLength}`,
-  });
-
-  // 3. slskd Soulseek Check
+  // 4A. Optional Integration: slskd Soulseek P2P
   const { slskdUrl, slskdApiKey } = getSlskdConfig();
   if (!slskdUrl || !slskdApiKey) {
     checks.push({
       id: 'slskd',
-      name: 'slskd Soulseek P2P Engine',
+      name: 'slskd Soulseek P2P (Optional)',
       category: 'slskd',
       status: 'warn',
-      summary: 'Optional — API Key not configured',
+      summary: 'Not Configured (Optional — uses YouTube/Archive fallback)',
+      details: 'Set SLSKD_URL and SLSKD_API_KEY in .env or Settings to enable Soulseek P2P.',
     });
   } else {
     const t0 = Date.now();
     try {
       const resp = await fetch(`${slskdUrl}/api/v0/application`, {
         headers: buildSlskdHeaders(slskdApiKey),
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(4500),
       });
       const latencyMs = Date.now() - t0;
       checks.push({
         id: 'slskd',
-        name: 'slskd Soulseek P2P Engine',
+        name: 'slskd Soulseek P2P',
         category: 'slskd',
         status: resp.ok ? 'ok' : 'error',
         latencyMs,
         summary: resp.ok
-          ? `Reachable at ${slskdUrl} (${latencyMs}ms)`
-          : `slskd returned HTTP ${resp.status}`,
+          ? `ONLINE · Reachable at ${slskdUrl} (${latencyMs}ms)`
+          : `HTTP ${resp.status} from ${slskdUrl}`,
+        hint: !resp.ok
+          ? 'Verify your slskd X-API-Key and LAN IP / Docker container name.'
+          : undefined,
       });
     } catch (err) {
       checks.push({
         id: 'slskd',
-        name: 'slskd Soulseek P2P Engine',
+        name: 'slskd Soulseek P2P',
         category: 'slskd',
         status: 'error',
-        summary: `Unreachable at ${slskdUrl}`,
+        summary: `UNREACHABLE at ${slskdUrl}`,
         details: err instanceof Error ? err.message : String(err),
+        hint: 'Check that the slskd container is running and reachable on port 5030.',
       });
     }
   }
 
-  // 4. Lidarr Check
+  // 4B. Optional Integration: Lidarr
   const { lidarrUrl, lidarrApiKey } = getLidarrConfig();
   if (!lidarrUrl || !lidarrApiKey) {
     checks.push({
       id: 'lidarr',
-      name: 'Lidarr Music Manager',
+      name: 'Lidarr Arr Stack (Optional)',
       category: 'lidarr',
       status: 'warn',
-      summary: 'Optional — API Key not configured',
+      summary: 'Not Configured (Optional)',
+      details: 'Set LIDARR_URL and LIDARR_API_KEY in .env or Settings if using Lidarr.',
     });
   } else {
     const t0 = Date.now();
     try {
       const resp = await fetch(`${lidarrUrl}/api/v1/system/status`, {
         headers: buildLidarrHeaders(lidarrApiKey),
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(4500),
       });
       const latencyMs = Date.now() - t0;
       checks.push({
         id: 'lidarr',
-        name: 'Lidarr Music Manager',
+        name: 'Lidarr Arr Stack',
         category: 'lidarr',
         status: resp.ok ? 'ok' : 'error',
         latencyMs,
         summary: resp.ok
-          ? `Connected to Lidarr (${latencyMs}ms)`
-          : `Lidarr returned HTTP ${resp.status}`,
+          ? `ONLINE · Connected to Lidarr (${latencyMs}ms)`
+          : `HTTP ${resp.status} from Lidarr`,
       });
     } catch (err) {
       checks.push({
         id: 'lidarr',
-        name: 'Lidarr Music Manager',
+        name: 'Lidarr Arr Stack',
         category: 'lidarr',
         status: 'error',
-        summary: `Unreachable at ${lidarrUrl}`,
+        summary: `UNREACHABLE at ${lidarrUrl}`,
         details: err instanceof Error ? err.message : String(err),
       });
     }
   }
 
-  // 5. ListenBrainz Check
-  const lbUser = String(cfg.integrations?.listenbrainzUsername || '').trim();
-  if (!lbUser) {
-    checks.push({
-      id: 'listenbrainz',
-      name: 'ListenBrainz Discovery & Scrobbler',
-      category: 'listenbrainz',
-      status: 'warn',
-      summary: 'Optional — Username not configured',
-    });
-  } else {
+  // 4C. Optional Integration: MusicBrainz Metadata API
+  {
     const t0 = Date.now();
     try {
-      const resp = await fetch(
-        `https://api.listenbrainz.org/1/user/${encodeURIComponent(
-          lbUser
-        )}/playlists/createdfor?count=1`,
-        { signal: AbortSignal.timeout(6000) }
+      const mbResp = await fetch(
+        'https://musicbrainz.org/ws/2/artist/056e4f3e-d505-4dad-8ec1-d04f521cbb56?fmt=json',
+        {
+          headers: MB_HEADERS,
+          signal: AbortSignal.timeout(5000),
+        }
       );
       const latencyMs = Date.now() - t0;
       checks.push({
-        id: 'listenbrainz',
-        name: 'ListenBrainz Discovery & Scrobbler',
-        category: 'listenbrainz',
-        status: resp.ok ? 'ok' : 'error',
+        id: 'musicbrainz',
+        name: 'MusicBrainz Picard Metadata API',
+        category: 'system',
+        status: mbResp.ok ? 'ok' : 'warn',
         latencyMs,
-        summary: resp.ok
-          ? `Connected for user "${lbUser}" (${latencyMs}ms)`
-          : `ListenBrainz returned HTTP ${resp.status}`,
+        summary: mbResp.ok
+          ? `ONLINE · musicbrainz.org reachable (${latencyMs}ms)`
+          : `MusicBrainz returned HTTP ${mbResp.status} (${latencyMs}ms)`,
+        details: 'Used for automatic MBID tagging, album release dates, and cover art resolution.',
       });
     } catch (err) {
       checks.push({
-        id: 'listenbrainz',
-        name: 'ListenBrainz Discovery & Scrobbler',
-        category: 'listenbrainz',
-        status: 'error',
-        summary: 'Failed to reach api.listenbrainz.org',
+        id: 'musicbrainz',
+        name: 'MusicBrainz Picard Metadata API',
+        category: 'system',
+        status: 'warn',
+        summary: 'Unreachable (Offline or rate-limited)',
         details: err instanceof Error ? err.message : String(err),
       });
     }
   }
 
-  // 6. Toolchain Check
-  checks.push({
-    id: 'toolchain',
-    name: 'YouTube Music & Picard Audio Toolchain',
-    category: 'youtube',
-    status: ytDlpInfo.installed || ffmpegInfo.installed ? 'ok' : 'warn',
-    summary: ytDlpInfo.installed
-      ? `yt-dlp (${ytDlpInfo.version}) & ${
-          ffmpegInfo.installed ? 'ffmpeg ready' : 'ffmpeg optional'
-        }`
-      : 'Docker image includes yt-dlp + ffmpeg',
-  });
+  // 4D. Optional Integration: LRCLIB Synchronized Lyrics API
+  {
+    const t0 = Date.now();
+    try {
+      const lrcResp = await fetch(
+        'https://lrclib.net/api/search?q=One+More+Time',
+        {
+          headers: {
+            'User-Agent': 'Brokeify/3.0.0 (https://github.com/mr-nickey/brokeify)',
+            Accept: 'application/json',
+          },
+          signal: AbortSignal.timeout(5000),
+        }
+      );
+      const latencyMs = Date.now() - t0;
+      checks.push({
+        id: 'lrclib',
+        name: 'LRCLIB Synchronized Lyrics API',
+        category: 'audio',
+        status: lrcResp.ok ? 'ok' : 'warn',
+        latencyMs,
+        summary: lrcResp.ok
+          ? `ONLINE · lrclib.net reachable (${latencyMs}ms)`
+          : `LRCLIB returned HTTP ${lrcResp.status} (${latencyMs}ms)`,
+        details: 'Provides time-synced .lrc karaoke lyrics for the Now Playing drawer.',
+      });
+    } catch (err) {
+      checks.push({
+        id: 'lrclib',
+        name: 'LRCLIB Synchronized Lyrics API',
+        category: 'audio',
+        status: 'warn',
+        summary: 'Unreachable (Using built-in studio lyric fallback)',
+        details: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // Emit structured diagnostic summary to stdout so Dozzle & Docker logs capture full visibility
+  const summaryLine = checks
+    .map((c) => `${c.id}=${c.status.toUpperCase()}${c.latencyMs ? `(${c.latencyMs}ms)` : ''}`)
+    .join(' | ');
+  pushServerLog(
+    checks.some((c) => c.status === 'error') ? 'warn' : 'info',
+    'system',
+    `[DOZZLE-HEALTHCHECK] ${summaryLine}`,
+    {
+      endpoint: 'GET/POST /api/debug/diagnostics',
+      details: JSON.stringify(checks, null, 2),
+    }
+  );
 
   return res.json({
     ok: true,
+    checkedAt: new Date().toISOString(),
+    totalDurationMs: Date.now() - tStart,
     checks,
     logs: serverDebugLogs,
   });
-});
+};
+
+app.get('/api/debug/diagnostics', handleRunDiagnosticsCheck);
+app.post('/api/debug/diagnostics', handleRunDiagnosticsCheck);
 
 // ============================================================================
 // 14. VERSION CHECKER

@@ -1,9 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   AlertTriangle,
   Bot,
   Check,
   CheckCircle2,
+  Copy,
   Database,
   Eye,
   EyeOff,
@@ -12,10 +13,12 @@ import {
   Lock,
   LogOut,
   Plus,
+  QrCode,
   RefreshCw,
   Shield,
   ShieldAlert,
   ShieldCheck,
+  Smartphone,
   Trash2,
   Unlock,
   UserCheck,
@@ -420,6 +423,111 @@ export const SecurityAndUsersManagerSection: React.FC<
     }
   };
 
+  const [apiKeys, setApiKeys] = useState<
+    Array<{
+      id: string;
+      name: string;
+      prefix: string;
+      role: string;
+      createdAt: string;
+      lastUsedAt: string | null;
+    }>
+  >([]);
+  const [newKeyName, setNewKeyName] = useState('Android Auto Companion');
+  const [newlyCreatedToken, setNewlyCreatedToken] = useState<string | null>(
+    null
+  );
+  const [isCreatingKey, setIsCreatingKey] = useState(false);
+  const [isCopyingSpec, setIsCopyingSpec] = useState(false);
+  const [copiedSpecDone, setCopiedSpecDone] = useState(false);
+
+  const loadApiKeys = useCallback(async () => {
+    try {
+      const resp = await fetch('/api/auth/api-keys');
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data?.ok && Array.isArray(data.apiKeys)) {
+        setApiKeys(data.apiKeys);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    loadApiKeys();
+  }, [loadApiKeys]);
+
+  const handleCreatePersonalApiKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newKeyName.trim()) return;
+    setIsCreatingKey(true);
+    setNewlyCreatedToken(null);
+    try {
+      const resp = await fetch('/api/auth/api-keys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newKeyName.trim() }),
+      });
+      const data = await resp.json();
+      if (resp.ok && data.ok && data.apiKey) {
+        setNewlyCreatedToken(data.apiKey.token);
+        setNewKeyName('');
+        await loadApiKeys();
+        onShowToast(`🔑 Created Personal API Key "${data.apiKey.name}"!`);
+      } else {
+        onShowToast(`⚠️ ${data.error || 'Failed to create API key.'}`);
+      }
+    } catch {
+      onShowToast('⚠️ Network error creating API key.');
+    } finally {
+      setIsCreatingKey(false);
+    }
+  };
+
+  const handleRevokeApiKey = async (keyId: string) => {
+    try {
+      const resp = await fetch(
+        `/api/auth/api-keys/${encodeURIComponent(keyId)}`,
+        {
+          method: 'DELETE',
+        }
+      );
+      const data = await resp.json();
+      if (resp.ok && data.ok) {
+        if (Array.isArray(data.apiKeys)) {
+          setApiKeys(data.apiKeys);
+        } else {
+          await loadApiKeys();
+        }
+        onShowToast('🗑️ Revoked Personal API Key.');
+      }
+    } catch {
+      onShowToast('⚠️ Failed to revoke API key.');
+    }
+  };
+
+  const handleCopyApiHandshakeSpec = async () => {
+    setIsCopyingSpec(true);
+    try {
+      const resp = await fetch('/api/system/spec?format=json');
+      const data = await resp.json();
+      const md = String(data?.markdown || '');
+      if (md) {
+        await navigator.clipboard.writeText(md);
+        setCopiedSpecDone(true);
+        setTimeout(() => setCopiedSpecDone(false), 3000);
+        onShowToast(
+          '📋 Copied brokeify-api-handshake.md to clipboard! Paste into your Android project.'
+        );
+      }
+    } catch {
+      onShowToast('⚠️ Could not copy API Handshake spec.');
+    } finally {
+      setIsCopyingSpec(false);
+    }
+  };
+
   return (
     <section
       aria-labelledby="security-gate-heading"
@@ -809,6 +917,181 @@ export const SecurityAndUsersManagerSection: React.FC<
               parsed!
             </li>
           </ul>
+        </div>
+      </div>
+
+      {/* Personal API Keys (brk_live_...) & Companion App / API Handshake Panel */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 pt-2 border-t border-zinc-800/80">
+        {/* Left 6 Cols: Personal API Keys */}
+        <div
+          data-testid="personal-api-keys-panel"
+          className="lg:col-span-6 rounded-2xl border border-cyan-500/30 bg-zinc-950/80 p-4 space-y-3"
+        >
+          <div className="flex items-center justify-between border-b border-zinc-800 pb-2.5">
+            <span className="text-xs font-mono font-bold uppercase text-cyan-300 flex items-center gap-2">
+              <KeyRound className="w-4 h-4 text-cyan-400" />
+              Personal API Keys (Android / Android Auto / 3rd-Party Clients)
+            </span>
+            <span className="text-[10px] font-mono text-zinc-400">
+              {apiKeys.length} active
+            </span>
+          </div>
+
+          <p className="text-[11px] font-mono text-zinc-400 leading-relaxed">
+            Generate long-lived, revocable bearer tokens (
+            <code className="text-cyan-300">brk_live_...</code>) for native
+            mobile apps or headless scripts so you never have to store your
+            master password on external devices.
+          </p>
+
+          {!isListenerRole && (
+            <form
+              onSubmit={handleCreatePersonalApiKey}
+              className="flex flex-wrap items-center gap-2"
+            >
+              <input
+                type="text"
+                value={newKeyName}
+                onChange={(e) => setNewKeyName(e.target.value)}
+                placeholder="Device label (e.g. Pixel 9 Pro / Android Auto)"
+                data-testid="input-new-api-key-name"
+                className="flex-1 min-w-[180px] rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+              />
+              <button
+                type="submit"
+                disabled={isCreatingKey}
+                data-testid="create-personal-api-key-btn"
+                className="inline-flex items-center gap-1.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 px-3.5 py-2 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[38px]"
+              >
+                <KeyRound className="w-3.5 h-3.5" />
+                <span>
+                  {isCreatingKey ? 'Generating...' : 'Generate API Key'}
+                </span>
+              </button>
+            </form>
+          )}
+
+          {newlyCreatedToken && (
+            <div
+              data-testid="newly-created-api-key-banner"
+              className="rounded-xl border border-[#00ff66] bg-emerald-950/40 p-3 space-y-1.5 font-mono text-xs"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[#00ff66] font-bold">
+                  ✓ Copy Your Personal API Key Now (Shown Once):
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard.writeText(newlyCreatedToken);
+                    onShowToast('📋 Copied API Key to clipboard!');
+                  }}
+                  className="inline-flex items-center gap-1 rounded bg-[#00ff66] px-2 py-0.5 text-[10px] font-bold text-zinc-950"
+                >
+                  <Copy className="w-3 h-3" />
+                  <span>Copy Token</span>
+                </button>
+              </div>
+              <code className="block break-all rounded bg-black/60 p-2 text-[11px] text-white select-all">
+                {newlyCreatedToken}
+              </code>
+            </div>
+          )}
+
+          {apiKeys.length > 0 && (
+            <div className="space-y-2 max-h-40 overflow-y-auto pt-1">
+              {apiKeys.map((k) => (
+                <div
+                  key={k.id}
+                  className="rounded-xl border border-zinc-800 bg-zinc-900/70 px-3 py-2 flex items-center justify-between gap-2 text-xs font-mono"
+                >
+                  <div className="min-w-0">
+                    <div className="font-bold text-white truncate">
+                      {k.name}{' '}
+                      <span className="text-cyan-300 font-normal">
+                        ({k.prefix})
+                      </span>
+                    </div>
+                    <div className="text-[10px] text-zinc-400">
+                      Created {new Date(k.createdAt).toLocaleDateString()} · Role:{' '}
+                      {k.role}
+                    </div>
+                  </div>
+                  {!isListenerRole && (
+                    <button
+                      type="button"
+                      onClick={() => handleRevokeApiKey(k.id)}
+                      className="rounded-lg border border-zinc-800 bg-zinc-950 hover:border-rose-500/50 px-2.5 py-1 text-[10px] text-rose-300 hover:bg-rose-950/40 shrink-0"
+                    >
+                      Revoke
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Right 6 Cols: Companion App & API Handshake (brokeify-api-handshake.md) */}
+        <div
+          data-testid="companion-api-handshake-panel"
+          className="lg:col-span-6 rounded-2xl border border-[#00ff66]/40 bg-zinc-950/80 p-4 space-y-3 flex flex-col justify-between"
+        >
+          <div className="space-y-2">
+            <div className="flex items-center justify-between border-b border-zinc-800 pb-2.5">
+              <span className="text-xs font-mono font-bold uppercase text-[#00ff66] flex items-center gap-2">
+                <Smartphone className="w-4 h-4 text-[#00ff66]" />
+                Companion App &amp; API Handshake (brokeify-api-handshake.md)
+              </span>
+              <span className="rounded bg-emerald-500/15 border border-emerald-500/40 px-2 py-0.5 text-[10px] font-mono font-bold text-[#00ff66]">
+                v2.5 Spec Ready
+              </span>
+            </div>
+
+            <p className="text-xs font-mono text-zinc-300 leading-relaxed">
+              Building or updating the native{' '}
+              <strong className="text-white">
+                Brokeify Android / Android Auto
+              </strong>{' '}
+              app? Download or copy the live{' '}
+              <code className="text-[#00ff66]">brokeify-api-handshake.md</code>{' '}
+              specification generated directly from this server—complete with
+              your detected base URL, JWT &amp; API key auth flows, HTTP 206
+              byte-range streaming headers, and exact TypeScript/JSON schemas.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5 pt-2">
+            <a
+              href="/api/system/spec"
+              download="brokeify-api-handshake.md"
+              data-testid="download-api-handshake-btn"
+              className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-4 py-2.5 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[40px]"
+            >
+              <QrCode className="w-4 h-4" />
+              <span>Download brokeify-api-handshake.md</span>
+            </a>
+
+            <button
+              type="button"
+              disabled={isCopyingSpec}
+              onClick={handleCopyApiHandshakeSpec}
+              data-testid="copy-api-handshake-btn"
+              className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl border border-emerald-500/50 bg-emerald-950/30 hover:bg-emerald-900/40 px-4 py-2.5 text-xs font-mono font-bold text-[#00ff66] transition-colors min-h-[40px]"
+            >
+              {copiedSpecDone ? (
+                <>
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>Copied Spec to Clipboard!</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-4 h-4" />
+                  <span>Copy Spec to Clipboard</span>
+                </>
+              )}
+            </button>
+          </div>
         </div>
       </div>
     </section>
