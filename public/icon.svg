@@ -1,38 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" fill="none">
   <defs>
-    <linearGradient id="bgGrad" x1="0" y1="0" x2="120" y2="120" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#09090b" />
-      <stop offset="100%" stop-color="#18181b" />
-    </linearGradient>
-    <linearGradient id="ductTape" x1="0" y1="0" x2="40" y2="16" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#d4d4d8" />
-      <stop offset="50%" stop-color="#a1a1aa" />
-      <stop offset="100%" stop-color="#e4e4e7" />
-    </linearGradient>
+    <radialGradient id="brokeifyDiscGlow" cx="50%" cy="50%" r="55%">
+      <stop offset="0%" stop-color="#00ff66" stop-opacity="0.22" />
+      <stop offset="70%" stop-color="#09090b" stop-opacity="0.95" />
+      <stop offset="100%" stop-color="#09090b" stop-opacity="1" />
+    </radialGradient>
   </defs>
-  <!-- Dark Circular Badge -->
-  <circle cx="60" cy="60" r="56" fill="url(#bgGrad)" stroke="#27272a" stroke-width="4" />
-  <circle cx="60" cy="60" r="50" stroke="#10b981" stroke-width="1.5" stroke-opacity="0.35" stroke-dasharray="6 4" />
-
-  <!-- Bottom & Middle Soundwaves (Purple & Emerald) -->
-  <path d="M 32 76 Q 60 64 88 76" stroke="#a855f7" stroke-width="6" stroke-linecap="round" fill="none" />
-  <path d="M 26 60 Q 60 46 94 60" stroke="#10b981" stroke-width="6.5" stroke-linecap="round" fill="none" />
-
-  <!-- Top Soundwave (Crooked / drooping on right side, taped to the rim) -->
-  <path d="M 24 42 Q 55 24 96 49" stroke="#10b981" stroke-width="6.5" stroke-linecap="round" fill="none" />
-
-  <!-- Slashed Dollar Symbol Inside -->
-  <g transform="translate(60, 66)">
-    <text x="0" y="14" text-anchor="middle" fill="#f4f4f5" font-family="monospace" font-weight="800" font-size="34" opacity="0.92">$</text>
-    <line x1="-16" y1="18" x2="16" y2="-14" stroke="#f43f5e" stroke-width="4.5" stroke-linecap="round" />
-  </g>
-
-  <!-- Strip of Silver Duct Tape holding the crooked top wave to the upper-right rim -->
-  <g transform="translate(76, 20) rotate(28)">
-    <rect x="0" y="0" width="32" height="13" rx="1.5" fill="url(#ductTape)" stroke="#71717a" stroke-width="1" />
-    <line x1="4" y1="0" x2="4" y2="13" stroke="#71717a" stroke-width="0.6" stroke-opacity="0.5" />
-    <line x1="12" y1="0" x2="12" y2="13" stroke="#71717a" stroke-width="0.6" stroke-opacity="0.5" />
-    <line x1="20" y1="0" x2="20" y2="13" stroke="#71717a" stroke-width="0.6" stroke-opacity="0.5" />
-    <line x1="27" y1="0" x2="27" y2="13" stroke="#71717a" stroke-width="0.6" stroke-opacity="0.5" />
-  </g>
+  <circle cx="60" cy="60" r="54" fill="url(#brokeifyDiscGlow)" stroke="#00ff66" stroke-width="3.5" stroke-opacity="0.85" />
+  <circle cx="60" cy="60" r="39" fill="none" stroke="#27272a" stroke-width="2" stroke-dasharray="6 5" />
+  <circle cx="60" cy="60" r="23" fill="none" stroke="#10b981" stroke-width="2" stroke-opacity="0.55" />
+  <circle cx="60" cy="60" r="8.5" fill="#00ff66" />
 </svg>

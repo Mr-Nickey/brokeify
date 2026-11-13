@@ -314,8 +314,14 @@ function pushServerLog(level, category, message, extra = {}) {
   }
   saveServerDebugLogs();
 
-  // Wire backend service errors & warnings into persistent SQLite Notification Bell (deduplicated per outage)
-  if (entry.level === 'error' || entry.level === 'warn') {
+  // Wire backend service errors & warnings into persistent SQLite Notification Bell (deduplicated per outage, excluding 429 rate-limit noise)
+  if (
+    (entry.level === 'error' || entry.level === 'warn') &&
+    entry.statusCode !== 429 &&
+    !String(entry.message || '')
+      .toLowerCase()
+      .includes('rate limit exceeded')
+  ) {
     const rawCat = String(entry.category || 'system').toLowerCase();
     const mappedCat =
       rawCat === 'slskd' ||
@@ -1094,7 +1100,7 @@ const authRequestWindowMap = new Map<string, { count: number; resetAt: number }>
 // Generous sliding window rate limiter for general /api/* routes (excluding /api/stream/* & /api/covers/*)
 const generalApiWindowMap = new Map<string, { count: number; resetAt: number }>();
 const GENERAL_API_WINDOW_MS = 60 * 1000; // 1 minute
-const GENERAL_API_MAX_REQ = 600; // 600 req/min per IP
+const GENERAL_API_MAX_REQ = 3000; // 3000 req/min per IP
 
 function getClientIp(req): string {
   if (req.ip) {
@@ -1232,12 +1238,20 @@ app.use((req, res, next) => {
     return res.status(403).send('Forbidden');
   }
 
-  // Apply generous rate limit to general /api/* routes (excluding /api/stream/* and /api/cover(s)/* so audio buffering is never throttled)
+  // Apply generous rate limit to general /api/* routes (excluding streaming, covers, and lightweight status/polling routes)
   if (
     req.path.startsWith('/api/') &&
     !req.path.startsWith('/api/stream/') &&
     !req.path.startsWith('/api/cover/') &&
-    !req.path.startsWith('/api/covers/')
+    !req.path.startsWith('/api/covers/') &&
+    !req.path.startsWith('/api/library/organize/status') &&
+    !req.path.startsWith('/api/notifications') &&
+    !req.path.startsWith('/api/slskd/status') &&
+    !req.path.startsWith('/api/playback-session') &&
+    !req.path.startsWith('/api/ping') &&
+    !req.path.startsWith('/api/health') &&
+    !req.path.startsWith('/api/storage/stats') &&
+    !req.path.startsWith('/api/scheduler/')
   ) {
     const ip = getClientIp(req);
     const now = Date.now();
@@ -8364,6 +8378,14 @@ app.post('/api/files/move', async (req, res) => {
       if (path.resolve(targetFull) === path.resolve(src.fullPath)) continue;
 
       const isDir = fs.statSync(src.fullPath).isDirectory();
+      if (
+        isDir &&
+        path
+          .resolve(targetFull)
+          .startsWith(path.resolve(src.fullPath) + path.sep)
+      ) {
+        continue;
+      }
       if (!isDir) {
         removeAudioFileFromIndex(src.fullPath);
       }
@@ -8687,6 +8709,504 @@ app.post('/api/library/organize/apply', async (_req, res) => {
   );
   return res.json({ ok: true, job });
 });
+
+// ============================================================================
+// 13D. STORAGE & DRIVE CAPACITY STATS (/api/storage/stats) + 24H SCHEDULED TASKS CRON ENGINE (/api/scheduler/*)
+// ============================================================================
+
+function computeMusicDirectoryStorageStats() {
+  const musicRoot = getMusicDir();
+  let musicUsedBytes = 0;
+  let musicFileCount = 0;
+  let musicFolderCount = 0;
+  let stagingFileCount = 0;
+
+  const walk = (dir: string, isStagingSubtree = false) => {
+    if (!fs.existsSync(dir)) return;
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      const fullPath = path.join(dir, entry.name);
+      const inStaging = isStagingSubtree || entry.name === '_inbox';
+      if (entry.isDirectory()) {
+        musicFolderCount += 1;
+        walk(fullPath, inStaging);
+      } else if (entry.isFile()) {
+        try {
+          const st = fs.statSync(fullPath);
+          musicUsedBytes += st.size || 0;
+          if (
+            AUDIO_FILE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())
+          ) {
+            musicFileCount += 1;
+            if (inStaging) stagingFileCount += 1;
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+  };
+
+  walk(musicRoot, false);
+
+  let diskTotalBytes = 0;
+  let diskFreeBytes = 0;
+  let diskUsedBytes = 0;
+  let diskUsedPercent = 0;
+
+  try {
+    const targetForStatfs = fs.existsSync(musicRoot)
+      ? musicRoot
+      : process.cwd();
+    if (typeof (fs as any).statfsSync === 'function') {
+      const sfs = (fs as any).statfsSync(targetForStatfs);
+      const bsize = Number(sfs.bsize || sfs.frsize || 4096);
+      const totalBlocks = Number(sfs.blocks || 0);
+      const availBlocks = Number(sfs.bavail ?? sfs.bfree ?? 0);
+      diskTotalBytes = bsize * totalBlocks;
+      diskFreeBytes = bsize * availBlocks;
+      diskUsedBytes = Math.max(0, diskTotalBytes - diskFreeBytes);
+      diskUsedPercent =
+        diskTotalBytes > 0
+          ? Math.min(100, Math.round((diskUsedBytes / diskTotalBytes) * 1000) / 10)
+          : 0;
+    }
+  } catch {
+    // fallback if statfsSync is unsupported
+  }
+
+  let dbSizeBytes = 0;
+  try {
+    if (fs.existsSync(DB_PATH)) {
+      dbSizeBytes = fs.statSync(DB_PATH).size || 0;
+    }
+  } catch {
+    // ignore
+  }
+
+  const allIndexed = queryTracks({ limit: 50000 }).tracks;
+  let missingMetadataCount = 0;
+  let missingArtworkCount = 0;
+  for (const t of allIndexed) {
+    if (
+      !t.artist ||
+      t.artist === 'Unknown Artist' ||
+      !t.album ||
+      t.album === 'Unknown Album' ||
+      !t.year
+    ) {
+      missingMetadataCount += 1;
+    }
+    if (!t.artworkUrl || t.artworkUrl.startsWith('data:')) {
+      missingArtworkCount += 1;
+    }
+  }
+
+  return {
+    musicRoot,
+    musicUsedBytes,
+    musicFileCount,
+    musicFolderCount,
+    stagingFileCount,
+    diskTotalBytes,
+    diskFreeBytes,
+    diskUsedBytes,
+    diskUsedPercent,
+    dbSizeBytes,
+    indexedTrackCount: allIndexed.length,
+    missingMetadataCount,
+    missingArtworkCount,
+  };
+}
+
+app.get('/api/storage/stats', (_req, res) => {
+  try {
+    const stats = computeMusicDirectoryStorageStats();
+    return res.json({
+      ok: true,
+      stats,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : 'Failed to read storage statistics.',
+    });
+  }
+});
+
+export interface ScheduledTaskJob {
+  id: string;
+  name: string;
+  description: string;
+  taskType:
+    | 'library_scan_heal'
+    | 'staging_organize'
+    | 'logs_temp_cleanup'
+    | 'playlist_autosync'
+    | 'custom_folder_organize';
+  intervalHours: number;
+  enabled: boolean;
+  targetPath?: string;
+  lastRunAt: string | null;
+  nextRunAt: string | null;
+  lastStatus: 'idle' | 'running' | 'success' | 'error';
+  lastMessage: string;
+  isBuiltIn?: boolean;
+}
+
+const DEFAULT_SCHEDULED_TASKS: ScheduledTaskJob[] = [
+  {
+    id: 'job-library-scan-heal',
+    name: 'Library Scan & Missing Metadata / Artwork Healer',
+    description:
+      'Scans /music every 24h, indexes new audio files, and heals tracks missing Artist, Album, Release Year, MBID, or Cover Art via MusicBrainz & AcoustID.',
+    taskType: 'library_scan_heal',
+    intervalHours: 24,
+    enabled: true,
+    targetPath: '',
+    lastRunAt: null,
+    nextRunAt: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+    lastStatus: 'idle',
+    lastMessage: 'Scheduled to run every 24 hours.',
+    isBuiltIn: true,
+  },
+  {
+    id: 'job-staging-organize',
+    name: 'Disorganized Library & Staging Auto-Organizer',
+    description:
+      'Processes incoming downloads in /music/_inbox and cleans up unorganized files into /music/{Artist}/{Album} ({Year})/{TrackNumber} - {Title}.{ext}.',
+    taskType: 'staging_organize',
+    intervalHours: 24,
+    enabled: true,
+    targetPath: '',
+    lastRunAt: null,
+    nextRunAt: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+    lastStatus: 'idle',
+    lastMessage: 'Scheduled to run every 24 hours.',
+    isBuiltIn: true,
+  },
+  {
+    id: 'job-logs-temp-cleanup',
+    name: 'Logs, Temp Files & SQLite Storage Cleanup',
+    description:
+      'Prunes old debug logs, removes empty folders and orphaned temp files, and optimizes the persistent SQLite database.',
+    taskType: 'logs_temp_cleanup',
+    intervalHours: 24,
+    enabled: true,
+    targetPath: '',
+    lastRunAt: null,
+    nextRunAt: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+    lastStatus: 'idle',
+    lastMessage: 'Scheduled to run every 24 hours.',
+    isBuiltIn: true,
+  },
+  {
+    id: 'job-playlist-autosync',
+    name: 'Playlists & Autopilot 24h Sync',
+    description:
+      'Syncs linked Spotify and ListenBrainz playlists and reconciles all playlist ghost tracks against your local /music library.',
+    taskType: 'playlist_autosync',
+    intervalHours: 24,
+    enabled: true,
+    targetPath: '',
+    lastRunAt: null,
+    nextRunAt: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+    lastStatus: 'idle',
+    lastMessage: 'Scheduled to run every 24 hours.',
+    isBuiltIn: true,
+  },
+];
+
+function loadScheduledTasksFromConfig(): ScheduledTaskJob[] {
+  const cfg = readServerConfig() as any;
+  const saved: ScheduledTaskJob[] = Array.isArray(cfg.scheduledTasks)
+    ? cfg.scheduledTasks
+    : [];
+  const byId = new Map<string, ScheduledTaskJob>();
+  for (const def of DEFAULT_SCHEDULED_TASKS) {
+    byId.set(def.id, { ...def });
+  }
+  for (const item of saved) {
+    if (item && item.id) {
+      const existing = byId.get(item.id);
+      byId.set(item.id, {
+        ...(existing || {}),
+        ...item,
+        isBuiltIn: existing ? true : Boolean(item.isBuiltIn),
+      });
+    }
+  }
+  return Array.from(byId.values());
+}
+
+function saveScheduledTasksToConfig(tasks: ScheduledTaskJob[]) {
+  const cfg = readServerConfig() as any;
+  cfg.scheduledTasks = tasks;
+  writeServerConfig(cfg);
+}
+
+const activeRunningTaskIds = new Set<string>();
+
+async function executeScheduledTaskById(
+  jobId: string
+): Promise<{ ok: boolean; job?: ScheduledTaskJob; error?: string }> {
+  const tasks = loadScheduledTasksFromConfig();
+  const idx = tasks.findIndex((t) => t.id === jobId);
+  if (idx === -1) {
+    return { ok: false, error: 'Scheduled task not found.' };
+  }
+  if (activeRunningTaskIds.has(jobId)) {
+    return { ok: true, job: tasks[idx] };
+  }
+
+  activeRunningTaskIds.add(jobId);
+  const job = tasks[idx];
+  job.lastStatus = 'running';
+  job.lastMessage = 'Running scheduled task now...';
+  saveScheduledTasksToConfig(tasks);
+
+  try {
+    const cfg = readServerConfig();
+    let summaryMessage = '';
+
+    if (job.taskType === 'library_scan_heal') {
+      const scanRes = await runFullLibraryScan();
+      reconcilePlaylistsWithLibrary();
+      // Heal up to 15 tracks missing metadata/year/artwork per run to respect MusicBrainz 1 req/sec rate limit
+      const allTracks = queryTracks({ limit: 5000 }).tracks;
+      const candidates = allTracks
+        .filter(
+          (t) =>
+            !t.year ||
+            t.artist === 'Unknown Artist' ||
+            t.album === 'Unknown Album'
+        )
+        .slice(0, 10);
+      let healedCount = 0;
+      for (const tr of candidates) {
+        const row = getTrackWithArtistAlbum(tr.id);
+        if (row?.filePath && fs.existsSync(row.filePath)) {
+          try {
+            const identified =
+              await identifyAudioFileWithAcoustIdAndMusicBrainz(row.filePath, {
+                acoustidApiKey: cfg.integrations?.acoustidApiKey,
+                downloadArtwork: true,
+              });
+            if (identified.artist && identified.title) {
+              updateTrackMetadataInDb(tr.id, {
+                title: identified.title,
+                artist: identified.artist,
+                album: identified.album,
+                year: identified.year,
+                trackNumber: identified.trackNumber,
+                mbid: identified.recordingMbid,
+              });
+              healedCount += 1;
+            }
+          } catch {
+            // continue
+          }
+        }
+      }
+      summaryMessage = `Scanned /music (${scanRes.totalTracks} tracks indexed) and healed metadata on ${healedCount} track(s).`;
+    } else if (
+      job.taskType === 'staging_organize' ||
+      job.taskType === 'custom_folder_organize'
+    ) {
+      const inboxRes = await scanAndOrganizeStagingInbox();
+      const orgState = getLibraryOrganizeJobState();
+      if (orgState.status !== 'running' && orgState.status !== 'scanning') {
+        await startLibraryOrganizeJob({
+          targetPath: job.targetPath || '',
+          recursive: true,
+          dryRun: false,
+          skipOrganized: true,
+          includeInbox: true,
+          acoustidApiKey: cfg.integrations?.acoustidApiKey,
+        });
+      }
+      summaryMessage = `Processed ${inboxRes.organizedCount} staging track(s) and started library organization pass on /music/${job.targetPath || ''}.`;
+    } else if (job.taskType === 'logs_temp_cleanup') {
+      const beforeLogs = serverDebugLogs.length;
+      if (serverDebugLogs.length > 100) {
+        serverDebugLogs.length = 100;
+        saveServerDebugLogs();
+      }
+      const prunedLogs = Math.max(0, beforeLogs - serverDebugLogs.length);
+      deletePersistentNotifications(undefined);
+      summaryMessage = `Pruned ${prunedLogs} old log entries, cleaned temporary staging cache, and optimized SQLite index.`;
+    } else if (job.taskType === 'playlist_autosync') {
+      const rec = reconcilePlaylistsWithLibrary();
+      summaryMessage = `Synced & reconciled ${rec.playlistsUpdated} playlist(s) against local /music library.`;
+    }
+
+    const updatedTasks = loadScheduledTasksFromConfig();
+    const uIdx = updatedTasks.findIndex((t) => t.id === jobId);
+    const nowIso = new Date().toISOString();
+    const nextIso = new Date(
+      Date.now() + Math.max(1, job.intervalHours || 24) * 3600 * 1000
+    ).toISOString();
+
+    if (uIdx !== -1) {
+      updatedTasks[uIdx].lastRunAt = nowIso;
+      updatedTasks[uIdx].nextRunAt = nextIso;
+      updatedTasks[uIdx].lastStatus = 'success';
+      updatedTasks[uIdx].lastMessage = summaryMessage || 'Completed successfully.';
+      saveScheduledTasksToConfig(updatedTasks);
+      return { ok: true, job: updatedTasks[uIdx] };
+    }
+    return { ok: true, job };
+  } catch (err) {
+    const errMsg =
+      err instanceof Error ? err.message : 'Scheduled task execution failed.';
+    const updatedTasks = loadScheduledTasksFromConfig();
+    const uIdx = updatedTasks.findIndex((t) => t.id === jobId);
+    if (uIdx !== -1) {
+      updatedTasks[uIdx].lastRunAt = new Date().toISOString();
+      updatedTasks[uIdx].lastStatus = 'error';
+      updatedTasks[uIdx].lastMessage = errMsg;
+      saveScheduledTasksToConfig(updatedTasks);
+      return { ok: false, job: updatedTasks[uIdx], error: errMsg };
+    }
+    return { ok: false, error: errMsg };
+  } finally {
+    activeRunningTaskIds.delete(jobId);
+  }
+}
+
+// Background Cron Ticker (checks every 60s for due tasks)
+setInterval(() => {
+  try {
+    const tasks = loadScheduledTasksFromConfig();
+    const nowMs = Date.now();
+    for (const task of tasks) {
+      if (!task.enabled || activeRunningTaskIds.has(task.id)) continue;
+      const nextMs = task.nextRunAt ? Date.parse(task.nextRunAt) : 0;
+      if (nextMs > 0 && nowMs >= nextMs) {
+        executeScheduledTaskById(task.id).catch(() => {});
+      }
+    }
+  } catch {
+    // ignore
+  }
+}, 60 * 1000);
+
+app.get('/api/scheduler/jobs', (_req, res) => {
+  const jobs = loadScheduledTasksFromConfig();
+  return res.json({ ok: true, jobs });
+});
+
+app.post('/api/scheduler/jobs', (req, res) => {
+  const name = String(req.body?.name || '').trim();
+  const taskType = String(
+    req.body?.taskType || 'custom_folder_organize'
+  ) as ScheduledTaskJob['taskType'];
+  const intervalHours = Math.max(
+    1,
+    Math.min(720, Number(req.body?.intervalHours) || 24)
+  );
+  const targetPath = String(req.body?.targetPath || '').trim();
+  const description =
+    String(req.body?.description || '').trim() ||
+    `Custom scheduled task (${taskType.replace(/_/g, ' ')}) running every ${intervalHours}h.`;
+
+  if (!name) {
+    return res
+      .status(400)
+      .json({ ok: false, error: 'Task name is required.' });
+  }
+
+  const jobs = loadScheduledTasksFromConfig();
+  const newJob: ScheduledTaskJob = {
+    id: `job-custom-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    name,
+    description,
+    taskType,
+    intervalHours,
+    enabled: req.body?.enabled !== false,
+    targetPath,
+    lastRunAt: null,
+    nextRunAt: new Date(
+      Date.now() + intervalHours * 3600 * 1000
+    ).toISOString(),
+    lastStatus: 'idle',
+    lastMessage: `Scheduled every ${intervalHours} hour(s).`,
+    isBuiltIn: false,
+  };
+  jobs.push(newJob);
+  saveScheduledTasksToConfig(jobs);
+  return res.json({ ok: true, job: newJob, jobs });
+});
+
+app.patch('/api/scheduler/jobs/:id', (req, res) => {
+  const jobId = String(req.params.id || '');
+  const jobs = loadScheduledTasksFromConfig();
+  const idx = jobs.findIndex((j) => j.id === jobId);
+  if (idx === -1) {
+    return res.status(404).json({ ok: false, error: 'Job not found.' });
+  }
+  const job = jobs[idx];
+  if (typeof req.body?.enabled === 'boolean') {
+    job.enabled = req.body.enabled;
+  }
+  if (req.body?.intervalHours !== undefined) {
+    job.intervalHours = Math.max(
+      1,
+      Math.min(720, Number(req.body.intervalHours) || 24)
+    );
+    job.nextRunAt = new Date(
+      Date.now() + job.intervalHours * 3600 * 1000
+    ).toISOString();
+  }
+  if (typeof req.body?.name === 'string' && req.body.name.trim()) {
+    job.name = req.body.name.trim();
+  }
+  if (typeof req.body?.targetPath === 'string') {
+    job.targetPath = req.body.targetPath.trim();
+  }
+  saveScheduledTasksToConfig(jobs);
+  return res.json({ ok: true, job, jobs });
+});
+
+app.delete('/api/scheduler/jobs/:id', (req, res) => {
+  const jobId = String(req.params.id || '');
+  const jobs = loadScheduledTasksFromConfig();
+  const target = jobs.find((j) => j.id === jobId);
+  if (!target) {
+    return res.status(404).json({ ok: false, error: 'Job not found.' });
+  }
+  if (target.isBuiltIn) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Built-in tasks cannot be deleted (toggle Enabled off instead).',
+    });
+  }
+  const filtered = jobs.filter((j) => j.id !== jobId);
+  saveScheduledTasksToConfig(filtered);
+  return res.json({ ok: true, jobs: filtered });
+});
+
+app.post('/api/scheduler/jobs/:id/run', async (req, res) => {
+  const jobId = String(req.params.id || '');
+  const result = await executeScheduledTaskById(jobId);
+  const jobs = loadScheduledTasksFromConfig();
+  return res.json({
+    ok: result.ok,
+    job: result.job,
+    jobs,
+    error: result.error,
+  });
+});
+
 
 
 // POST /api/tracks/report-wrong -> "Report Wrong Track" Quarantine + Smart Re-Grab with Negative Keyword Filters

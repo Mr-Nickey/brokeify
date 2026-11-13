@@ -37,7 +37,46 @@ export interface AppNotificationItem {
   severity?: AppNotificationSeverity;
   service?: string;
   createdAt: string;
+  timestampMs?: number;
   read: boolean;
+}
+
+export function formatNotificationTimestamp(
+  raw?: string | number | null,
+  timestampMs?: number
+): string {
+  const formatMs = (ms: number) =>
+    new Date(ms).toLocaleString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+
+  if (typeof timestampMs === 'number' && !Number.isNaN(timestampMs) && timestampMs > 0) {
+    return formatMs(timestampMs);
+  }
+  if (typeof raw === 'number' && !Number.isNaN(raw) && raw > 0) {
+    return formatMs(raw);
+  }
+  const str = String(raw || '').trim();
+  if (!str || str === 'Invalid Date') {
+    return formatMs(Date.now());
+  }
+  // If str already has a 4-digit year or slash date and isn't Invalid Date, check if Date.parse works
+  const parsed = Date.parse(str);
+  if (!Number.isNaN(parsed) && parsed > 0) {
+    return formatMs(parsed);
+  }
+  // If str is a time-only string like "8:56:12 AM", prepend today's date
+  const todayDate = new Date().toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+  return `${todayDate}, ${str}`;
 }
 
 export function inferNotificationCategory(
@@ -181,8 +220,11 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
     }
   }, [isOpen]);
 
-  const isFlashingActive = unreadCount > 0 && !hasCheckedCurrentBatch && !isOpen;
-  const hasUrgentError = unreadErrors > 0;
+  // Note: mutePopupBanners === false means "Mute All" (silent bell, no bouncing/badges), while mutePopupBanners === true (default) is "Bell Only" (collects in bell, zero popups)
+  const isMuteAll = !mutePopupBanners;
+  const isFlashingActive =
+    !isMuteAll && unreadCount > 0 && !hasCheckedCurrentBatch && !isOpen;
+  const hasUrgentError = !isMuteAll && unreadErrors > 0;
 
   const filteredNotifications = useMemo(() => {
     return notifications.filter((n) => {
@@ -354,7 +396,7 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
         <span className="hidden xl:inline">Alerts</span>
 
         {/* Color-Coded Unread Notification Count Badge */}
-        {unreadCount > 0 && (
+        {!isMuteAll && unreadCount > 0 && (
           <span
             data-testid="notification-badge-count"
             className={`-top-1.5 -right-1.5 absolute min-w-[18px] h-[18px] px-1 rounded-full border border-zinc-950 text-[10px] font-mono font-extrabold text-white flex items-center justify-center shadow-md ${
@@ -396,24 +438,24 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
                 data-testid="btn-toggle-mute-toasts"
                 title={
                   mutePopupBanners
-                    ? 'Bell Only Mode (Default): Zero layout-shifting banners; all alerts collect here'
-                    : 'Click to lock in Bell Only silent mode'
+                    ? 'Bell Only Mode (Default): Alerts collect quietly in the bell with zero popup banners. Click to switch to Mute All.'
+                    : 'Mute All Mode: All notifications and bell badges are muted. Click to switch to Bell Only.'
                 }
                 className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[10px] font-mono font-bold transition-colors ${
                   mutePopupBanners
                     ? 'border-[#10b981]/40 bg-[#10b981]/15 text-[#10b981]'
-                    : 'border-zinc-700 bg-zinc-900 text-zinc-300 hover:text-white'
+                    : 'border-rose-500/40 bg-rose-950/40 text-rose-300 hover:text-white'
                 }`}
               >
                 {mutePopupBanners ? (
                   <>
-                    <BellOff className="w-3 h-3" />
+                    <Bell className="w-3 h-3 text-[#10b981]" />
                     <span>Bell Only</span>
                   </>
                 ) : (
                   <>
-                    <Bell className="w-3 h-3 text-[#10b981]" />
-                    <span>Popups ON</span>
+                    <BellOff className="w-3 h-3 text-rose-400" />
+                    <span>Mute All</span>
                   </>
                 )}
               </button>
@@ -624,8 +666,13 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
                       >
                         {item.message}
                       </div>
-                      <div className="text-[10px] text-zinc-500 flex items-center gap-1.5 flex-wrap">
-                        <span>{item.createdAt}</span>
+                      <div className="text-[10px] text-zinc-400 flex items-center gap-1.5 flex-wrap">
+                        <span className="text-zinc-300 font-semibold">
+                          {formatNotificationTimestamp(
+                            item.createdAt,
+                            item.timestampMs
+                          )}
+                        </span>
                         <span>·</span>
                         <span className="uppercase">
                           {item.service || item.category}

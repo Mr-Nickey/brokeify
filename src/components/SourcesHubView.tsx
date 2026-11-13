@@ -167,17 +167,19 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
     fetchOrganizeJobStatus();
   }, []);
 
+  const organizeJobStatus = organizeJob?.status;
+
   useEffect(() => {
     if (
-      organizeJob &&
-      (organizeJob.status === 'running' || organizeJob.status === 'scanning')
+      organizeJobStatus === 'running' ||
+      organizeJobStatus === 'scanning'
     ) {
       const timer = setInterval(() => {
         fetchOrganizeJobStatus();
-      }, 1500);
+      }, 2500);
       return () => clearInterval(timer);
     }
-  }, [organizeJob]);
+  }, [organizeJobStatus]);
 
   const handleStartLibraryOrganize = async (dryRun: boolean) => {
     try {

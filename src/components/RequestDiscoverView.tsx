@@ -661,7 +661,10 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
               }`}
             >
               <Sparkles className="w-3.5 h-3.5" />
-              <span>2. Spotify &amp; Playlist Importer</span>
+              <span>
+                2. Spotify &amp; Playlist Importer
+                {autopilotRules.length > 0 ? ` (${autopilotRules.length} Auto)` : ''}
+              </span>
             </button>
 
             <button
@@ -685,20 +688,6 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
 
             <button
               type="button"
-              onClick={() => setSubMode('autopilot')}
-              data-testid="discover-subtab-autopilot"
-              className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-mono font-bold transition-colors min-h-[38px] ${
-                subMode === 'autopilot'
-                  ? 'bg-[#00ff66] text-zinc-950'
-                  : 'bg-zinc-950 text-zinc-300 hover:text-white border border-zinc-800'
-              }`}
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-              <span>4. Autopilot &amp; Picard ({autopilotRules.length})</span>
-            </button>
-
-            <button
-              type="button"
               onClick={() => setSubMode('filters')}
               data-testid="discover-subtab-filters"
               className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-mono font-bold transition-colors min-h-[38px] ${
@@ -708,7 +697,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
               }`}
             >
               <Filter className="w-3.5 h-3.5" />
-              <span>5. Exclusion Filters ({activeExclusionCount})</span>
+              <span>4. Exclusion Filters ({activeExclusionCount})</span>
             </button>
 
             <button
@@ -722,7 +711,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
               }`}
             >
               <DownloadCloud className="w-3.5 h-3.5" />
-              <span>6. Downloads ({jobs.length})</span>
+              <span>5. Downloads ({jobs.length})</span>
             </button>
           </div>
 
@@ -939,7 +928,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
                             className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-500/20 border border-emerald-500/50 px-3 py-1.5 text-xs font-mono font-bold text-[#00ff66]"
                           >
                             <Play className="w-3.5 h-3.5 fill-current" />
-                            <span>On Jellyfin · Play</span>
+                            <span>In Library · Play</span>
                           </button>
                         ) : (
                           <div className="flex flex-wrap items-center gap-1.5">
@@ -1050,7 +1039,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
                                         className="inline-flex items-center gap-1 rounded-lg bg-emerald-500/20 border border-emerald-500/40 px-2.5 py-1 text-[11px] font-mono font-bold text-[#00ff66]"
                                       >
                                         <CheckCircle2 className="w-3 h-3" />
-                                        <span>On Jellyfin</span>
+                                        <span>In Library</span>
                                       </button>
                                     ) : rich.state === 'downloading' ? (
                                       <span className="inline-flex items-center gap-1 rounded-lg bg-sky-500/20 border border-sky-500/40 px-2.5 py-1 text-[11px] font-mono font-bold text-sky-300">
@@ -1115,14 +1104,14 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
               <h2 className="text-base font-bold text-white font-mono flex items-center gap-2">
                 <Sparkles className="w-4 h-4 text-[#00ff66]" />
                 <span>
-                  Spotify Playlist Link &amp; Tracklist Importer (Better Than Explo)
+                  Spotify Playlist Link &amp; Tracklist Importer + Autopilot Sync
                 </span>
               </h2>
               <p className="text-xs text-zinc-300">
                 Drop any public{' '}
                 <strong className="text-white">Spotify Playlist or Album Link</strong>{' '}
                 (or paste a song list) below. Brokeify shows you exactly which songs
-                are <span className="text-[#00ff66] font-semibold">On Jellyfin</span>,{' '}
+                are <span className="text-[#00ff66] font-semibold">In Library</span>,{' '}
                 <span className="text-sky-300 font-semibold">Downloading</span>,{' '}
                 <span className="text-rose-300 font-semibold">Not Found</span>, or{' '}
                 <span className="text-amber-300 font-semibold">Filtered Out</span>—and
@@ -1214,7 +1203,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
                       .filter((id): id is string => Boolean(id));
                     if (matchedIds.length === 0) {
                       onShowToast(
-                        '⚠️ None of these songs are in Jellyfin yet. Click "Download Missing" first!'
+                        '⚠️ None of these songs are in your library yet. Click "Download Missing" first!'
                       );
                       return;
                     }
@@ -1226,7 +1215,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
                       originalName:
                         importedPlaylistTitle.trim() ||
                         'Imported Spotify Playlist',
-                      description: `Imported playlist (${matchedIds.length}/${parsedSpotifyItems.length} tracks on Jellyfin).`,
+                      description: `Imported playlist (${matchedIds.length}/${parsedSpotifyItems.length} tracks in library).`,
                       source: 'spotify-resolved',
                       trackIds: matchedIds,
                       createdAt: new Date().toISOString().slice(0, 10),
@@ -1234,7 +1223,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
                     };
                     onSaveResolvedPlaylist(newPl);
                     onShowToast(
-                      `💾 Saved "${newPl.name}" (${matchedIds.length} Jellyfin tracks) to Library -> Playlists!`
+                      `💾 Saved "${newPl.name}" (${matchedIds.length} tracks) to Library -> Playlists!`
                     );
                   }}
                   className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-purple-600 hover:bg-purple-500 py-2.5 px-4 text-xs font-mono font-bold text-white transition-colors min-h-[40px]"
@@ -1289,7 +1278,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
                         </h3>
                         <p className="text-[11px] font-mono text-zinc-400 mt-0.5">
                           Click any status pill below to inspect Missing,
-                          Downloading, On Jellyfin, Not Found, or Filtered songs.
+                          Downloading, In Library, Not Found, or Filtered songs.
                         </p>
                       </div>
 
@@ -1364,7 +1353,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
                             : 'border-emerald-500/30 bg-emerald-500/10 text-[#00ff66]'
                         }`}
                       >
-                        🟢 On Jellyfin ({countInJf})
+                        🟢 In Library ({countInJf})
                       </button>
                       <button
                         type="button"
@@ -1437,7 +1426,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
                               <div className="mt-1 flex items-center gap-2 text-[11px] font-mono">
                                 {rich.state === 'in_jellyfin' && (
                                   <span className="text-[#00ff66]">
-                                    ✓ On Jellyfin Server
+                                    ✓ In Brokeify Library
                                   </span>
                                 )}
                                 {rich.state === 'downloading' && (
@@ -1459,7 +1448,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
                                 )}
                                 {rich.state === 'missing' && (
                                   <span className="text-amber-300">
-                                    • Missing from Jellyfin
+                                    • Missing from Library
                                   </span>
                                 )}
                               </div>
@@ -1537,6 +1526,231 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
               })()}
             </div>
           </div>
+
+          {/* Embedded Autopilot Linked Playlists inside Spotify & Playlist Importer */}
+          <div
+            data-testid="discover-autopilot-embedded-panel"
+            className="rounded-2xl border border-emerald-500/30 bg-zinc-950/90 p-4 sm:p-5 space-y-4 mt-4"
+          >
+            <div className="space-y-1 border-b border-zinc-800 pb-3">
+              <h3 className="text-sm sm:text-base font-bold text-white font-mono flex items-center gap-2">
+                <RefreshCw className="w-4 h-4 text-[#00ff66]" />
+                <span>
+                  Autopilot Linked Playlists (Daily, Weekly, or Monthly Spotify Sync)
+                </span>
+              </h3>
+              <p className="text-xs text-zinc-300 leading-relaxed">
+                Link any of your playlists to a public{' '}
+                <strong className="text-white">Spotify Playlist URL</strong>.
+                Brokeify will automatically check that Spotify playlist{' '}
+                <strong className="text-[#00ff66]">
+                  Daily, Weekly, or Monthly
+                </strong>{' '}
+                in the background, download any new songs via{' '}
+                <code className="text-[#00ff66]">slskd</code> or{' '}
+                <code className="text-rose-300">YouTube Music</code>, organize
+                them into clean folders, and add them to your playlist.
+              </p>
+            </div>
+
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                if (!apSpotifyUrl.trim()) {
+                  onShowToast('Paste a Spotify Playlist URL first.');
+                  return;
+                }
+                const targetPl = playlists.find((p) => p.id === apPlaylistId);
+                setIsSavingAutopilot(true);
+                try {
+                  const resp = await fetch('/api/autopilot/save', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      rule: {
+                        id: `autopilot-${Date.now()}`,
+                        playlistId: targetPl?.id || `pl-auto-${Date.now()}`,
+                        playlistName:
+                          targetPl?.name || 'Autopilot Spotify Mix',
+                        spotifyUrl: apSpotifyUrl.trim(),
+                        interval: apInterval,
+                        enabled: true,
+                        preferredDownloader: sourceMode,
+                        organizeWithPicard: true,
+                      },
+                    }),
+                  });
+                  const data = await resp.json();
+                  if (resp.ok && data.ok) {
+                    onShowToast(
+                      `🤖 Autopilot rule saved! Will check Spotify ${apInterval}.`
+                    );
+                    setApSpotifyUrl('');
+                    if (onRefreshAutopilotRules) onRefreshAutopilotRules();
+                  } else {
+                    onShowToast(
+                      `⚠️ ${data.error || 'Could not save Autopilot rule'}`
+                    );
+                  }
+                } finally {
+                  setIsSavingAutopilot(false);
+                }
+              }}
+              className="grid grid-cols-1 md:grid-cols-12 gap-3"
+            >
+              <div className="md:col-span-3">
+                <label className="block text-xs font-mono text-zinc-300 mb-1">
+                  1. Target Playlist
+                </label>
+                <select
+                  value={apPlaylistId}
+                  onChange={(e) => setApPlaylistId(e.target.value)}
+                  data-testid="autopilot-select-playlist"
+                  className="w-full rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none min-h-[40px]"
+                >
+                  <option value="">+ Create New Autopilot Playlist</option>
+                  {playlists.map((pl) => (
+                    <option key={pl.id} value={pl.id}>
+                      {pl.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="md:col-span-4">
+                <label className="block text-xs font-mono text-zinc-300 mb-1">
+                  2. Spotify Playlist URL to Watch
+                </label>
+                <input
+                  type="text"
+                  value={apSpotifyUrl}
+                  onChange={(e) => setApSpotifyUrl(e.target.value)}
+                  placeholder="https://open.spotify.com/playlist/..."
+                  data-testid="autopilot-spotify-url-input"
+                  className="w-full rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none min-h-[40px]"
+                />
+              </div>
+
+              <div className="md:col-span-2">
+                <label className="block text-xs font-mono text-zinc-300 mb-1">
+                  3. Check Schedule
+                </label>
+                <select
+                  value={apInterval}
+                  onChange={(e) =>
+                    setApInterval(e.target.value as AutopilotScheduleInterval)
+                  }
+                  data-testid="autopilot-schedule-select"
+                  className="w-full rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs font-mono text-[#00ff66] font-bold focus:border-[#00ff66] focus:outline-none min-h-[40px]"
+                >
+                  <option value="daily">Every Day (Daily)</option>
+                  <option value="weekly">Every Week (Weekly)</option>
+                  <option value="monthly">Every Month (Monthly)</option>
+                </select>
+              </div>
+
+              <div className="md:col-span-3 flex items-end">
+                <button
+                  type="submit"
+                  disabled={isSavingAutopilot}
+                  data-testid="autopilot-create-btn"
+                  className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-4 py-2.5 text-xs font-mono font-bold text-zinc-950 min-h-[40px]"
+                >
+                  {isSavingAutopilot ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Plus className="w-4 h-4" />
+                  )}
+                  <span>Enable Autopilot</span>
+                </button>
+              </div>
+            </form>
+
+            {autopilotRules.length > 0 && (
+              <div className="space-y-2.5 pt-2">
+                {autopilotRules.map((rule) => (
+                  <div
+                    key={rule.id}
+                    data-testid={`autopilot-rule-${rule.id}`}
+                    className="rounded-xl border border-zinc-800 bg-zinc-900/80 p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                  >
+                    <div className="space-y-0.5 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="rounded bg-emerald-500/20 border border-emerald-500/40 px-2 py-0.5 text-[10px] font-mono font-bold text-[#00ff66] uppercase">
+                          AUTOPILOT: {rule.interval.toUpperCase()}
+                        </span>
+                        <span className="text-sm font-bold text-white truncate">
+                          {rule.playlistName}
+                        </span>
+                      </div>
+                      <div className="text-xs font-mono text-zinc-400 truncate">
+                        Linked Spotify URL: {rule.spotifyUrl}
+                      </div>
+                      {rule.lastRunMessage && (
+                        <div className="text-[11px] font-mono text-purple-300">
+                          Last Check: {rule.lastRunMessage}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        disabled={syncingRuleId === rule.id}
+                        onClick={async () => {
+                          setSyncingRuleId(rule.id);
+                          try {
+                            const resp = await fetch(
+                              '/api/autopilot/sync-now',
+                              {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ ruleId: rule.id }),
+                              }
+                            );
+                            const data = await resp.json();
+                            onShowToast(
+                              data.message || 'Autopilot check completed!'
+                            );
+                            if (onRefreshAutopilotRules)
+                              onRefreshAutopilotRules();
+                            onRefreshStatus();
+                          } finally {
+                            setSyncingRuleId(null);
+                          }
+                        }}
+                        className="inline-flex items-center gap-1.5 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-3 py-1.5 text-xs font-mono font-bold text-zinc-950"
+                      >
+                        {syncingRuleId === rule.id ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <RefreshCw className="w-3.5 h-3.5" />
+                        )}
+                        <span>Check &amp; Sync Now</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          await fetch(
+                            `/api/autopilot/${encodeURIComponent(rule.id)}`,
+                            { method: 'DELETE' }
+                          );
+                          onShowToast('Removed Autopilot rule.');
+                          if (onRefreshAutopilotRules)
+                            onRefreshAutopilotRules();
+                        }}
+                        className="rounded-xl border border-zinc-800 bg-zinc-900 hover:border-rose-500/50 hover:text-rose-400 p-2 text-zinc-400"
+                        title="Delete Autopilot Rule"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -1550,12 +1764,12 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
               <h2 className="text-base font-bold text-white font-mono flex items-center gap-2">
                 <Sparkles className="w-4 h-4 text-purple-400" />
                 <span>
-                  ListenBrainz Discovery Playlists (Better-Than-Explo Status Tracker)
+                  ListenBrainz Discovery Playlists
                 </span>
               </h2>
               <p className="text-xs text-zinc-400">
                 Shows exactly which songs in your ListenBrainz mixes are{' '}
-                <span className="text-[#00ff66]">On Jellyfin</span>,{' '}
+                <span className="text-[#00ff66]">In Library</span>,{' '}
                 <span className="text-sky-300">Downloading</span>,{' '}
                 <span className="text-rose-300">Not Found</span>, or{' '}
                 <span className="text-purple-300">Excluded by Filters</span>—and
@@ -1642,7 +1856,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
 
                       <div className="flex items-center justify-between text-[11px] font-mono pt-2 border-t border-zinc-800/80">
                         <span className="text-[#00ff66]">
-                          {pl.inLibraryCount}/{pl.trackCount} in Jellyfin
+                          {pl.inLibraryCount}/{pl.trackCount} in Library
                         </span>
                         <span className="text-amber-300">
                           {pl.missingCount} missing
@@ -1711,7 +1925,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
                             {activeLbPlaylist.title}
                           </h3>
                           <p className="text-xs text-zinc-400">
-                            {countInJf} on Jellyfin · {countMissing} missing ·{' '}
+                            {countInJf} in Library · {countMissing} missing ·{' '}
                             {countDownloading} downloading · {countNotFound} not
                             found · {countFiltered} excluded by filters
                           </p>
@@ -1789,7 +2003,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
                               : 'border-emerald-500/30 bg-emerald-500/10 text-[#00ff66]'
                           }`}
                         >
-                          🟢 On Jellyfin ({countInJf})
+                          🟢 In Library ({countInJf})
                         </button>
                         <button
                           type="button"
@@ -1867,7 +2081,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
                                 <div className="pl-8 mt-0.5 text-[11px] font-mono">
                                   {rich.state === 'in_jellyfin' && (
                                     <span className="text-[#00ff66]">
-                                      ✓ On Jellyfin Server
+                                      ✓ In Brokeify Library
                                     </span>
                                   )}
                                   {rich.state === 'downloading' && (
@@ -1907,7 +2121,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
                                 ) : rich.state === 'in_jellyfin' ? (
                                   <span className="inline-flex items-center gap-1 rounded-lg bg-emerald-500/15 border border-emerald-500/30 px-2.5 py-1 text-[11px] font-mono text-[#00ff66]">
                                     <CheckCircle2 className="w-3 h-3" />
-                                    <span>On Jellyfin</span>
+                                    <span>In Library</span>
                                   </span>
                                 ) : rich.state === 'downloading' ? (
                                   <span className="inline-flex items-center gap-1 rounded-lg bg-sky-500/20 border border-sky-500/40 px-2.5 py-1 text-[11px] font-mono text-sky-300">
@@ -1989,9 +2203,9 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
                 </span>
               </h2>
               <p className="text-xs text-zinc-300">
-                Just like Explo (and better): turn on any toggle below or write
-                your own custom rule so Brokeify automatically skips unwanted
-                versions when downloading playlists or albums.
+                Turn on any toggle below or write your own custom rule so
+                Brokeify automatically skips unwanted versions when downloading
+                playlists or albums.
               </p>
             </div>
 
@@ -2245,7 +2459,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
               <div className="flex items-center gap-2">
                 <Code2 className="w-4 h-4 text-purple-400" />
                 <h3 className="text-xs font-mono font-bold uppercase text-purple-300">
-                  Custom Filter Script (Advanced Explo Rule Engine)
+                  Custom Filter Script (Advanced Rule Engine)
                 </h3>
               </div>
 
@@ -2700,14 +2914,14 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
           <div className="flex items-center justify-between gap-2">
             <div>
               <h2 className="text-base font-bold text-white font-mono">
-                Automated Download Transfers &amp; Jellyfin Auto-Importer
+                Automated Download Transfers &amp; Library Auto-Importer
               </h2>
               <p className="text-xs text-zinc-400">
                 Tracks downloads across <code className="text-[#00ff66]">slskd</code>,{' '}
                 <code className="text-rose-300">YouTube Music</code>, and{' '}
                 <code className="text-sky-300">Open Audio Archive</code>. Automatically
-                triggers Jellyfin <code className="text-[#00ff66]">POST /Library/Refresh</code>{' '}
-                when complete!
+                fingerprints, tags, and imports completed tracks into your{' '}
+                <code className="text-[#00ff66]">/music</code> library!
               </p>
             </div>
 

@@ -314,7 +314,39 @@ class BrokeifyEmbeddedDatabase {
         }
       }
       if (Array.isArray(parsed.notifications)) {
-        this.notifications = parsed.notifications.slice(0, 200);
+        this.notifications = parsed.notifications
+          .filter(
+            (n) =>
+              n &&
+              typeof n.message === 'string' &&
+              !n.message.toLowerCase().includes('rate limit exceeded')
+          )
+          .map((n) => {
+            const ts =
+              typeof n.timestampMs === 'number' && n.timestampMs > 0
+                ? n.timestampMs
+                : Date.now();
+            const rawDate = String(n.createdAt || '').trim();
+            const formatted =
+              !rawDate ||
+              rawDate === 'Invalid Date' ||
+              !/\d{4}|\//.test(rawDate)
+                ? new Date(ts).toLocaleString('en-US', {
+                    month: 'short',
+                    day: 'numeric',
+                    year: 'numeric',
+                    hour: 'numeric',
+                    minute: '2-digit',
+                    second: '2-digit',
+                  })
+                : rawDate;
+            return {
+              ...n,
+              timestampMs: ts,
+              createdAt: formatted,
+            };
+          })
+          .slice(0, 200);
       }
       console.log(
         `[Brokeify][DB][INFO] Restored persistent database from ${DB_PATH}: ${this.tracks.size} tracks, ${this.albums.size} albums, ${this.artists.size} artists, ${this.playlists.size} playlists intact.`
@@ -2718,6 +2750,21 @@ export function getPersistentNotifications() {
   return computeNotificationSummary();
 }
 
+export function formatNotificationDateTime(ms: number = Date.now()): string {
+  try {
+    return new Date(ms).toLocaleString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+  } catch {
+    return new Date(ms).toISOString();
+  }
+}
+
 export function addPersistentNotification(input: {
   message: string;
   category?: 'system' | 'download' | 'security' | 'library';
@@ -2727,7 +2774,7 @@ export function addPersistentNotification(input: {
   cooldownMs?: number;
 }): NotificationRow {
   const nowMs = Date.now();
-  const nowStr = new Date().toLocaleTimeString();
+  const nowStr = formatNotificationDateTime(nowMs);
   const cleanMsg = String(input.message || '').trim();
   const category = input.category || 'system';
   const severity = input.severity || 'info';
