@@ -9,7 +9,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install --legacy-peer-deps
 
-# Copy source code and build both client (dist/) and standalone server.js
+# Copy source code and build both client (dist/) and standalone server bundle (dist/server.js)
 COPY . .
 RUN npm run build
 
@@ -28,10 +28,10 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
-# Copy only the compiled frontend assets and self-contained server bundle
+# Copy only the compiled frontend assets, bundled server, and manifest files
 COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/server.js ./server.js
 COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/version.json ./version.json
 
 # Create persistent directories for database (/data/brokeify.db), cover art (/data/covers),
 # mounted music library (/music), and staging inbox (/music/_inbox & /downloads), owned by non-root `node` user
@@ -58,4 +58,4 @@ USER node
 # Container healthcheck hitting the public handshake endpoint using Node's built-in fetch
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD node -e "fetch('http://127.0.0.1:3487/api/ping').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
-CMD ["node", "server.js"]
+CMD ["node", "dist/server.js"]

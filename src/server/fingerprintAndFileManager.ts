@@ -11,6 +11,7 @@ import {
   deleteTrackFromDb,
   getMusicDir,
   indexAudioFile,
+  isSafePathWithinAllowedRootsStrict,
   reconcilePlaylistsWithLibrary,
   updateTrackMetadataInDb,
   addPersistentNotification,
@@ -19,11 +20,47 @@ import {
 const execFileAsync = promisify(execFile);
 
 export const QUARANTINE_DIR = path.join(DATA_DIR, 'quarantine');
-try {
-  fs.mkdirSync(QUARANTINE_DIR, { recursive: true });
-} catch {
-  // ignore
+
+export async function ensureQuarantineDir(): Promise<string> {
+  await fs.promises.mkdir(QUARANTINE_DIR, { recursive: true });
+  return QUARANTINE_DIR;
 }
+
+async function pathExistsAsync(targetPath: string): Promise<boolean> {
+  try {
+    await fs.promises.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export class AsyncWorkerPool {
+  private activeCount = 0;
+  private waitQueue: Array<() => void> = [];
+
+  constructor(private readonly maxConcurrency: number) {}
+
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    if (this.activeCount >= this.maxConcurrency) {
+      await new Promise<void>((resolve) => {
+        this.waitQueue.push(resolve);
+      });
+    }
+    this.activeCount += 1;
+    try {
+      return await task();
+    } finally {
+      this.activeCount = Math.max(0, this.activeCount - 1);
+      const next = this.waitQueue.shift();
+      if (next) next();
+    }
+  }
+}
+
+export const fpcalcWorkerPool = new AsyncWorkerPool(2);
+export const ffmpegTagWorkerPool = new AsyncWorkerPool(2);
+export const ytDlpWorkerPool = new AsyncWorkerPool(2);
 
 // Strict 1 request/sec rate-limiter for MusicBrainz API with exponential backoff on HTTP 503/429
 const MB_USER_AGENT =
@@ -127,10 +164,24 @@ export async function runFpcalcOnFile(filePath: string): Promise<{
   durationSec: number;
   fingerprint: string;
 }> {
+  const resolvedPath = path.resolve(String(filePath || ''));
+  if (!(await isSafePathWithinAllowedRootsStrict(resolvedPath))) {
+    return {
+      ok: false,
+      fpcalcInstalled: false,
+      durationSec: 0,
+      fingerprint: '',
+    };
+  }
+
   try {
-    const { stdout } = await execFileAsync('fpcalc', ['-json', filePath], {
-      timeout: 20000,
-    });
+    const { stdout } = await fpcalcWorkerPool.run(() =>
+      execFileAsync('fpcalc', ['-json', resolvedPath], {
+        timeout: 20000,
+        shell: false,
+        windowsHide: true,
+      })
+    );
     const parsed = JSON.parse(String(stdout || '{}').trim());
     if (parsed && parsed.fingerprint) {
       return {
@@ -146,7 +197,7 @@ export async function runFpcalcOnFile(filePath: string): Promise<{
 
   let durationSec = 0;
   try {
-    const meta = await parseFile(filePath, { duration: true, skipCovers: true });
+    const meta = await parseFile(resolvedPath, { duration: true, skipCovers: true });
     durationSec = Math.round(Number(meta.format.duration || 0));
   } catch {
     // ignore
@@ -163,9 +214,10 @@ export async function runFpcalcOnFile(filePath: string): Promise<{
 export async function downloadCoverArtArchiveForRelease(
   releaseMbid: string
 ): Promise<{ coverArtUrl?: string; localCoverId?: string }> {
-  if (!releaseMbid) return {};
+  const cleanMbid = String(releaseMbid || '').trim();
+  if (!cleanMbid || !/^[0-9a-f-]{8,64}$/i.test(cleanMbid)) return {};
   const caaUrl = `https://coverartarchive.org/release/${encodeURIComponent(
-    releaseMbid
+    cleanMbid
   )}/front-500`;
   try {
     const resp = await fetch(caaUrl, {
@@ -177,10 +229,10 @@ export async function downloadCoverArtArchiveForRelease(
     const buffer = Buffer.from(arrayBuf);
     if (buffer.length < 512) return {};
 
-    const coverId = `caa-${releaseMbid}.jpg`;
+    const coverId = `caa-${cleanMbid}.jpg`;
     const destPath = path.join(COVERS_DIR, coverId);
-    fs.mkdirSync(COVERS_DIR, { recursive: true });
-    fs.writeFileSync(destPath, buffer);
+    await fs.promises.mkdir(COVERS_DIR, { recursive: true });
+    await fs.promises.writeFile(destPath, buffer);
     return {
       coverArtUrl: `/api/cover/${coverId}`,
       localCoverId: coverId,
@@ -435,6 +487,12 @@ export async function identifyAudioFileWithAcoustIdAndMusicBrainz(
   };
 }
 
+function sanitizeMetadataValue(val: unknown): string {
+  return String(val ?? '')
+    .replace(/[\x00\r\n]/g, ' ')
+    .trim();
+}
+
 export async function embedMetadataAndArtworkIntoFile(
   filePath: string,
   meta: {
@@ -447,24 +505,41 @@ export async function embedMetadataAndArtworkIntoFile(
     genre?: string;
     recordingMbid?: string;
     releaseMbid?: string;
+    artistMbid?: string;
     localCoverId?: string;
-  }
+  },
+  coverFilePathOverride?: string
 ): Promise<boolean> {
-  if (!fs.existsSync(filePath)) return false;
-  const ext = path.extname(filePath).toLowerCase();
+  const resolvedFilePath = path.resolve(String(filePath || ''));
+  if (!(await isSafePathWithinAllowedRootsStrict(resolvedFilePath))) {
+    return false;
+  }
+  if (!(await pathExistsAsync(resolvedFilePath))) return false;
+  const ext = path.extname(resolvedFilePath).toLowerCase();
   const tempPath = path.join(
-    path.dirname(filePath),
+    path.dirname(resolvedFilePath),
     `.brokeify-tag-${Date.now()}-${Math.random().toString(36).slice(2, 6)}${ext}`
   );
 
   try {
-    const args: string[] = ['-y', '-i', filePath];
-    const coverPath = meta.localCoverId
-      ? path.join(COVERS_DIR, meta.localCoverId)
-      : '';
+    const args: string[] = ['-y', '-i', resolvedFilePath];
+    let coverPath = '';
+    if (coverFilePathOverride) {
+      const candidateOverride = path.resolve(String(coverFilePathOverride));
+      if (await isSafePathWithinAllowedRootsStrict(candidateOverride)) {
+        coverPath = candidateOverride;
+      }
+    } else if (meta.localCoverId) {
+      const safeCoverName = path.basename(String(meta.localCoverId));
+      const candidateLocal = path.join(COVERS_DIR, safeCoverName);
+      if (await isSafePathWithinAllowedRootsStrict(candidateLocal)) {
+        coverPath = candidateLocal;
+      }
+    }
+
     const hasCoverFile =
       Boolean(coverPath) &&
-      fs.existsSync(coverPath) &&
+      (await pathExistsAsync(coverPath)) &&
       (ext === '.mp3' || ext === '.flac' || ext === '.m4a');
 
     if (hasCoverFile) {
@@ -489,30 +564,43 @@ export async function embedMetadataAndArtworkIntoFile(
       args.push('-c', 'copy');
     }
 
-    if (meta.title) args.push('-metadata', `title=${meta.title}`);
-    if (meta.artist) args.push('-metadata', `artist=${meta.artist}`);
-    if (meta.album) args.push('-metadata', `album=${meta.album}`);
+    if (meta.title) args.push('-metadata', `title=${sanitizeMetadataValue(meta.title)}`);
+    if (meta.artist) args.push('-metadata', `artist=${sanitizeMetadataValue(meta.artist)}`);
+    if (meta.album) args.push('-metadata', `album=${sanitizeMetadataValue(meta.album)}`);
     if (meta.trackNumber)
-      args.push('-metadata', `track=${String(meta.trackNumber)}`);
+      args.push('-metadata', `track=${String(Math.max(1, Number(meta.trackNumber) || 1))}`);
     if (meta.discNumber)
-      args.push('-metadata', `disc=${String(meta.discNumber)}`);
-    if (meta.year) args.push('-metadata', `date=${String(meta.year)}`);
-    if (meta.genre) args.push('-metadata', `genre=${meta.genre}`);
+      args.push('-metadata', `disc=${String(Math.max(1, Number(meta.discNumber) || 1))}`);
+    if (meta.year) args.push('-metadata', `date=${String(Number(meta.year) || '')}`);
+    if (meta.genre) args.push('-metadata', `genre=${sanitizeMetadataValue(meta.genre)}`);
     if (meta.recordingMbid)
-      args.push('-metadata', `musicbrainz_trackid=${meta.recordingMbid}`);
+      args.push('-metadata', `musicbrainz_trackid=${sanitizeMetadataValue(meta.recordingMbid)}`);
     if (meta.releaseMbid)
-      args.push('-metadata', `musicbrainz_albumid=${meta.releaseMbid}`);
+      args.push('-metadata', `musicbrainz_albumid=${sanitizeMetadataValue(meta.releaseMbid)}`);
+    if (meta.artistMbid)
+      args.push('-metadata', `musicbrainz_artistid=${sanitizeMetadataValue(meta.artistMbid)}`);
 
     args.push(tempPath);
 
-    await execFileAsync('ffmpeg', args, { timeout: 25000 });
-    if (fs.existsSync(tempPath) && fs.statSync(tempPath).size > 0) {
-      fs.renameSync(tempPath, filePath);
-      return true;
+    await ffmpegTagWorkerPool.run(() =>
+      execFileAsync('ffmpeg', args, {
+        timeout: 25000,
+        shell: false,
+        windowsHide: true,
+      })
+    );
+    if (await pathExistsAsync(tempPath)) {
+      const st = await fs.promises.stat(tempPath);
+      if (st.size > 0) {
+        await fs.promises.rename(tempPath, resolvedFilePath);
+        return true;
+      }
     }
   } catch {
     try {
-      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+      if (await pathExistsAsync(tempPath)) {
+        await fs.promises.unlink(tempPath);
+      }
     } catch {}
   }
   return false;
@@ -526,6 +614,38 @@ export function sanitizePathSegment(segment: string): string {
       .replace(/^\.+|\.+$/g, '')
       .trim() || 'Unknown'
   );
+}
+
+export function sanitizeSingleSegmentName(rawName: string): {
+  ok: boolean;
+  name: string;
+  error?: string;
+} {
+  const str = String(rawName || '');
+  if (!str.trim()) {
+    return { ok: false, name: '', error: 'Name is required.' };
+  }
+  if (
+    str.includes('\0') ||
+    str.includes('/') ||
+    str.includes('\\') ||
+    /%2e/i.test(str) ||
+    /%2f/i.test(str) ||
+    /%5c/i.test(str)
+  ) {
+    return {
+      ok: false,
+      name: '',
+      error: 'Single file or folder name cannot contain path separators or traversal.',
+    };
+  }
+  const cleaned = str
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .trim();
+  if (!cleaned || cleaned === '.' || cleaned === '..') {
+    return { ok: false, name: '', error: 'Invalid file or folder name.' };
+  }
+  return { ok: true, name: cleaned };
 }
 
 export function buildOrganizedTrackDestination(
@@ -558,25 +678,25 @@ export function buildOrganizedTrackDestination(
   );
 }
 
-export function cleanupEmptyParentDirs(
+export async function cleanupEmptyParentDirs(
   startDir: string,
   stopAtRootDir: string
-): void {
+): Promise<void> {
   try {
     const resolvedRoot = path.resolve(stopAtRootDir);
     let current = path.resolve(startDir);
     while (
-      current.startsWith(resolvedRoot) &&
+      current.startsWith(resolvedRoot + path.sep) &&
       current !== resolvedRoot &&
       path.basename(current) !== '_inbox'
     ) {
-      if (!fs.existsSync(current)) {
+      if (!(await pathExistsAsync(current))) {
         current = path.dirname(current);
         continue;
       }
-      const entries = fs.readdirSync(current);
+      const entries = await fs.promises.readdir(current);
       if (entries.length === 0) {
-        fs.rmdirSync(current);
+        await fs.promises.rmdir(current);
         current = path.dirname(current);
       } else {
         break;
@@ -602,8 +722,13 @@ export async function fingerprintTagAndOrganizeFile(
   identified: AcousticFingerprintResult;
   trackRow?: any;
 }> {
+  const resolvedSource = path.resolve(String(sourceFilePath || ''));
+  if (!(await isSafePathWithinAllowedRootsStrict(resolvedSource))) {
+    throw new Error('Source audio path is outside allowed music/staging directories.');
+  }
+
   const identified = await identifyAudioFileWithAcoustIdAndMusicBrainz(
-    sourceFilePath,
+    resolvedSource,
     {
       acoustidApiKey: options.acoustidApiKey,
       hintArtist: options.hintArtist,
@@ -612,7 +737,7 @@ export async function fingerprintTagAndOrganizeFile(
     }
   );
 
-  await embedMetadataAndArtworkIntoFile(sourceFilePath, {
+  await embedMetadataAndArtworkIntoFile(resolvedSource, {
     title: identified.title,
     artist: identified.artist,
     album: identified.album,
@@ -624,10 +749,10 @@ export async function fingerprintTagAndOrganizeFile(
     localCoverId: identified.localCoverId,
   });
 
-  let finalPath = sourceFilePath;
+  let finalPath = resolvedSource;
   if (options.moveToLibraryRoot !== false) {
     const musicRoot = getMusicDir();
-    const ext = path.extname(sourceFilePath) || '.mp3';
+    const ext = path.extname(resolvedSource) || '.mp3';
     const destPath = buildOrganizedTrackDestination(musicRoot, {
       artist: identified.artist || options.hintArtist || 'Unknown Artist',
       album: identified.album || options.hintAlbum || 'Singles',
@@ -637,54 +762,55 @@ export async function fingerprintTagAndOrganizeFile(
       ext,
     });
 
-    const existingTrackId = db.tracksByPath.get(path.resolve(sourceFilePath));
+    const existingTrackId = db.tracksByPath.get(resolvedSource);
 
-    if (path.resolve(destPath) !== path.resolve(sourceFilePath)) {
-      const sourceDir = path.dirname(sourceFilePath);
-      fs.mkdirSync(path.dirname(destPath), { recursive: true });
+    if (path.resolve(destPath) !== resolvedSource) {
+      const sourceDir = path.dirname(resolvedSource);
+      await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
       try {
-        fs.renameSync(sourceFilePath, destPath);
+        await fs.promises.rename(resolvedSource, destPath);
       } catch {
-        fs.copyFileSync(sourceFilePath, destPath);
+        await fs.promises.copyFile(resolvedSource, destPath);
         try {
-          fs.unlinkSync(sourceFilePath);
+          await fs.promises.unlink(resolvedSource);
         } catch {}
       }
       finalPath = destPath;
-      cleanupEmptyParentDirs(sourceDir, musicRoot);
+      await cleanupEmptyParentDirs(sourceDir, musicRoot);
     }
 
     let trackRow: any = null;
     if (existingTrackId && db.tracks.has(existingTrackId)) {
       // In-place path and metadata update so playlists, play counts, and favorites are preserved
-      db.tracksByPath.delete(path.resolve(sourceFilePath));
+      db.tracksByPath.delete(resolvedSource);
       const row = db.tracks.get(existingTrackId)!;
       row.file_path = finalPath;
       db.tracksByPath.set(path.resolve(finalPath), existingTrackId);
-      updateTrackMetadataInDb(existingTrackId, {
+      await updateTrackMetadataInDb({
+        trackId: existingTrackId,
         title: identified.title,
         artist: identified.artist,
         album: identified.album,
         year: identified.year,
         trackNumber: identified.trackNumber,
         discNumber: identified.discNumber,
-        coverArt: identified.localCoverId,
-        mbid: identified.recordingMbid,
+        musicbrainzId: identified.recordingMbid,
       });
       trackRow = db.tracks.get(existingTrackId);
     } else {
-      trackRow = await indexAudioFile(finalPath);
-      if (trackRow && identified.localCoverId) {
-        updateTrackMetadataInDb(trackRow.id, {
+      const indexedId = await indexAudioFile(finalPath);
+      if (indexedId) {
+        await updateTrackMetadataInDb({
+          trackId: indexedId,
           title: identified.title,
           artist: identified.artist,
           album: identified.album,
           year: identified.year,
           trackNumber: identified.trackNumber,
           discNumber: identified.discNumber,
-          coverArt: identified.localCoverId,
-          mbid: identified.recordingMbid,
+          musicbrainzId: identified.recordingMbid,
         });
+        trackRow = db.tracks.get(indexedId);
       }
     }
   }
@@ -699,7 +825,7 @@ export async function fingerprintTagAndOrganizeFile(
   };
 }
 
-// Strictly sandboxed path resolver inside /music (prevents ../ traversal or symlink escape)
+// Strictly sandboxed path resolver inside /music (prevents ../ traversal, null bytes, encoded traversal & symlink escape)
 export function resolveSandboxedMusicPath(relativePath = ''): {
   ok: boolean;
   fullPath: string;
@@ -707,10 +833,22 @@ export function resolveSandboxedMusicPath(relativePath = ''): {
   error?: string;
 } {
   const musicRoot = path.resolve(getMusicDir());
-  const cleanRel = String(relativePath || '')
-    .replace(/\\/g, '/')
-    .replace(/^\/+/, '');
+  const rawInput = String(relativePath || '');
+  if (
+    rawInput.includes('\0') ||
+    /%2e/i.test(rawInput) ||
+    /%2f/i.test(rawInput) ||
+    /%5c/i.test(rawInput)
+  ) {
+    return {
+      ok: false,
+      fullPath: musicRoot,
+      relativePath: '',
+      error: 'Invalid or encoded traversal sequence in path.',
+    };
+  }
 
+  const cleanRel = rawInput.replace(/\\/g, '/').replace(/^\/+/, '');
   if (cleanRel.split('/').some((part) => part === '..')) {
     return {
       ok: false,
@@ -735,6 +873,97 @@ export function resolveSandboxedMusicPath(relativePath = ''): {
     fullPath: candidate,
     relativePath: path.relative(musicRoot, candidate).replace(/\\/g, '/'),
   };
+}
+
+async function resolveRealPathWithTail(targetPath: string): Promise<string> {
+  let cursor = path.resolve(targetPath);
+  const missingTail: string[] = [];
+  while (true) {
+    try {
+      const realBase = await fs.promises.realpath(cursor);
+      return missingTail.length > 0
+        ? path.resolve(realBase, ...missingTail.reverse())
+        : realBase;
+    } catch {
+      const parent = path.dirname(cursor);
+      if (parent === cursor) return path.resolve(targetPath);
+      missingTail.push(path.basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+export async function resolveSandboxedMusicPathStrict(
+  relativePath = '',
+  options: { requireInbox?: boolean } = {}
+): Promise<{
+  ok: boolean;
+  fullPath: string;
+  relativePath: string;
+  error?: string;
+}> {
+  const lexical = resolveSandboxedMusicPath(relativePath);
+  if (!lexical.ok) return lexical;
+
+  const musicRoot = path.resolve(getMusicDir());
+  const realRoot = await resolveRealPathWithTail(musicRoot);
+  const realCandidate = await resolveRealPathWithTail(lexical.fullPath);
+
+  if (
+    realCandidate !== realRoot &&
+    !realCandidate.startsWith(realRoot + path.sep)
+  ) {
+    return {
+      ok: false,
+      fullPath: musicRoot,
+      relativePath: '',
+      error: 'Symlink escape outside /music is forbidden.',
+    };
+  }
+
+  if (options.requireInbox) {
+    const inboxRoot = path.resolve(musicRoot, '_inbox');
+    if (
+      lexical.fullPath !== inboxRoot &&
+      !lexical.fullPath.startsWith(inboxRoot + path.sep)
+    ) {
+      return {
+        ok: false,
+        fullPath: musicRoot,
+        relativePath: '',
+        error: 'Operation restricted to /music/_inbox staging folder.',
+      };
+    }
+  }
+
+  return lexical;
+}
+
+export async function resolveSandboxedStagingDir(
+  rawStagingDir?: string
+): Promise<string> {
+  const musicRoot = path.resolve(getMusicDir());
+  const defaultInbox = path.join(musicRoot, '_inbox');
+  const raw = String(rawStagingDir || '').trim();
+  if (!raw) return defaultInbox;
+  if (raw.includes('\0') || /%2e/i.test(raw)) return defaultInbox;
+
+  const allowedBases = [musicRoot, path.resolve('/downloads')];
+  const candidate = path.isAbsolute(raw)
+    ? path.resolve(raw)
+    : path.resolve(musicRoot, raw);
+
+  const realCandidate = await resolveRealPathWithTail(candidate);
+  for (const base of allowedBases) {
+    const realBase = await resolveRealPathWithTail(base);
+    if (
+      (candidate === base || candidate.startsWith(base + path.sep)) &&
+      (realCandidate === realBase || realCandidate.startsWith(realBase + path.sep))
+    ) {
+      return candidate;
+    }
+  }
+  return defaultInbox;
 }
 
 // Supported audio file extensions
@@ -831,21 +1060,21 @@ export function cancelLibraryOrganizeJob(): LibraryOrganizeJobState {
   return activeOrganizeJob;
 }
 
-function collectAudioFilesRecursive(
+async function collectAudioFilesRecursive(
   dir: string,
   options: { recursive?: boolean; includeInbox?: boolean } = {},
   acc: string[] = []
-): string[] {
-  if (!fs.existsSync(dir)) return acc;
+): Promise<string[]> {
+  if (!(await pathExistsAsync(dir))) return acc;
   try {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    const entries = await fs.promises.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
       if (entry.name.startsWith('.')) continue;
       if (!options.includeInbox && entry.name === '_inbox') continue;
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         if (options.recursive !== false) {
-          collectAudioFilesRecursive(full, options, acc);
+          await collectAudioFilesRecursive(full, options, acc);
         }
       } else if (
         entry.isFile() &&
@@ -878,11 +1107,13 @@ export async function startLibraryOrganizeJob(options: {
   cancelRequested = false;
   const musicRoot = getMusicDir();
   const targetRel = String(options.targetPath || '');
-  const resolved = resolveSandboxedMusicPath(targetRel);
-  const scanDir =
-    resolved.ok && fs.existsSync(resolved.fullPath)
-      ? resolved.fullPath
-      : musicRoot;
+  const resolved = await resolveSandboxedMusicPathStrict(targetRel);
+  if (!resolved.ok) {
+    throw new Error(resolved.error || 'Target path outside /music is forbidden.');
+  }
+  const scanDir = (await pathExistsAsync(resolved.fullPath))
+    ? resolved.fullPath
+    : musicRoot;
 
   activeOrganizeJob = {
     id: `job-${Date.now()}`,
@@ -907,7 +1138,7 @@ export async function startLibraryOrganizeJob(options: {
   // Run in background asynchronously so HTTP response returns immediately
   (async () => {
     try {
-      const audioFiles = collectAudioFilesRecursive(scanDir, {
+      const audioFiles = await collectAudioFilesRecursive(scanDir, {
         recursive: options.recursive !== false,
         includeInbox: Boolean(options.includeInbox),
       });
@@ -1087,11 +1318,14 @@ export async function applyPreviewedLibraryOrganizeJob(
           break;
         }
 
-        const fullSrc = path.join(musicRoot, item.beforePath);
-        if (!fs.existsSync(fullSrc)) {
+        const resolvedSrc = await resolveSandboxedMusicPathStrict(
+          item.beforePath
+        );
+        if (!resolvedSrc.ok || !(await pathExistsAsync(resolvedSrc.fullPath))) {
           activeOrganizeJob.processedFiles++;
           continue;
         }
+        const fullSrc = resolvedSrc.fullPath;
 
         activeOrganizeJob.currentFile = item.beforePath;
         activeOrganizeJob.currentTrackTitle = item.title;

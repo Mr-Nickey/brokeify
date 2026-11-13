@@ -26,6 +26,8 @@ import {
   MUSIC_DIR,
   getMusicDir,
   isSafePathWithinAllowedRoots,
+  isSafePathWithinAllowedRootsStrict,
+  flushDatabaseToDisk,
   inspectMusicDrive,
   setMusicDirectory,
   db,
@@ -77,6 +79,12 @@ import {
   buildOrganizedTrackDestination,
   cleanupEmptyParentDirs,
   resolveSandboxedMusicPath,
+  resolveSandboxedMusicPathStrict,
+  resolveSandboxedStagingDir,
+  sanitizePathSegment,
+  sanitizeSingleSegmentName,
+  ensureQuarantineDir,
+  ytDlpWorkerPool,
   detectVariantFlagsInText,
   QUARANTINE_DIR,
   AUDIO_FILE_EXTENSIONS,
@@ -91,6 +99,7 @@ const execFileAsync = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const APP_ROOT = path.basename(__dirname) === 'dist' ? path.dirname(__dirname) : __dirname;
 
 const app = express();
 
@@ -453,6 +462,15 @@ process.on('unhandledRejection', (reason) => {
   );
 });
 
+for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+  process.on(sig, () => {
+    try {
+      db.saveToDiskSyncForShutdown();
+    } catch {}
+    process.exit(0);
+  });
+}
+
 const DEFAULT_SERVER_CONFIG = {
   version: 3,
   updatedAt: new Date().toISOString(),
@@ -764,23 +782,23 @@ function getSqliteAudioFingerprints() {
 // ============================================================================
 
 // GET /api/ping -> Public Handshake Endpoint for Docker HEALTHCHECK, Uptime Kuma, Android / Android Auto & External Clients
-app.get('/api/ping', (_req, res) => {
+app.get('/api/ping', async (req, res) => {
   const cfg = readServerConfig();
   const hasCustomAdminPassword =
     Boolean(cfg.auth?.password) && cfg.auth?.password !== 'brokeify';
   const setupRequired = !hasCustomAdminPassword && !cfg.auth?.setupCompleted;
-  const authRequired = Boolean(cfg.auth?.requireLogin);
+  const authRequired = isAuthRequiredForRequest(req, cfg);
   const counts = getLocalLibraryStats();
 
   let dbWritable = false;
   try {
-    fs.accessSync(DATA_DIR, fs.constants.R_OK | fs.constants.W_OK);
+    await fs.promises.access(DATA_DIR, fs.constants.R_OK | fs.constants.W_OK);
     dbWritable = true;
   } catch {}
 
   let musicReadable = false;
   try {
-    fs.accessSync(MUSIC_DIR, fs.constants.R_OK);
+    await fs.promises.access(MUSIC_DIR, fs.constants.R_OK);
     musicReadable = true;
   } catch {}
 
@@ -816,9 +834,9 @@ app.get('/api/ping', (_req, res) => {
 });
 
 // GET /api/health -> Returns server status, version, drive connection status, and total indexed track/album/artist counts
-app.get('/api/health', (_req, res) => {
+app.get('/api/health', async (_req, res) => {
   const counts = getLocalLibraryStats();
-  const driveStatus = inspectMusicDrive();
+  const driveStatus = await inspectMusicDrive();
   res.json({
     ok: true,
     status: 'ok',
@@ -843,9 +861,9 @@ app.get('/api/health', (_req, res) => {
 });
 
 // GET /api/library/stats -> Returns total tracks, albums, artists, playlists, liked songs, and last scan timestamp
-app.get('/api/library/stats', (_req, res) => {
+app.get('/api/library/stats', async (_req, res) => {
   const counts = getLocalLibraryStats();
-  const driveStatus = inspectMusicDrive();
+  const driveStatus = await inspectMusicDrive();
   res.json({
     ok: true,
     totalTracks: counts.totalTracks,
@@ -999,9 +1017,39 @@ app.get('/api/lyrics', async (req, res) => {
   });
 });
 
+const FORBIDDEN_SYSTEM_MOUNT_DIRS = new Set([
+  '/',
+  '/etc',
+  '/proc',
+  '/sys',
+  '/dev',
+  '/bin',
+  '/sbin',
+  '/usr',
+  '/var',
+  '/root',
+  '/boot',
+  '/lib',
+  '/lib64',
+  '/data',
+]);
+
+function isAllowedCustomMusicMountPath(candidatePath: string): boolean {
+  const raw = String(candidatePath || '').trim();
+  if (!raw || raw.includes('\0') || /%2e/i.test(raw)) return false;
+  const resolved = path.resolve(raw);
+  if (FORBIDDEN_SYSTEM_MOUNT_DIRS.has(resolved)) return false;
+  for (const sysRoot of ['/etc', '/proc', '/sys', '/dev', '/bin', '/sbin', '/usr', '/boot', '/root', '/data']) {
+    if (resolved === sysRoot || resolved.startsWith(`${sysRoot}${path.sep}`)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // GET /api/storage/drive-status -> Inspects current mounted music drive / NAS folder
-app.get('/api/storage/drive-status', (_req, res) => {
-  const driveStatus = inspectMusicDrive();
+app.get('/api/storage/drive-status', async (_req, res) => {
+  const driveStatus = await inspectMusicDrive();
   const counts = getLocalLibraryStats();
   res.json({
     ok: true,
@@ -1011,11 +1059,17 @@ app.get('/api/storage/drive-status', (_req, res) => {
 });
 
 // POST /api/storage/test-drive -> Tests any local or NAS folder path before saving
-app.post('/api/storage/test-drive', (req, res) => {
+app.post('/api/storage/test-drive', async (req, res) => {
   const customPath = String(
     req.body?.path || req.body?.musicDir || getMusicDir()
   ).trim();
-  const driveStatus = inspectMusicDrive(customPath);
+  if (!isAllowedCustomMusicMountPath(customPath)) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Refusing access to protected OS system directory.',
+    });
+  }
+  const driveStatus = await inspectMusicDrive(customPath);
   res.json({
     ok: driveStatus.exists && driveStatus.readable,
     ...driveStatus,
@@ -1028,10 +1082,10 @@ app.post('/api/storage/connect-drive', async (req, res) => {
     const newPath = String(
       req.body?.path || req.body?.musicDir || getMusicDir()
     ).trim();
-    if (!newPath) {
+    if (!newPath || !isAllowedCustomMusicMountPath(newPath)) {
       return res.status(400).json({
         ok: false,
-        error: 'Please enter a valid folder path (e.g. /music or /mnt/nas/music).',
+        error: 'Please enter a valid music folder path (e.g. /music or /mnt/nas/music).',
       });
     }
 
@@ -1302,19 +1356,18 @@ function computeUserSessionToken(
     .digest('hex');
 }
 
-function isPublicInternetDomain(req): boolean {
-  const host = String(
-    req.headers['x-forwarded-host'] || req.headers.host || ''
-  )
+function isLocalHostname(rawHostHeader: string): boolean {
+  const host = String(rawHostHeader || '')
     .split(',')[0]
     .split(':')[0]
     .trim()
     .toLowerCase();
-  if (!host) return false;
+  if (!host) return true;
   if (
     host === 'localhost' ||
     host === '127.0.0.1' ||
     host === '0.0.0.0' ||
+    host === '::1' ||
     host.startsWith('192.168.') ||
     host.startsWith('10.') ||
     host.startsWith('100.') ||
@@ -1323,9 +1376,25 @@ function isPublicInternetDomain(req): boolean {
     host.endsWith('.lan') ||
     host.endsWith('.run.app')
   ) {
-    return false;
+    return true;
   }
-  return true;
+  return false;
+}
+
+function isPublicInternetDomain(req): boolean {
+  const directHost = String(req.headers.host || '').trim();
+  const fwdHost = String(req.headers['x-forwarded-host'] || '').trim();
+  if (!directHost && !fwdHost) return false;
+  if (directHost && !isLocalHostname(directHost)) return true;
+  if (fwdHost && !isLocalHostname(fwdHost)) return true;
+  return false;
+}
+
+function isAuthRequiredForRequest(req, cfg: any): boolean {
+  return (
+    Boolean(cfg?.auth?.requireLogin) ||
+    (cfg?.auth?.autoLockPublicDomain !== false && isPublicInternetDomain(req))
+  );
 }
 
 interface AuthenticatedUser {
@@ -1448,11 +1517,88 @@ function resolveRequestAuth(req): {
   return { authenticated: false, user: null };
 }
 
+function isAdminOnlyEndpointPath(reqPath: string, method: string): boolean {
+  const m = String(method || 'GET').toUpperCase();
+  return (
+    (reqPath === '/api/config' && m !== 'GET') ||
+    reqPath === '/api/config/backup' ||
+    reqPath === '/api/library/rescan' ||
+    reqPath === '/api/library/scan' ||
+    reqPath.startsWith('/api/storage/') ||
+    reqPath.startsWith('/api/auth/security-config') ||
+    reqPath.startsWith('/api/auth/api-keys') ||
+    reqPath.startsWith('/api/mobile/pair-info') ||
+    reqPath.startsWith('/api/mobile/regenerate-token') ||
+    reqPath === '/api/mobile/quick-connect/authorize' ||
+    reqPath.startsWith('/api/files/') ||
+    reqPath.startsWith('/api/staging/') ||
+    reqPath.startsWith('/api/library/organize/') ||
+    (reqPath.startsWith('/api/library/tracks') && m === 'DELETE') ||
+    reqPath === '/api/library/tracks/bulk-delete' ||
+    (reqPath.startsWith('/api/slskd/') && m !== 'GET') ||
+    reqPath.startsWith('/api/lidarr/') ||
+    reqPath === '/api/services/test-all' ||
+    reqPath === '/api/jellyfin/test' ||
+    reqPath === '/api/listenbrainz/test' ||
+    reqPath === '/api/listenbrainz/grab-mix' ||
+    reqPath === '/api/spotify/import-url' ||
+    reqPath === '/api/playlists/import-spotify' ||
+    (reqPath.startsWith('/api/playlists') && m !== 'GET') ||
+    reqPath === '/api/tracks/report-wrong' ||
+    reqPath.startsWith('/api/metadata/') ||
+    reqPath.startsWith('/api/musicbrainz/enrich/') ||
+    reqPath.startsWith('/api/picard/') ||
+    (reqPath.startsWith('/api/scheduler/') && m !== 'GET') ||
+    (reqPath.startsWith('/api/autopilot/') && m !== 'GET') ||
+    reqPath.startsWith('/api/debug/') ||
+    reqPath === '/api/version/check' ||
+    (reqPath === '/api/notifications' && m === 'DELETE') ||
+    reqPath === '/api/notifications/delete'
+  );
+}
+
+function requireAuth(req: any, res: any, next: any) {
+  const cfg = readServerConfig();
+  const authResult = resolveRequestAuth(req);
+  req.authUser = authResult.user;
+  if (isAuthRequiredForRequest(req, cfg) && !authResult.authenticated) {
+    return res.status(401).json({
+      ok: false,
+      requiresLogin: true,
+      error:
+        'Authentication required. Provide a valid Authorization: Bearer <token> header or log in.',
+    });
+  }
+  next();
+}
+
+function requireAdmin(req: any, res: any, next: any) {
+  const cfg = readServerConfig();
+  const authResult = resolveRequestAuth(req);
+  req.authUser = authResult.user;
+  if (isAuthRequiredForRequest(req, cfg) && !authResult.authenticated) {
+    return res.status(401).json({
+      ok: false,
+      requiresLogin: true,
+      error:
+        'Authentication required. Provide a valid Authorization: Bearer <token> header or log in.',
+    });
+  }
+  if (authResult.authenticated && authResult.user && !authResult.user.isAdmin) {
+    return res.status(403).json({
+      ok: false,
+      error:
+        'Admin privileges required. Friends & Family listener accounts cannot modify server settings, trigger downloads/rescans, or manage files.',
+    });
+  }
+  next();
+}
+
 // API Auth & Role Enforcement (`isAdmin`) Middleware
 app.use((req, res, next) => {
   if (!req.path.startsWith('/api/')) return next();
 
-  // Public Handshake, Login, Setup, Token Refresh & Quick Connect Pairing Endpoints
+  // Public Handshake, Login, Setup, Token Refresh & Quick Connect Phone-Pairing Endpoints
   if (
     req.path === '/api/ping' ||
     req.path === '/api/health' ||
@@ -1463,14 +1609,17 @@ app.use((req, res, next) => {
     req.path === '/api/auth/refresh' ||
     req.path === '/api/auth/logout' ||
     req.path === '/api/mobile/verify' ||
-    req.path.startsWith('/api/mobile/quick-connect')
+    req.path === '/api/mobile/quick-connect' ||
+    req.path === '/api/mobile/quick-connect/initiate' ||
+    req.path === '/api/mobile/quick-connect/poll'
   ) {
     return next();
   }
 
   const cfg = readServerConfig();
-  const requireLogin = Boolean(cfg.auth?.requireLogin);
+  const requireLogin = isAuthRequiredForRequest(req, cfg);
   const authResult = resolveRequestAuth(req);
+  (req as any).authUser = authResult.user;
 
   if (requireLogin && !authResult.authenticated) {
     return res.status(401).json({
@@ -1482,16 +1631,7 @@ app.use((req, res, next) => {
   }
 
   // Lock down destructive/admin endpoints behind an `isAdmin` check
-  const isAdminOnlyRoute =
-    (req.path === '/api/config' && req.method !== 'GET') ||
-    req.path === '/api/library/rescan' ||
-    req.path === '/api/library/scan' ||
-    req.path.startsWith('/api/storage/') ||
-    req.path.startsWith('/api/auth/security-config') ||
-    (req.path.startsWith('/api/auth/api-keys') && req.method !== 'GET') ||
-    req.path.startsWith('/api/mobile/regenerate-token') ||
-    (req.path.startsWith('/api/library/tracks') && req.method === 'DELETE') ||
-    req.path === '/api/library/tracks/bulk-delete';
+  const isAdminOnlyRoute = isAdminOnlyEndpointPath(req.path, req.method);
 
   if (
     isAdminOnlyRoute &&
@@ -1502,7 +1642,7 @@ app.use((req, res, next) => {
     return res.status(403).json({
       ok: false,
       error:
-        'Admin privileges required. Friends & Family listener accounts cannot modify server settings, trigger rescans, or delete files.',
+        'Admin privileges required. Friends & Family listener accounts cannot modify server settings, trigger downloads/rescans, or manage files.',
     });
   }
 
@@ -1667,7 +1807,7 @@ app.post(['/api/auth/setup', '/api/auth/register'], (req, res) => {
 app.get('/api/auth/me', (req, res) => {
   const cfg = readServerConfig();
   const authResult = resolveRequestAuth(req);
-  if (!authResult.authenticated && cfg.auth?.requireLogin) {
+  if (!authResult.authenticated && isAuthRequiredForRequest(req, cfg)) {
     return res.status(401).json({
       ok: false,
       authenticated: false,
@@ -1862,7 +2002,7 @@ app.delete('/api/auth/api-keys/:id', (req, res) => {
 app.get('/api/auth/status', (req, res) => {
   const cfg = readServerConfig();
   const authResult = resolveRequestAuth(req);
-  const requireLogin = Boolean(cfg.auth?.requireLogin);
+  const requireLogin = isAuthRequiredForRequest(req, cfg);
   const publicDomainDetected = isPublicInternetDomain(req);
   const host = String(
     req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3487'
@@ -1879,13 +2019,15 @@ app.get('/api/auth/status', (req, res) => {
     publicDomainDetected,
     detectedHost: host,
     isDefaultPassword,
-    user: authResult.user || {
-      id: 'usr-brokeify-admin',
-      username: cfg.auth?.username || 'admin',
-      displayName: cfg.auth?.username || 'admin',
-      role: 'admin',
-      isAdmin: true,
-    },
+    user: authResult.user || (requireLogin
+      ? null
+      : {
+          id: 'usr-brokeify-admin',
+          username: cfg.auth?.username || 'admin',
+          displayName: cfg.auth?.username || 'admin',
+          role: 'admin',
+          isAdmin: true,
+        }),
     securityStats: {
       ...securityStats,
       guestUsersCount: Array.isArray(cfg.auth?.guestUsers)
@@ -2220,16 +2362,20 @@ app.post('/api/auth/security-config', (req, res) => {
 
   writeServerConfig({ auth: nextAuth });
 
-  // Issue fresh admin session cookie so the admin stays logged in after enabling the lock or changing password
-  const sessionToken = computeUserSessionToken(
-    nextAuth.username,
-    nextAuth.password,
-    'admin'
+  // Issue fresh signed JWT session cookie so the admin stays logged in after enabling the lock or changing password
+  const accessJwt = signJwtToken(
+    {
+      sub: 'usr-brokeify-admin',
+      username: nextAuth.username,
+      displayName: nextAuth.username,
+      role: 'admin',
+    },
+    30 * 24 * 3600
   );
   res.setHeader(
     'Set-Cookie',
     `brokeify_session=${encodeURIComponent(
-      sessionToken
+      accessJwt.token
     )}; Path=/; Max-Age=2592000; SameSite=Lax; HttpOnly`
   );
 
@@ -2238,7 +2384,7 @@ app.post('/api/auth/security-config', (req, res) => {
     requireLogin: Boolean(nextAuth.requireLogin),
     adminUsername: nextAuth.username,
     isDefaultPassword: nextAuth.password === 'brokeify',
-    token: sessionToken,
+    token: accessJwt.token,
     message: nextAuth.requireLogin
       ? '🔒 Front-End Security Gate enabled & credentials saved!'
       : 'Security settings updated.',
@@ -2439,7 +2585,7 @@ function registerPairedAndroidDevice(
 }
 
 // GET /api/mobile/pair-info -> Returns 6-digit Quick Connect code, QR pairing payload, detected Browser/Domain URL, LAN IP, and connected Android devices
-app.get('/api/mobile/pair-info', (req, res) => {
+app.get('/api/mobile/pair-info', async (req, res) => {
   const apiToken = ensureMobileApiToken(false);
   const tempInfo = ensureTempPairingToken(false);
   const qcPin = ensureQuickConnectPin(false);
@@ -2457,7 +2603,7 @@ app.get('/api/mobile/pair-info', (req, res) => {
     .trim();
   const detectedOriginUrl = `${proto}://${host}`;
   const counts = getLocalLibraryStats();
-  const driveStatus = inspectMusicDrive();
+  const driveStatus = await inspectMusicDrive();
 
   // Prune expired phone-initiated requests
   const now = Date.now();
@@ -2975,7 +3121,7 @@ app.get('/api/playlists/:id', (req, res) => {
   });
 });
 
-app.post('/api/playlists', (req, res) => {
+app.post('/api/playlists', async (req, res) => {
   try {
     const name = String(req.body?.name || '').trim();
     if (!name) {
@@ -3002,7 +3148,7 @@ app.post('/api/playlists', (req, res) => {
     const spotifyUrl =
       req.body?.linkedSpotifyUrl || req.body?.spotifyUrl || undefined;
 
-    upsertPlaylistWithTracks({
+    await upsertPlaylistWithTracks({
       id,
       name,
       description,
@@ -3028,7 +3174,7 @@ app.post('/api/playlists', (req, res) => {
   }
 });
 
-const handleUpdatePlaylist = (req, res) => {
+const handleUpdatePlaylist = async (req, res) => {
   try {
     const id = String(req.params.id || '').trim();
     const existing = db.playlists.get(id);
@@ -3064,7 +3210,7 @@ const handleUpdatePlaylist = (req, res) => {
           : null
         : undefined;
 
-    upsertPlaylistWithTracks({
+    await upsertPlaylistWithTracks({
       id,
       name,
       description,
@@ -3172,7 +3318,7 @@ app.get('/api/playlists/:id/export.m3u8', (req, res) => {
 });
 
 // POST /api/playlists/import -> Imports a playlist from .m3u / .m3u8 text content or JSON track list
-app.post('/api/playlists/import', (req, res) => {
+app.post('/api/playlists/import', async (req, res) => {
   try {
     const name = String(req.body?.name || 'Imported Playlist').trim();
     const rawM3uContent = String(req.body?.content || req.body?.m3u || '').trim();
@@ -3211,7 +3357,7 @@ app.post('/api/playlists/import', (req, res) => {
     }
 
     const id = `pl-import-${Date.now().toString(36)}`;
-    upsertPlaylistWithTracks({
+    await upsertPlaylistWithTracks({
       id,
       name,
       description: `Imported playlist (${matchedIds.length} matched tracks)`,
@@ -3254,7 +3400,7 @@ app.delete('/api/playlists/:id', (req, res) => {
 });
 
 // Merge / Link multiple playlists into a target playlist (combines both library trackIds and Ghost Songs)
-app.post('/api/playlists/merge', (req, res) => {
+app.post('/api/playlists/merge', async (req, res) => {
   try {
     const sourcePlaylistIds = Array.isArray(req.body?.sourcePlaylistIds)
       ? req.body.sourcePlaylistIds.map(String)
@@ -3317,7 +3463,7 @@ app.post('/api/playlists/merge', (req, res) => {
       }
     }
 
-    upsertPlaylistWithTracks({
+    await upsertPlaylistWithTracks({
       id: finalId,
       name: finalName,
       description: `Combined Playlist (${mergedTrackIds.length} in library${
@@ -3488,7 +3634,7 @@ app.get('/api/cover/:type/:id', (req, res) => {
 // 4. TRACK DISK CLEANUP & MAINTAINERR DUPLICATE JANITOR
 // ============================================================================
 
-function deleteTrackFromDiskAndDb(rawId: string): boolean {
+async function deleteTrackFromDiskAndDb(rawId: string): Promise<boolean> {
   const cleanId = String(rawId || '').trim();
   if (!cleanId) return false;
 
@@ -3496,19 +3642,19 @@ function deleteTrackFromDiskAndDb(rawId: string): boolean {
   if (!row) return false;
 
   try {
-    if (row.file_path && fs.existsSync(row.file_path)) {
-      fs.unlinkSync(row.file_path);
+    if (row.file_path && (await isSafePathWithinAllowedRootsStrict(row.file_path))) {
+      await fs.promises.unlink(row.file_path);
     }
   } catch {
-    // ignore unlink error if read-only
+    // ignore unlink error if missing or read-only
   }
 
   return true;
 }
 
-app.delete('/api/library/tracks/:id', (req, res) => {
+app.delete('/api/library/tracks/:id', requireAdmin, async (req, res) => {
   const id = String(req.params.id || '').trim();
-  const ok = deleteTrackFromDiskAndDb(id);
+  const ok = await deleteTrackFromDiskAndDb(id);
   if (!ok) {
     return res
       .status(404)
@@ -3521,7 +3667,7 @@ app.delete('/api/library/tracks/:id', (req, res) => {
   });
 });
 
-app.post('/api/library/tracks/bulk-delete', (req, res) => {
+app.post('/api/library/tracks/bulk-delete', requireAdmin, async (req, res) => {
   const ids = Array.isArray(req.body?.ids)
     ? req.body.ids
     : Array.isArray(req.body?.itemIds)
@@ -3532,7 +3678,7 @@ app.post('/api/library/tracks/bulk-delete', (req, res) => {
   const failedIds: string[] = [];
 
   for (const rawId of ids) {
-    if (deleteTrackFromDiskAndDb(String(rawId))) {
+    if (await deleteTrackFromDiskAndDb(String(rawId))) {
       deletedIds.push(String(rawId));
     } else {
       failedIds.push(String(rawId));
@@ -3551,31 +3697,59 @@ app.post('/api/library/tracks/bulk-delete', (req, res) => {
 // 5. PERSISTENT SERVER-SIDE STORAGE (/api/config & /api/config/backup)
 // ============================================================================
 
-app.get('/api/config', (_req, res) => {
+function sanitizeConfigForClientResponse(config: any, isAdminUser: boolean) {
+  const safeAuth = {
+    username: config.auth?.username || 'admin',
+    requireLogin: Boolean(config.auth?.requireLogin),
+    autoLockPublicDomain: config.auth?.autoLockPublicDomain !== false,
+    setupCompleted: Boolean(config.auth?.setupCompleted),
+  };
+  const safeIntegrations = isAdminUser
+    ? config.integrations
+    : {
+        ...(config.integrations || {}),
+        slskdApiKey: '',
+        lidarrApiKey: '',
+        listenbrainzToken: '',
+        acoustidApiKey: '',
+        jellyfinToken: '',
+      };
+  return {
+    ...config,
+    auth: safeAuth,
+    integrations: safeIntegrations,
+  };
+}
+
+app.get('/api/config', (req, res) => {
   const config = readServerConfig();
   const sqlPlaylists = queryPlaylists();
+  const authUser = (req as any).authUser as AuthenticatedUser | null | undefined;
+  const isAdminUser = authUser ? authUser.isAdmin : !isAuthRequiredForRequest(req, config);
+  const safeConfig = sanitizeConfigForClientResponse(config, isAdminUser);
   res.json({
     ok: true,
     configPath: CONFIG_FILE_PATH,
     dbPath: DB_PATH,
     musicDir: MUSIC_DIR,
     config: {
-      ...config,
+      ...safeConfig,
       playlists:
         sqlPlaylists.length > 0 ? sqlPlaylists : config.playlists || [],
     },
   });
 });
 
-app.post('/api/config', (req, res) => {
+app.post('/api/config', requireAdmin, async (req, res) => {
   try {
     const incoming = req.body?.config || req.body || {};
-    const saved = writeServerConfig(incoming);
+    const { auth: _ignoredAuth, ...safeIncoming } = incoming;
+    const saved = writeServerConfig(safeIncoming);
 
     if (Array.isArray(incoming.playlists)) {
       for (const pl of incoming.playlists) {
         if (!pl || !pl.id || !pl.name) continue;
-        upsertPlaylistWithTracks({
+        await upsertPlaylistWithTracks({
           id: String(pl.id),
           name: String(pl.name),
           description: String(pl.description || ''),
@@ -3600,7 +3774,7 @@ app.post('/api/config', (req, res) => {
     res.json({
       ok: true,
       configPath: CONFIG_FILE_PATH,
-      config: saved,
+      config: sanitizeConfigForClientResponse(saved, true),
     });
   } catch (err) {
     res.status(500).json({
@@ -3610,8 +3784,8 @@ app.post('/api/config', (req, res) => {
   }
 });
 
-app.get('/api/config/backup', (_req, res) => {
-  const config = readServerConfig();
+app.get('/api/config/backup', requireAdmin, (_req, res) => {
+  const config = sanitizeConfigForClientResponse(readServerConfig(), true);
   const filename = `brokeify-config-${new Date().toISOString().slice(0, 10)}.json`;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
@@ -4134,7 +4308,7 @@ app.post('/api/listenbrainz/grab-mix', async (req, res) => {
       tracks: playlistTracks,
     };
 
-    upsertPlaylistWithTracks(savedPlaylist);
+    await upsertPlaylistWithTracks(savedPlaylist);
 
     const missingTracks = playlistTracks.filter((t) => !t.inLibrary);
     let queuedCount = 0;
@@ -4659,7 +4833,7 @@ async function fetchSpotifyTracksFromUrl(
 
   if (options?.onPageProgress && tracks.length > 0) {
     try {
-      options.onPageProgress({
+      await options.onPageProgress({
         loadedTracks: tracks.length,
         totalTracks: effectiveTotalInitial,
         playlistTitle: title,
@@ -4807,7 +4981,7 @@ async function fetchSpotifyTracksFromUrl(
 
         if (options?.onPageProgress && addedInPage > 0) {
           try {
-            options.onPageProgress({
+            await options.onPageProgress({
               loadedTracks: tracks.length,
               totalTracks: targetTotal,
               playlistTitle: title,
@@ -4934,7 +5108,7 @@ app.post('/api/playlists/import-spotify', async (req, res) => {
         .filter((t: any) => Boolean(t.title));
     }
 
-    const mergeAndSaveGhostTracks = (
+    const mergeAndSaveGhostTracks = async (
       tracksBatch: Array<{
         title: string;
         artist: string;
@@ -4973,7 +5147,7 @@ app.post('/api/playlists/import-spotify', async (req, res) => {
 
       const finalName =
         requestedName || currentPl?.name || currentTitle || 'Spotify Playlist';
-      upsertPlaylistWithTracks({
+      await upsertPlaylistWithTracks({
         id: playlistId,
         name: finalName,
         description: `Spotify Playlist (${combined.length} tracks)`,
@@ -4989,14 +5163,14 @@ app.post('/api/playlists/import-spotify', async (req, res) => {
       const spotifyData = await fetchSpotifyTracksFromUrl(rawUrl, {
         maxTracks,
         playlistId,
-        onPageProgress: ({
+        onPageProgress: async ({
           playlistTitle: pageTitle,
           tracks: partialTracks,
         }) => {
           if (!requestedName && pageTitle) {
             resolvedTitle = pageTitle;
           }
-          mergeAndSaveGhostTracks(partialTracks, resolvedTitle);
+          await mergeAndSaveGhostTracks(partialTracks, resolvedTitle);
         },
       });
       if (!requestedName && spotifyData.playlistTitle) {
@@ -5020,7 +5194,7 @@ app.post('/api/playlists/import-spotify', async (req, res) => {
       });
     }
 
-    const { finalName } = mergeAndSaveGhostTracks(
+    const { finalName } = await mergeAndSaveGhostTracks(
       importedTracks,
       resolvedTitle
     );
@@ -5222,15 +5396,48 @@ function evaluateServerDiscoveryFilter(track, filtersConfig) {
 
   if (filters.customScriptEnabled && filters.customScriptCode?.trim()) {
     try {
-      const fn = new Function(
-        'title',
-        'artist',
-        'album',
-        'durationSec',
-        filters.customScriptCode
-      );
-      if (fn(title, artist, album, durationSec) === false) {
-        return { excluded: true, reason: 'Excluded by Custom Filter Script' };
+      const ruleText = String(filters.customScriptCode || '');
+      const titleLower = title;
+      const artistLower = artist;
+      const albumLower = album;
+      const combined = `${titleLower} ${artistLower} ${albumLower}`;
+      const lines = ruleText
+        .split(/\r?\n|;/)
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith('//') && !l.startsWith('#'));
+
+      for (const line of lines) {
+        const excludeMatch = line.match(/^(?:exclude|block|deny)\s*:\s*(.+)$/i);
+        if (excludeMatch) {
+          const term = excludeMatch[1]
+            .trim()
+            .replace(/^["']|["']$/g, '')
+            .toLowerCase();
+          if (term && combined.includes(term)) {
+            return { excluded: true, reason: 'Excluded by Custom Filter Rule' };
+          }
+          continue;
+        }
+        const minDurMatch = line.match(/^(?:minDuration|min_duration)\s*:\s*(\d+)$/i);
+        if (minDurMatch && durationSec > 0 && durationSec < Number(minDurMatch[1])) {
+          return { excluded: true, reason: 'Excluded by Custom Filter Rule' };
+        }
+        const maxDurMatch = line.match(/^(?:maxDuration|max_duration)\s*:\s*(\d+)$/i);
+        if (maxDurMatch && durationSec > 0 && durationSec > Number(maxDurMatch[1])) {
+          return { excluded: true, reason: 'Excluded by Custom Filter Rule' };
+        }
+        const legacyIncludes = line.match(
+          /(title|artist|album)[\s\S]{0,30}\.includes\(\s*(['"])([^'"]{1,80})\2\s*\)/i
+        );
+        if (legacyIncludes && /return\s+false/i.test(line)) {
+          const field = legacyIncludes[1].toLowerCase();
+          const needle = legacyIncludes[3].toLowerCase();
+          const hay =
+            field === 'artist' ? artistLower : field === 'album' ? albumLower : titleLower;
+          if (needle && hay.includes(needle)) {
+            return { excluded: true, reason: 'Excluded by Custom Filter Rule' };
+          }
+        }
       }
     } catch {}
   }
@@ -5394,10 +5601,16 @@ async function executeYouTubeOrArchiveGrabJob(
 ) {
   try {
     const cfg = readServerConfig();
-    const downloadDir = MUSIC_DIR;
-    const audioFormat = cfg.integrations?.youtubeAudioFormat || 'mp3';
+    const downloadDir = getMusicDir();
+    const ALLOWED_AUDIO_FORMATS = new Set(['mp3', 'flac', 'm4a', 'opus', 'wav']);
+    const requestedFormat = String(cfg.integrations?.youtubeAudioFormat || 'mp3')
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '');
+    const audioFormat = ALLOWED_AUDIO_FORMATS.has(requestedFormat)
+      ? requestedFormat
+      : 'mp3';
     try {
-      fs.mkdirSync(downloadDir, { recursive: true });
+      await fs.promises.mkdir(downloadDir, { recursive: true });
     } catch {}
 
     job.sourceEngine = preferredEngine === 'archive' ? 'archive' : 'youtube';
@@ -5410,23 +5623,38 @@ async function executeYouTubeOrArchiveGrabJob(
     // 1. Try native yt-dlp CLI -> downloads directly into /music and indexes into SQLite
     if (job.sourceEngine === 'youtube') {
       try {
-        const safeArtist = String(job.artist || 'Downloaded Artist')
-          .replace(/[<>:"/\\|?*]/g, '_')
-          .trim();
-        const safeFileBase = `${safeArtist} - ${job.title || job.label}`
-          .replace(/[<>:"/\\|?*]/g, '_')
-          .slice(0, 120);
+        const safeArtist = sanitizePathSegment(job.artist || 'Downloaded Artist');
+        const safeFileBase = sanitizePathSegment(
+          `${safeArtist} - ${job.title || job.label}`
+        ).slice(0, 120);
         const stagingRoot =
           cfg.integrations?.autoOrganizeDownloads !== false
-            ? cfg.integrations?.stagingDir || path.join(MUSIC_DIR, '_inbox')
+            ? await resolveSandboxedStagingDir(cfg.integrations?.stagingDir)
             : downloadDir;
         const artistFolder = path.join(stagingRoot, safeArtist);
-        fs.mkdirSync(artistFolder, { recursive: true });
+        await fs.promises.mkdir(artistFolder, { recursive: true });
         const outTemplate = path.join(artistFolder, `${safeFileBase}.%(ext)s`);
-        const negativeSuffix = Array.isArray(job.negativeKeywords) && job.negativeKeywords.length > 0
-          ? ' ' + job.negativeKeywords.map((kw: string) => `-${kw}`).join(' ')
-          : '';
-        const query = `ytsearch1:${job.searchText} official audio${negativeSuffix}`;
+        const sanitizedSearchText = String(job.searchText || '')
+          .replace(/[\x00-\x1f\x7f]/g, ' ')
+          .replace(/^-+/, '')
+          .trim()
+          .slice(0, 200);
+        const safeNegatives = Array.isArray(job.negativeKeywords)
+          ? job.negativeKeywords
+              .map((kw: string) =>
+                String(kw)
+                  .toLowerCase()
+                  .replace(/[^a-z0-9 _-]/g, '')
+                  .replace(/^-+/, '')
+                  .trim()
+              )
+              .filter(Boolean)
+          : [];
+        const negativeSuffix =
+          safeNegatives.length > 0
+            ? ' ' + safeNegatives.map((kw: string) => `-${kw}`).join(' ')
+            : '';
+        const query = `ytsearch1:${sanitizedSearchText} official audio${negativeSuffix}`;
 
         job.status = 'downloading';
         job.matchedPeer = 'YouTube Music (yt-dlp)';
@@ -5434,20 +5662,23 @@ async function executeYouTubeOrArchiveGrabJob(
         job.message = `Downloading "${job.label}" via YouTube Music (yt-dlp -> ${audioFormat.toUpperCase()})...`;
         pushServerLog('info', 'youtube', job.message);
 
-        await execFileAsync(
-          'yt-dlp',
-          [
-            '--no-playlist',
-            '-x',
-            '--audio-format',
-            audioFormat,
-            '--audio-quality',
-            '0',
-            '-o',
-            outTemplate,
-            query,
-          ],
-          { timeout: 120000 }
+        await ytDlpWorkerPool.run(() =>
+          execFileAsync(
+            'yt-dlp',
+            [
+              '--no-playlist',
+              '-x',
+              '--audio-format',
+              audioFormat,
+              '--audio-quality',
+              '0',
+              '-o',
+              outTemplate,
+              '--',
+              query,
+            ],
+            { timeout: 120000, shell: false, windowsHide: true }
+          )
         );
 
         let finalFile = path.join(
@@ -5970,8 +6201,8 @@ app.post('/api/services/test-all', async (req, res) => {
     message: `SQLite Active (${DB_PATH} · ${counts.totalTracks} tracks)`,
   };
   try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.accessSync(DATA_DIR, fs.constants.W_OK);
+    await fs.promises.mkdir(DATA_DIR, { recursive: true });
+    await fs.promises.access(DATA_DIR, fs.constants.W_OK);
   } catch (e) {
     storageStatus = {
       ok: false,
@@ -6545,30 +6776,32 @@ function formatEngineChainLabel(sourceMode: string): string {
   return 'Auto (slskd → Lidarr → YouTube)';
 }
 
+let dripQueueWritePromise: Promise<void> = Promise.resolve();
 function saveDripQueueState() {
-  try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    const serializedJobs = Array.from(slskdJobs.values()).slice(-1500);
-    const pendingIds = pendingGrabQueue.map((item) => ({
-      jobId: item.job?.id,
-      sourceMode: item.sourceMode,
-    }));
-    fs.writeFileSync(
-      DRIP_QUEUE_FILE,
-      JSON.stringify(
-        {
-          updatedAt: new Date().toISOString(),
-          jobs: serializedJobs,
-          pending: pendingIds,
-        },
-        null,
-        2
-      ),
-      'utf8'
-    );
-  } catch {
-    // ignore write errors in ephemeral sandboxes
-  }
+  const serializedJobs = Array.from(slskdJobs.values()).slice(-1500);
+  const pendingIds = pendingGrabQueue.map((item) => ({
+    jobId: item.job?.id,
+    sourceMode: item.sourceMode,
+  }));
+  const payload = JSON.stringify(
+    {
+      updatedAt: new Date().toISOString(),
+      jobs: serializedJobs,
+      pending: pendingIds,
+    },
+    null,
+    2
+  );
+  dripQueueWritePromise = dripQueueWritePromise
+    .then(async () => {
+      await fs.promises.mkdir(DATA_DIR, { recursive: true });
+      const tmp = `${DRIP_QUEUE_FILE}.tmp`;
+      await fs.promises.writeFile(tmp, payload, 'utf8');
+      await fs.promises.rename(tmp, DRIP_QUEUE_FILE);
+    })
+    .catch(() => {
+      // ignore write errors in ephemeral sandboxes
+    });
 }
 
 function loadDripQueueStateOnBoot() {
@@ -6999,8 +7232,8 @@ const handleSlskdGrabRequest = async (req: any, res: any) => {
   }
 };
 
-app.post('/api/slskd/grab', handleSlskdGrabRequest);
-app.post('/api/slskd/grab-job', handleSlskdGrabRequest);
+app.post('/api/slskd/grab', requireAdmin, handleSlskdGrabRequest);
+app.post('/api/slskd/grab-job', requireAdmin, handleSlskdGrabRequest);
 
 app.get('/api/slskd/status', (_req, res) => {
   updatePendingQueuePositions();
@@ -7222,7 +7455,7 @@ async function resolvePicardAndAiMetadata(rawArtist, rawTitle, rawAlbum = '') {
   };
 }
 
-app.post('/api/picard/resolve-metadata', async (req, res) => {
+app.post('/api/picard/resolve-metadata', requireAdmin, async (req, res) => {
   try {
     const artist = String(req.body?.artist || '').trim();
     const title = String(req.body?.title || '').trim();
@@ -7334,7 +7567,7 @@ app.get('/api/metadata/musicbrainz-search', async (req, res) => {
 });
 
 // Enrich or manually update metadata & MusicBrainz IDs (MBID) for 1 or more tracks
-app.post('/api/metadata/enrich', async (req, res) => {
+app.post('/api/metadata/enrich', requireAdmin, async (req, res) => {
   try {
     const rawIds = Array.isArray(req.body?.trackIds)
       ? req.body.trackIds.map(String)
@@ -7407,16 +7640,24 @@ app.post('/api/metadata/enrich', async (req, res) => {
         });
 
         // Also embed the updated tags & cover artwork directly into the audio file on disk so future library scans never overwrite manual edits!
-        if (updated && updated.filePath && fs.existsSync(updated.filePath)) {
+        if (
+          updated &&
+          updated.filePath &&
+          (await isSafePathWithinAllowedRootsStrict(updated.filePath))
+        ) {
           try {
+            await fs.promises.access(updated.filePath);
             const trRow = db.tracks.get(tid);
             const albRow = trRow?.album_id
               ? db.albums.get(trRow.album_id)
               : undefined;
-            const coverOnDisk =
-              albRow?.cover_path && fs.existsSync(albRow.cover_path)
-                ? albRow.cover_path
-                : undefined;
+            let coverOnDisk: string | undefined;
+            if (albRow?.cover_path) {
+              try {
+                await fs.promises.access(albRow.cover_path);
+                coverOnDisk = albRow.cover_path;
+              } catch {}
+            }
             await embedMetadataAndArtworkIntoFile(
               updated.filePath,
               {
@@ -7519,7 +7760,7 @@ async function runSingleAutopilotRule(ruleId) {
     });
   }
 
-  upsertPlaylistWithTracks({
+  await upsertPlaylistWithTracks({
     id: playlistId,
     name: playlistName,
     description: targetPl?.description || `Spotify Playlist (${combinedGhosts.length} tracks)`,
@@ -7585,7 +7826,7 @@ app.get('/api/autopilot', (_req, res) => {
   });
 });
 
-app.post('/api/autopilot/save', (req, res) => {
+app.post('/api/autopilot/save', requireAdmin, (req, res) => {
   const cfg = readServerConfig();
   const incomingRule = req.body?.rule;
   const incomingPicard = req.body?.picardConfig;
@@ -7641,7 +7882,7 @@ app.post('/api/autopilot/save', (req, res) => {
   });
 });
 
-app.delete('/api/autopilot/:id', (req, res) => {
+app.delete('/api/autopilot/:id', requireAdmin, (req, res) => {
   const cfg = readServerConfig();
   const id = String(req.params.id || '');
   const nextRules = (cfg.autopilotRules || []).filter(
@@ -7651,7 +7892,7 @@ app.delete('/api/autopilot/:id', (req, res) => {
   res.json({ ok: true, rules: saved.autopilotRules || [] });
 });
 
-app.post('/api/autopilot/sync-now', async (req, res) => {
+app.post('/api/autopilot/sync-now', requireAdmin, async (req, res) => {
   try {
     const ruleId = String(req.body?.ruleId || '').trim();
     const updatedRule = await runSingleAutopilotRule(ruleId);
@@ -7722,9 +7963,15 @@ app.post('/api/stats/record-play', (req, res) => {
 });
 
 async function checkBinaryInstalled(binName) {
+  const ALLOWED_BINARIES = new Set(['yt-dlp', 'ffmpeg', 'fpcalc']);
+  if (!ALLOWED_BINARIES.has(String(binName))) {
+    return { installed: false, version: null };
+  }
   try {
     const { stdout } = await execFileAsync(binName, ['--version'], {
       timeout: 3000,
+      shell: false,
+      windowsHide: true,
     });
     return {
       installed: true,
@@ -7818,12 +8065,11 @@ const handleRunDiagnosticsCheck = async (_req: any, res: any) => {
   // 2. SQLite Database (/data/brokeify.db read/write & WAL status)
   try {
     const t0 = Date.now();
-    fs.accessSync(DATA_DIR, fs.constants.R_OK | fs.constants.W_OK);
+    await fs.promises.access(DATA_DIR, fs.constants.R_OK | fs.constants.W_OK);
     let dbSizeKb = 0;
     try {
-      if (fs.existsSync(DB_PATH)) {
-        dbSizeKb = Math.round(fs.statSync(DB_PATH).size / 1024);
-      }
+      const st = await fs.promises.stat(DB_PATH);
+      dbSizeKb = Math.round(st.size / 1024);
     } catch {}
     const walMode = String(db.pragmaState?.journal_mode || 'wal').toUpperCase();
     const busyTimeout = Number(db.pragmaState?.busy_timeout || 5000);
@@ -7852,7 +8098,7 @@ const handleRunDiagnosticsCheck = async (_req: any, res: any) => {
   // 3. Music Library Mount (/music readable & track count)
   try {
     const t0 = Date.now();
-    const driveInfo = inspectMusicDrive();
+    const driveInfo = await inspectMusicDrive();
     const [ytDlpInfo, ffmpegInfo] = await Promise.all([
       checkBinaryInstalled('yt-dlp'),
       checkBinaryInstalled('ffmpeg'),
@@ -8124,16 +8370,6 @@ app.delete('/api/notifications', (_req, res) => {
 // 13C. STAGING INBOX AUTO-ORGANIZER, WEB FILE & TAG MANAGER, AND WRONG-TRACK AUTO-REPLACEMENT
 // ============================================================================
 
-const AUDIO_FILE_EXTENSIONS = new Set([
-  '.mp3',
-  '.flac',
-  '.m4a',
-  '.aac',
-  '.ogg',
-  '.opus',
-  '.wav',
-]);
-
 let isScanningStagingInbox = false;
 
 async function scanAndOrganizeStagingInbox() {
@@ -8143,23 +8379,28 @@ async function scanAndOrganizeStagingInbox() {
     return { organizedCount: 0, files: [] };
   }
 
-  const stagingDir =
-    cfg.integrations?.stagingDir || path.join(getMusicDir(), '_inbox');
-  if (!fs.existsSync(stagingDir)) {
+  const stagingDir = await resolveSandboxedStagingDir(cfg.integrations?.stagingDir);
+  try {
+    await fs.promises.access(stagingDir);
+  } catch {
     return { organizedCount: 0, files: [] };
   }
 
   isScanningStagingInbox = true;
   const organizedFiles: Array<{ from: string; to: string; title?: string; artist?: string }> = [];
   try {
-    const collectAudioFiles = (dir: string, acc: string[] = []): string[] => {
-      if (!fs.existsSync(dir)) return acc;
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
+    const collectAudioFiles = async (dir: string, acc: string[] = []): Promise<string[]> => {
+      let entries: fs.Dirent[];
+      try {
+        entries = await fs.promises.readdir(dir, { withFileTypes: true });
+      } catch {
+        return acc;
+      }
       for (const entry of entries) {
         if (entry.name.startsWith('.')) continue;
         const full = path.join(dir, entry.name);
         if (entry.isDirectory()) {
-          collectAudioFiles(full, acc);
+          await collectAudioFiles(full, acc);
         } else if (
           entry.isFile() &&
           AUDIO_FILE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())
@@ -8170,7 +8411,7 @@ async function scanAndOrganizeStagingInbox() {
       return acc;
     };
 
-    const inboxAudioFiles = collectAudioFiles(stagingDir);
+    const inboxAudioFiles = await collectAudioFiles(stagingDir);
     for (const filePath of inboxAudioFiles) {
       try {
         const res = await fingerprintTagAndOrganizeFile(filePath, {
@@ -8214,7 +8455,7 @@ setInterval(() => {
   scanAndOrganizeStagingInbox().catch(() => {});
 }, 15000);
 
-app.post('/api/staging/scan', async (_req, res) => {
+app.post('/api/staging/scan', requireAdmin, async (_req, res) => {
   const result = await scanAndOrganizeStagingInbox();
   return res.json({
     ok: true,
@@ -8287,21 +8528,23 @@ function getFastBrowseIndex(musicRoot: string) {
 }
 
 // GET /api/files/browse?path=... -> Sandboxed directory & audio tag browser inside /music
-app.get('/api/files/browse', (req, res) => {
+app.get('/api/files/browse', requireAdmin, async (req, res) => {
   const relParam = String(req.query.path || '');
-  const resolved = resolveSandboxedMusicPath(relParam);
+  const resolved = await resolveSandboxedMusicPathStrict(relParam);
   if (!resolved.ok) {
     return res.status(400).json({ ok: false, error: resolved.error });
   }
 
   const musicRoot = getMusicDir();
   try {
-    fs.mkdirSync(musicRoot, { recursive: true });
+    await fs.promises.mkdir(musicRoot, { recursive: true });
     const inboxDir = path.join(musicRoot, '_inbox');
-    fs.mkdirSync(inboxDir, { recursive: true });
+    await fs.promises.mkdir(inboxDir, { recursive: true });
   } catch {}
 
-  if (!fs.existsSync(resolved.fullPath)) {
+  try {
+    await fs.promises.access(resolved.fullPath);
+  } catch {
     return res.json({
       ok: true,
       musicRoot,
@@ -8312,7 +8555,9 @@ app.get('/api/files/browse', (req, res) => {
   }
 
   try {
-    const entries = fs.readdirSync(resolved.fullPath, { withFileTypes: true });
+    const entries = await fs.promises.readdir(resolved.fullPath, {
+      withFileTypes: true,
+    });
     const { trackByPath, folderChildrenByDir } = getFastBrowseIndex(musicRoot);
 
     const folders: any[] = [];
@@ -8336,9 +8581,8 @@ app.get('/api/files/browse', (req, res) => {
           (entry.name === '_inbox' || dirEntriesCount <= 30)
         ) {
           try {
-            childCount = fs
-              .readdirSync(fullEntryPath)
-              .filter((n) => !n.startsWith('.')).length;
+            const subNames = await fs.promises.readdir(fullEntryPath);
+            childCount = subNames.filter((n) => !n.startsWith('.')).length;
           } catch {}
         }
         folders.push({
@@ -8359,7 +8603,7 @@ app.get('/api/files/browse', (req, res) => {
         const indexed = trackByPath.get(absEntryPath);
         let stat: fs.Stats | null = null;
         try {
-          stat = fs.statSync(fullEntryPath);
+          stat = await fs.promises.stat(fullEntryPath);
         } catch {}
         files.push({
           name: entry.name,
@@ -8415,22 +8659,22 @@ app.get('/api/files/browse', (req, res) => {
 });
 
 // POST /api/files/mkdir -> Create a new folder inside /music
-app.post('/api/files/mkdir', (req, res) => {
+app.post('/api/files/mkdir', requireAdmin, async (req, res) => {
   const parentRel = String(req.body?.parentPath || '');
-  const folderName = String(req.body?.folderName || '').trim();
-  if (!folderName) {
+  const segCheck = sanitizeSingleSegmentName(String(req.body?.folderName || ''));
+  if (!segCheck.ok) {
     return res
       .status(400)
-      .json({ ok: false, error: 'Folder name is required.' });
+      .json({ ok: false, error: segCheck.error || 'Folder name is required.' });
   }
-  const resolved = resolveSandboxedMusicPath(
-    path.posix.join(parentRel, folderName.replace(/[<>:"/\\|?*]/g, '_'))
+  const resolved = await resolveSandboxedMusicPathStrict(
+    parentRel ? path.posix.join(parentRel, segCheck.name) : segCheck.name
   );
   if (!resolved.ok) {
     return res.status(400).json({ ok: false, error: resolved.error });
   }
   try {
-    fs.mkdirSync(resolved.fullPath, { recursive: true });
+    await fs.promises.mkdir(resolved.fullPath, { recursive: true });
     invalidateFileAndStorageCaches();
     return res.json({ ok: true, relativePath: resolved.relativePath });
   } catch (err) {
@@ -8442,38 +8686,50 @@ app.post('/api/files/mkdir', (req, res) => {
 });
 
 // POST /api/files/rename -> Rename a file or folder inside /music
-app.post('/api/files/rename', async (req, res) => {
+app.post('/api/files/rename', requireAdmin, async (req, res) => {
   const sourceRel = String(req.body?.relativePath || '');
-  const newName = String(req.body?.newName || '')
-    .replace(/[<>:"/\\|?*]/g, '_')
-    .trim();
-  if (!sourceRel || !newName) {
-    return res
-      .status(400)
-      .json({ ok: false, error: 'relativePath and newName are required.' });
+  const segCheck = sanitizeSingleSegmentName(String(req.body?.newName || ''));
+  if (!sourceRel || !segCheck.ok) {
+    return res.status(400).json({
+      ok: false,
+      error: segCheck.error || 'relativePath and a valid newName are required.',
+    });
   }
 
-  const srcResolved = resolveSandboxedMusicPath(sourceRel);
-  if (!srcResolved.ok || !fs.existsSync(srcResolved.fullPath)) {
+  const srcResolved = await resolveSandboxedMusicPathStrict(sourceRel);
+  if (!srcResolved.ok) {
+    return res.status(400).json({ ok: false, error: srcResolved.error });
+  }
+  if (!srcResolved.relativePath || srcResolved.relativePath === '_inbox') {
+    return res.status(400).json({
+      ok: false,
+      error: 'Cannot rename the root music folder or staging _inbox.',
+    });
+  }
+
+  try {
+    await fs.promises.access(srcResolved.fullPath);
+  } catch {
     return res
       .status(404)
       .json({ ok: false, error: 'Source file/folder not found.' });
   }
 
   const parentDirRel = path.posix.dirname(srcResolved.relativePath);
-  const destResolved = resolveSandboxedMusicPath(
-    parentDirRel === '.' ? newName : `${parentDirRel}/${newName}`
+  const destResolved = await resolveSandboxedMusicPathStrict(
+    parentDirRel === '.' ? segCheck.name : `${parentDirRel}/${segCheck.name}`
   );
   if (!destResolved.ok) {
     return res.status(400).json({ ok: false, error: destResolved.error });
   }
 
   try {
-    const isDir = fs.statSync(srcResolved.fullPath).isDirectory();
+    const stat = await fs.promises.stat(srcResolved.fullPath);
+    const isDir = stat.isDirectory();
     if (!isDir) {
       removeAudioFileFromIndex(srcResolved.fullPath);
     }
-    fs.renameSync(srcResolved.fullPath, destResolved.fullPath);
+    await fs.promises.rename(srcResolved.fullPath, destResolved.fullPath);
     invalidateFileAndStorageCaches();
     if (isDir) {
       void runFullLibraryScan().then(() => reconcilePlaylistsWithLibrary());
@@ -8495,7 +8751,7 @@ app.post('/api/files/rename', async (req, res) => {
 });
 
 // POST /api/files/move -> Move files/folders into target folder inside /music
-app.post('/api/files/move', async (req, res) => {
+app.post('/api/files/move', requireAdmin, async (req, res) => {
   const pathsToMove: string[] = Array.isArray(req.body?.paths)
     ? req.body.paths
     : req.body?.relativePath
@@ -8503,24 +8759,31 @@ app.post('/api/files/move', async (req, res) => {
       : [];
   const targetFolderRel = String(req.body?.targetFolder || '');
 
-  const destFolder = resolveSandboxedMusicPath(targetFolderRel);
+  const destFolder = await resolveSandboxedMusicPathStrict(targetFolderRel);
   if (!destFolder.ok) {
     return res.status(400).json({ ok: false, error: destFolder.error });
   }
 
   try {
-    fs.mkdirSync(destFolder.fullPath, { recursive: true });
+    await fs.promises.mkdir(destFolder.fullPath, { recursive: true });
     const moved: string[] = [];
     let movedDirectory = false;
 
     for (const rel of pathsToMove) {
-      const src = resolveSandboxedMusicPath(rel);
-      if (!src.ok || !fs.existsSync(src.fullPath)) continue;
+      const src = await resolveSandboxedMusicPathStrict(String(rel || ''));
+      if (!src.ok || !src.relativePath || src.relativePath === '_inbox') continue;
+      try {
+        await fs.promises.access(src.fullPath);
+      } catch {
+        continue;
+      }
       const baseName = path.basename(src.fullPath);
       const targetFull = path.join(destFolder.fullPath, baseName);
       if (path.resolve(targetFull) === path.resolve(src.fullPath)) continue;
+      if (!(await isSafePathWithinAllowedRootsStrict(targetFull))) continue;
 
-      const isDir = fs.statSync(src.fullPath).isDirectory();
+      const stat = await fs.promises.stat(src.fullPath);
+      const isDir = stat.isDirectory();
       if (
         isDir &&
         path
@@ -8535,11 +8798,11 @@ app.post('/api/files/move', async (req, res) => {
         movedDirectory = true;
       }
       const oldParent = path.dirname(src.fullPath);
-      fs.renameSync(src.fullPath, targetFull);
+      await fs.promises.rename(src.fullPath, targetFull);
       if (!isDir) {
         await indexAudioFile(targetFull);
       }
-      cleanupEmptyParentDirs(oldParent, getMusicDir());
+      await cleanupEmptyParentDirs(oldParent, getMusicDir());
       moved.push(baseName);
     }
 
@@ -8563,7 +8826,7 @@ app.post('/api/files/move', async (req, res) => {
 });
 
 // POST /api/files/delete -> Delete unwanted files/folders inside /music
-app.post('/api/files/delete', async (req, res) => {
+app.post('/api/files/delete', requireAdmin, async (req, res) => {
   const pathsToDelete: string[] = Array.isArray(req.body?.paths)
     ? req.body.paths
     : req.body?.relativePath
@@ -8578,24 +8841,29 @@ app.post('/api/files/delete', async (req, res) => {
     let deletedCount = 0;
     let deletedDirectory = false;
     for (const rel of pathsToDelete) {
-      const target = resolveSandboxedMusicPath(rel);
+      const target = await resolveSandboxedMusicPathStrict(String(rel || ''));
       if (
         !target.ok ||
         !target.relativePath ||
-        !fs.existsSync(target.fullPath)
+        target.relativePath === '_inbox'
       ) {
         continue;
       }
-      const stat = fs.statSync(target.fullPath);
+      let stat: fs.Stats;
+      try {
+        stat = await fs.promises.stat(target.fullPath);
+      } catch {
+        continue;
+      }
       const parentDir = path.dirname(target.fullPath);
       if (stat.isDirectory()) {
         deletedDirectory = true;
-        fs.rmSync(target.fullPath, { recursive: true, force: true });
+        await fs.promises.rm(target.fullPath, { recursive: true, force: true });
       } else {
         removeAudioFileFromIndex(target.fullPath);
-        fs.unlinkSync(target.fullPath);
+        await fs.promises.unlink(target.fullPath);
       }
-      cleanupEmptyParentDirs(parentDir, getMusicDir());
+      await cleanupEmptyParentDirs(parentDir, getMusicDir());
       deletedCount++;
     }
 
@@ -8615,7 +8883,7 @@ app.post('/api/files/delete', async (req, res) => {
 });
 
 // POST /api/files/bulk-tag -> Bulk-edit metadata tags (Title, Artist, Album, Track #, Year, Genre, Cover Art) & optionally reorganize path
-app.post('/api/files/bulk-tag', async (req, res) => {
+app.post('/api/files/bulk-tag', requireAdmin, async (req, res) => {
   const items: Array<{
     relativePath: string;
     trackId?: string;
@@ -8637,8 +8905,13 @@ app.post('/api/files/bulk-tag', async (req, res) => {
   try {
     let updatedCount = 0;
     for (const item of items) {
-      const resolved = resolveSandboxedMusicPath(item.relativePath);
-      if (!resolved.ok || !fs.existsSync(resolved.fullPath)) continue;
+      const resolved = await resolveSandboxedMusicPathStrict(item.relativePath);
+      if (!resolved.ok) continue;
+      try {
+        await fs.promises.access(resolved.fullPath);
+      } catch {
+        continue;
+      }
 
       const mergedMeta = {
         title: item.title || sharedTags.title || undefined,
@@ -8678,23 +8951,27 @@ app.post('/api/files/bulk-tag', async (req, res) => {
           title: mergedMeta.title || path.basename(resolved.fullPath, ext),
           ext,
         });
-        if (path.resolve(dest) !== path.resolve(resolved.fullPath)) {
+        if (
+          path.resolve(dest) !== path.resolve(resolved.fullPath) &&
+          (await isSafePathWithinAllowedRootsStrict(dest))
+        ) {
           const oldDir = path.dirname(resolved.fullPath);
           removeAudioFileFromIndex(resolved.fullPath);
-          fs.mkdirSync(path.dirname(dest), { recursive: true });
-          fs.renameSync(resolved.fullPath, dest);
-          cleanupEmptyParentDirs(oldDir, getMusicDir());
+          await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+          await fs.promises.rename(resolved.fullPath, dest);
+          await cleanupEmptyParentDirs(oldDir, getMusicDir());
           finalPath = dest;
         }
       }
 
       const row = await indexAudioFile(finalPath);
       if (row) {
-        updateTrackMetadataInDb(row.id, mergedMeta);
+        await updateTrackMetadataInDb({ trackId: row.id, ...mergedMeta });
       }
       updatedCount++;
     }
 
+    invalidateFileAndStorageCaches();
     reconcilePlaylistsWithLibrary();
     return res.json({
       ok: true,
@@ -8710,18 +8987,25 @@ app.post('/api/files/bulk-tag', async (req, res) => {
 });
 
 // POST /api/files/identify-folder -> 1-Click "Auto-Identify & Organize Folder" with Before/After Preview & Apply
-app.post('/api/files/identify-folder', async (req, res) => {
+app.post('/api/files/identify-folder', requireAdmin, async (req, res) => {
   const folderRel = String(req.body?.relativePath || '');
   const applyChanges = Boolean(req.body?.apply);
   const cfg = readServerConfig();
 
-  const resolved = resolveSandboxedMusicPath(folderRel);
-  if (!resolved.ok || !fs.existsSync(resolved.fullPath)) {
+  const resolved = await resolveSandboxedMusicPathStrict(folderRel);
+  if (!resolved.ok) {
+    return res.status(400).json({ ok: false, error: resolved.error });
+  }
+  try {
+    await fs.promises.access(resolved.fullPath);
+  } catch {
     return res.status(404).json({ ok: false, error: 'Target folder not found.' });
   }
 
   try {
-    const entries = fs.readdirSync(resolved.fullPath, { withFileTypes: true });
+    const entries = await fs.promises.readdir(resolved.fullPath, {
+      withFileTypes: true,
+    });
     const audioFiles = entries
       .filter(
         (e) =>
@@ -8798,6 +9082,7 @@ app.post('/api/files/identify-folder', async (req, res) => {
     }
 
     if (applyChanges && previewItems.length > 0) {
+      invalidateFileAndStorageCaches();
       addPersistentNotification({
         message: `Auto-Identify & Organize: Fingerprinted, tagged & organized ${previewItems.length} track(s) in "${folderRel || '/music'}".`,
         category: 'library',
@@ -8824,40 +9109,47 @@ app.post('/api/files/identify-folder', async (req, res) => {
 });
 
 // GET /api/library/organize/status -> Get real-time status of the background library organizer job
-app.get('/api/library/organize/status', (_req, res) => {
+app.get('/api/library/organize/status', requireAdmin, (_req, res) => {
   const job = getLibraryOrganizeJobState();
   return res.json({ ok: true, job });
 });
 
 // POST /api/library/organize/start -> Start full or targeted library organization & tag cleanup
-app.post('/api/library/organize/start', async (req, res) => {
-  const cfg = readServerConfig();
-  const targetPath = String(req.body?.targetPath || '');
-  const recursive = req.body?.recursive !== false;
-  const dryRun = Boolean(req.body?.dryRun);
-  const skipOrganized = Boolean(req.body?.skipOrganized);
-  const includeInbox = Boolean(req.body?.includeInbox);
+app.post('/api/library/organize/start', requireAdmin, async (req, res) => {
+  try {
+    const cfg = readServerConfig();
+    const targetPath = String(req.body?.targetPath || '');
+    const recursive = req.body?.recursive !== false;
+    const dryRun = Boolean(req.body?.dryRun);
+    const skipOrganized = Boolean(req.body?.skipOrganized);
+    const includeInbox = Boolean(req.body?.includeInbox);
 
-  const job = await startLibraryOrganizeJob({
-    targetPath,
-    recursive,
-    dryRun,
-    skipOrganized,
-    includeInbox,
-    acoustidApiKey: cfg.integrations?.acoustidApiKey,
-  });
+    const job = await startLibraryOrganizeJob({
+      targetPath,
+      recursive,
+      dryRun,
+      skipOrganized,
+      includeInbox,
+      acoustidApiKey: cfg.integrations?.acoustidApiKey,
+    });
 
-  return res.json({ ok: true, job });
+    return res.json({ ok: true, job });
+  } catch (err) {
+    return res.status(400).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Invalid target folder path.',
+    });
+  }
 });
 
 // POST /api/library/organize/cancel -> Cancel running organization job
-app.post('/api/library/organize/cancel', (_req, res) => {
+app.post('/api/library/organize/cancel', requireAdmin, (_req, res) => {
   const job = cancelLibraryOrganizeJob();
   return res.json({ ok: true, job });
 });
 
 // POST /api/library/organize/apply -> Apply dry-run previewed items to library disk
-app.post('/api/library/organize/apply', async (_req, res) => {
+app.post('/api/library/organize/apply', requireAdmin, async (_req, res) => {
   const cfg = readServerConfig();
   const job = await applyPreviewedLibraryOrganizeJob(
     cfg.integrations?.acoustidApiKey
@@ -8917,7 +9209,7 @@ async function refreshMusicBytesInBackground(musicRoot: string) {
   }
 }
 
-function computeMusicDirectoryStorageStats(forceRefresh = false) {
+async function computeMusicDirectoryStorageStats(forceRefresh = false) {
   const now = Date.now();
   if (
     !forceRefresh &&
@@ -8969,13 +9261,15 @@ function computeMusicDirectoryStorageStats(forceRefresh = false) {
     }
   }
 
-  // Only inspect top-level /music and /music/_inbox synchronously (2 fast readdir calls instead of thousands)
+  // Only inspect top-level /music and /music/_inbox asynchronously (2 fast readdir calls instead of thousands)
   let stagingFileCount = 0;
   try {
     const inboxPath = path.join(musicRoot, '_inbox');
-    if (fs.existsSync(inboxPath)) {
+    try {
+      const inboxEntries = await fs.promises.readdir(inboxPath, {
+        withFileTypes: true,
+      });
       folderSet.add(path.resolve(inboxPath));
-      const inboxEntries = fs.readdirSync(inboxPath, { withFileTypes: true });
       for (const e of inboxEntries) {
         if (
           e.isFile() &&
@@ -8985,15 +9279,17 @@ function computeMusicDirectoryStorageStats(forceRefresh = false) {
           stagingFileCount += 1;
         }
       }
-    }
-    if (fs.existsSync(musicRoot)) {
-      const topEntries = fs.readdirSync(musicRoot, { withFileTypes: true });
+    } catch {}
+    try {
+      const topEntries = await fs.promises.readdir(musicRoot, {
+        withFileTypes: true,
+      });
       for (const e of topEntries) {
         if (e.isDirectory() && !e.name.startsWith('.')) {
           folderSet.add(path.resolve(path.join(musicRoot, e.name)));
         }
       }
-    }
+    } catch {}
   } catch {
     // ignore
   }
@@ -9004,11 +9300,13 @@ function computeMusicDirectoryStorageStats(forceRefresh = false) {
   let diskUsedPercent = 0;
 
   try {
-    const targetForStatfs = fs.existsSync(musicRoot)
-      ? musicRoot
-      : process.cwd();
-    if (typeof (fs as any).statfsSync === 'function') {
-      const sfs = (fs as any).statfsSync(targetForStatfs);
+    let targetForStatfs = process.cwd();
+    try {
+      await fs.promises.access(musicRoot);
+      targetForStatfs = musicRoot;
+    } catch {}
+    if (typeof (fs.promises as any).statfs === 'function') {
+      const sfs = await (fs.promises as any).statfs(targetForStatfs);
       const bsize = Number(sfs.bsize || sfs.frsize || 4096);
       const totalBlocks = Number(sfs.blocks || 0);
       const availBlocks = Number(sfs.bavail ?? sfs.bfree ?? 0);
@@ -9024,14 +9322,13 @@ function computeMusicDirectoryStorageStats(forceRefresh = false) {
           : 0;
     }
   } catch {
-    // fallback if statfsSync is unsupported
+    // fallback if statfs is unsupported
   }
 
   let dbSizeBytes = 0;
   try {
-    if (fs.existsSync(DB_PATH)) {
-      dbSizeBytes = fs.statSync(DB_PATH).size || 0;
-    }
+    const dbStat = await fs.promises.stat(DB_PATH);
+    dbSizeBytes = dbStat.size || 0;
   } catch {
     // ignore
   }
@@ -9067,10 +9364,10 @@ function computeMusicDirectoryStorageStats(forceRefresh = false) {
   return stats;
 }
 
-app.get('/api/storage/stats', (req, res) => {
+app.get('/api/storage/stats', requireAdmin, async (req, res) => {
   try {
     const force = req.query.refresh === '1' || req.query.refresh === 'true';
-    const stats = computeMusicDirectoryStorageStats(force);
+    const stats = await computeMusicDirectoryStorageStats(force);
     return res.json({
       ok: true,
       stats,
@@ -9271,21 +9568,23 @@ async function executeScheduledTaskById(
       let healedCount = 0;
       for (const tr of candidates) {
         const row = getTrackWithArtistAlbum(tr.id);
-        if (row?.filePath && fs.existsSync(row.filePath)) {
+        if (row?.filePath && (await isSafePathWithinAllowedRootsStrict(row.filePath))) {
           try {
+            await fs.promises.access(row.filePath);
             const identified =
               await identifyAudioFileWithAcoustIdAndMusicBrainz(row.filePath, {
                 acoustidApiKey: cfg.integrations?.acoustidApiKey,
                 downloadArtwork: true,
               });
             if (identified.artist && identified.title) {
-              updateTrackMetadataInDb(tr.id, {
+              await updateTrackMetadataInDb({
+                trackId: tr.id,
                 title: identified.title,
                 artist: identified.artist,
                 album: identified.album,
                 year: identified.year,
                 trackNumber: identified.trackNumber,
-                mbid: identified.recordingMbid,
+                musicbrainzId: identified.recordingMbid,
               });
               healedCount += 1;
             }
@@ -9294,7 +9593,7 @@ async function executeScheduledTaskById(
           }
         }
       }
-      summaryMessage = `Scanned /music (${scanRes.totalTracks} tracks indexed) and healed metadata on ${healedCount} track(s).`;
+      summaryMessage = `Scanned /music (${scanRes.indexedTracks} tracks indexed) and healed metadata on ${healedCount} track(s).`;
     } else if (
       job.taskType === 'staging_organize' ||
       job.taskType === 'auto_organize_library' ||
@@ -9393,7 +9692,7 @@ app.get('/api/scheduler/jobs', (_req, res) => {
   return res.json({ ok: true, jobs });
 });
 
-app.post('/api/scheduler/jobs', (req, res) => {
+app.post('/api/scheduler/jobs', requireAdmin, (req, res) => {
   const name = String(req.body?.name || '').trim();
   const taskType = String(
     req.body?.taskType || 'auto_organize_library'
@@ -9437,7 +9736,7 @@ app.post('/api/scheduler/jobs', (req, res) => {
   return res.json({ ok: true, job: newJob, jobs });
 });
 
-app.patch('/api/scheduler/jobs/:id', (req, res) => {
+app.patch('/api/scheduler/jobs/:id', requireAdmin, (req, res) => {
   const jobId = String(req.params.id || '');
   const jobs = loadScheduledTasksFromConfig();
   const idx = jobs.findIndex((j) => j.id === jobId);
@@ -9467,7 +9766,7 @@ app.patch('/api/scheduler/jobs/:id', (req, res) => {
   return res.json({ ok: true, job, jobs });
 });
 
-app.delete('/api/scheduler/jobs/:id', (req, res) => {
+app.delete('/api/scheduler/jobs/:id', requireAdmin, (req, res) => {
   const jobId = String(req.params.id || '');
   const jobs = loadScheduledTasksFromConfig();
   const target = jobs.find((j) => j.id === jobId);
@@ -9485,7 +9784,7 @@ app.delete('/api/scheduler/jobs/:id', (req, res) => {
   return res.json({ ok: true, jobs: filtered });
 });
 
-app.post('/api/scheduler/jobs/:id/run', async (req, res) => {
+app.post('/api/scheduler/jobs/:id/run', requireAdmin, async (req, res) => {
   const jobId = String(req.params.id || '');
   const result = await executeScheduledTaskById(jobId);
   const jobs = loadScheduledTasksFromConfig();
@@ -9497,10 +9796,8 @@ app.post('/api/scheduler/jobs/:id/run', async (req, res) => {
   });
 });
 
-
-
 // POST /api/tracks/report-wrong -> "Report Wrong Track" Quarantine + Smart Re-Grab with Negative Keyword Filters
-app.post('/api/tracks/report-wrong', async (req, res) => {
+app.post('/api/tracks/report-wrong', requireAdmin, async (req, res) => {
   try {
     const trackId = String(req.body?.trackId || '').trim();
     const playlistId = String(req.body?.playlistId || '').trim();
@@ -9524,20 +9821,24 @@ app.post('/api/tracks/report-wrong', async (req, res) => {
     const targetAlbum = rawAlbum || existingTrack?.album || '';
 
     let quarantinedPath: string | null = null;
-    if (existingTrack?.filePath && fs.existsSync(existingTrack.filePath)) {
+    if (
+      existingTrack?.filePath &&
+      (await isSafePathWithinAllowedRootsStrict(existingTrack.filePath))
+    ) {
       try {
-        fs.mkdirSync(QUARANTINE_DIR, { recursive: true });
+        await fs.promises.access(existingTrack.filePath);
+        const qDir = await ensureQuarantineDir();
         const qFile = path.join(
-          QUARANTINE_DIR,
-          `${Date.now()}-${path.basename(existingTrack.filePath)}`
+          qDir,
+          `${Date.now()}-${sanitizePathSegment(path.basename(existingTrack.filePath))}`
         );
         const parentDir = path.dirname(existingTrack.filePath);
-        fs.renameSync(existingTrack.filePath, qFile);
+        await fs.promises.rename(existingTrack.filePath, qFile);
         quarantinedPath = qFile;
-        cleanupEmptyParentDirs(parentDir, getMusicDir());
+        await cleanupEmptyParentDirs(parentDir, getMusicDir());
       } catch {
         try {
-          fs.unlinkSync(existingTrack.filePath);
+          await fs.promises.unlink(existingTrack.filePath);
         } catch {}
       }
     }
@@ -9572,7 +9873,7 @@ app.post('/api/tracks/report-wrong', async (req, res) => {
         return pt;
       });
       if (changed) {
-        upsertPlaylistWithTracks({
+        await upsertPlaylistWithTracks({
           ...pl,
           tracks: updatedTracks,
         });
@@ -9671,7 +9972,7 @@ app.post('/api/tracks/report-wrong', async (req, res) => {
 // ============================================================================
 
 function readLocalVersionMetadata() {
-  const versionFile = path.join(__dirname, 'version.json');
+  const versionFile = path.join(APP_ROOT, 'version.json');
   try {
     if (fs.existsSync(versionFile)) {
       const raw = fs.readFileSync(versionFile, 'utf-8');
@@ -9752,7 +10053,7 @@ async function startServer() {
       ? Number(process.argv[portArgIdx + 1])
       : 0;
   const PORT = Number(process.env.PORT || cliPort || 3487);
-  const distPath = path.join(__dirname, 'dist');
+  const distPath = path.join(APP_ROOT, 'dist');
   const distIndex = path.join(distPath, 'index.html');
   const isProd = process.env.NODE_ENV === 'production';
 

@@ -84,6 +84,55 @@ export function isSafePathWithinAllowedRoots(
   );
 }
 
+async function pathExistsAsync(targetPath: string): Promise<boolean> {
+  try {
+    await fs.promises.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveRealPathWithMissingTail(targetPath: string): Promise<string> {
+  let cursor = path.resolve(targetPath);
+  const missingSegments: string[] = [];
+
+  while (true) {
+    try {
+      const realBase = await fs.promises.realpath(cursor);
+      return missingSegments.length > 0
+        ? path.resolve(realBase, ...missingSegments.reverse())
+        : realBase;
+    } catch {
+      const parent = path.dirname(cursor);
+      if (parent === cursor) {
+        return path.resolve(targetPath);
+      }
+      missingSegments.push(path.basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+export async function isSafePathWithinAllowedRootsStrict(
+  candidatePath: string,
+  extraAllowedRoots: string[] = []
+): Promise<boolean> {
+  if (!isSafePathWithinAllowedRoots(candidatePath, extraAllowedRoots)) {
+    return false;
+  }
+  const realCandidate = await resolveRealPathWithMissingTail(candidatePath);
+  const rawRoots = [MUSIC_DIR, DATA_DIR, COVERS_DIR, ...extraAllowedRoots];
+  const realRoots: string[] = [];
+  for (const r of rawRoots) {
+    realRoots.push(await resolveRealPathWithMissingTail(r));
+  }
+  return realRoots.some(
+    (root) =>
+      realCandidate === root || realCandidate.startsWith(`${root}${path.sep}`)
+  );
+}
+
 const SUPPORTED_AUDIO_EXTENSIONS = new Set([
   '.flac',
   '.mp3',
@@ -356,42 +405,49 @@ class BrokeifyEmbeddedDatabase {
     }
   }
 
-  saveToDisk(): void {
+  private saveQueuePromise: Promise<void> = Promise.resolve();
+
+  private buildPersistedPayload(): PersistedDatabaseSchema {
+    return {
+      engine: 'brokeify-embedded-db-v2',
+      savedAt: new Date().toISOString(),
+      artists: Array.from(this.artists.values()),
+      albums: Array.from(this.albums.values()),
+      tracks: Array.from(this.tracks.values()),
+      playlists: Array.from(this.playlists.values()),
+      playlistTracks: Object.fromEntries(this.playlistTracks.entries()),
+      scrobbles: this.scrobbles.slice(-2000),
+      likedTrackIds: Array.from(this.likedTrackIds),
+      notifications: this.notifications.slice(0, 200),
+    };
+  }
+
+  saveToDisk(): Promise<void> {
+    const json = JSON.stringify(this.buildPersistedPayload());
+    const runWrite = async () => {
+      try {
+        await fs.promises.mkdir(path.dirname(DB_PATH), { recursive: true });
+        const tmpPath = `${DB_PATH}.tmp`;
+        await fs.promises.writeFile(tmpPath, json, 'utf-8');
+        await fs.promises.rename(tmpPath, DB_PATH);
+      } catch {
+        try {
+          await fs.promises.writeFile(DB_PATH, json, 'utf-8');
+        } catch {}
+      }
+    };
+    this.saveQueuePromise = this.saveQueuePromise.then(runWrite, runWrite);
+    return this.saveQueuePromise;
+  }
+
+  saveToDiskSyncForShutdown(): void {
     try {
       fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-      const payload: PersistedDatabaseSchema = {
-        engine: 'brokeify-embedded-db-v2',
-        savedAt: new Date().toISOString(),
-        artists: Array.from(this.artists.values()),
-        albums: Array.from(this.albums.values()),
-        tracks: Array.from(this.tracks.values()),
-        playlists: Array.from(this.playlists.values()),
-        playlistTracks: Object.fromEntries(this.playlistTracks.entries()),
-        scrobbles: this.scrobbles.slice(-2000),
-        likedTrackIds: Array.from(this.likedTrackIds),
-        notifications: this.notifications.slice(0, 200),
-      };
-      const json = JSON.stringify(payload);
+      const json = JSON.stringify(this.buildPersistedPayload());
       const tmpPath = `${DB_PATH}.tmp`;
       fs.writeFileSync(tmpPath, json, 'utf-8');
       fs.renameSync(tmpPath, DB_PATH);
-    } catch {
-      try {
-        const payload: PersistedDatabaseSchema = {
-          engine: 'brokeify-embedded-db-v2',
-          savedAt: new Date().toISOString(),
-          artists: Array.from(this.artists.values()),
-          albums: Array.from(this.albums.values()),
-          tracks: Array.from(this.tracks.values()),
-          playlists: Array.from(this.playlists.values()),
-          playlistTracks: Object.fromEntries(this.playlistTracks.entries()),
-          scrobbles: this.scrobbles.slice(-2000),
-          likedTrackIds: Array.from(this.likedTrackIds),
-          notifications: this.notifications.slice(0, 200),
-        };
-        fs.writeFileSync(DB_PATH, JSON.stringify(payload), 'utf-8');
-      } catch {}
-    }
+    } catch {}
   }
 
   pragmaState: { journal_mode: string; busy_timeout: number } = {
@@ -522,15 +578,23 @@ export function syncDatabaseToPersistentDisk(immediate = false): void {
       clearTimeout(syncDbTimer);
       syncDbTimer = null;
     }
-    db.saveToDisk();
+    void db.saveToDisk();
     return;
   }
   if (!syncDbTimer) {
     syncDbTimer = setTimeout(() => {
       syncDbTimer = null;
-      db.saveToDisk();
+      void db.saveToDisk();
     }, 1500);
   }
+}
+
+export async function flushDatabaseToDisk(): Promise<void> {
+  if (syncDbTimer) {
+    clearTimeout(syncDbTimer);
+    syncDbTimer = null;
+  }
+  await db.saveToDisk();
 }
 
 export function getLibraryCounts() {
@@ -565,7 +629,7 @@ export function pruneOrphanedAlbumsAndArtists(): void {
   }
 }
 
-export function upsertPlaylistWithTracks(params: {
+export async function upsertPlaylistWithTracks(params: {
   id: string;
   name: string;
   description?: string;
@@ -576,7 +640,7 @@ export function upsertPlaylistWithTracks(params: {
   spotifyUrl?: string | null;
   trackIds?: string[];
   createdAt?: string;
-}): void {
+}): Promise<void> {
   const now = new Date().toISOString();
   const existing = db.playlists.get(params.id);
 
@@ -604,8 +668,8 @@ export function upsertPlaylistWithTracks(params: {
         const buf = Buffer.from(b64, 'base64');
         const safeId = params.id.replace(/[^a-zA-Z0-9_-]/g, '_');
         const diskCover = path.join(COVERS_DIR, `playlist-${safeId}.jpg`);
-        fs.mkdirSync(COVERS_DIR, { recursive: true });
-        fs.writeFileSync(diskCover, buf);
+        await fs.promises.mkdir(COVERS_DIR, { recursive: true });
+        await fs.promises.writeFile(diskCover, buf);
         resolvedCoverPath = diskCover;
       }
     } catch {
@@ -737,6 +801,7 @@ export function getTrackWithArtistAlbum(trackId: string) {
     id: t.id,
     title: t.title,
     duration_ms: t.duration_ms,
+    filePath: t.file_path,
     artist: ar?.name || 'Unknown Artist',
     album: al?.title || 'Singles',
   };
@@ -775,10 +840,15 @@ function analyzeFileEbuR128(
   filePath: string
 ): Promise<{ loudnessLufs: number; replaygainDb: number } | null> {
   return new Promise((resolve) => {
+    const resolvedPath = path.resolve(String(filePath || ''));
+    if (!isSafePathWithinAllowedRoots(resolvedPath)) {
+      resolve(null);
+      return;
+    }
     execFile(
       'ffmpeg',
-      ['-nostats', '-i', filePath, '-af', 'ebur128=framelog=verbose', '-f', 'null', '-'],
-      { timeout: 60000, maxBuffer: 10 * 1024 * 1024 },
+      ['-nostats', '-i', resolvedPath, '-af', 'ebur128=framelog=verbose', '-f', 'null', '-'],
+      { timeout: 60000, maxBuffer: 10 * 1024 * 1024, shell: false, windowsHide: true },
       (_err, stdout, stderr) => {
         const combined = `${stdout || ''}\n${stderr || ''}`;
         const matches = [...combined.matchAll(/I:\s*(-?\d+(?:\.\d+)?)\s*LUFS/gi)];
@@ -814,7 +884,7 @@ async function processNextLufsJob() {
     scannerState.currentLufsTrack = path.basename(job.filePath);
 
     try {
-      if (fs.existsSync(job.filePath)) {
+      if (await pathExistsAsync(job.filePath)) {
         const result = await analyzeFileEbuR128(job.filePath);
         if (result) {
           const track = db.tracks.get(job.trackId);
@@ -919,14 +989,14 @@ export async function indexAudioFile(
 ): Promise<string | null> {
   try {
     const resolvedPath = path.resolve(filePath);
-    if (!fs.existsSync(resolvedPath)) return null;
+    if (!(await pathExistsAsync(resolvedPath))) return null;
 
     if (!isSupportedAudioFile(resolvedPath)) return null;
     const ext = path.extname(resolvedPath).toLowerCase();
 
     let fileMtimeMs: number | null = null;
     try {
-      const st = fs.statSync(resolvedPath);
+      const st = await fs.promises.stat(resolvedPath);
       fileMtimeMs = Math.round(st.mtimeMs);
     } catch {}
 
@@ -1040,13 +1110,17 @@ export async function indexAudioFile(
     const trackId = sha1Id('trk', resolvedPath);
 
     const targetCoverPath = path.join(COVERS_DIR, `${albumId}.jpg`);
-    let finalCoverPath: string | null = fs.existsSync(targetCoverPath)
+    let finalCoverPath: string | null = (await pathExistsAsync(targetCoverPath))
       ? targetCoverPath
       : null;
 
     if (!finalCoverPath && embeddedPicture && embeddedPicture.data.length > 32) {
       try {
-        fs.writeFileSync(targetCoverPath, Buffer.from(embeddedPicture.data));
+        await fs.promises.mkdir(COVERS_DIR, { recursive: true });
+        await fs.promises.writeFile(
+          targetCoverPath,
+          Buffer.from(embeddedPicture.data)
+        );
         finalCoverPath = targetCoverPath;
       } catch {}
     }
@@ -1054,13 +1128,14 @@ export async function indexAudioFile(
     if (!finalCoverPath) {
       const trackDir = path.dirname(resolvedPath);
       try {
-        const dirFiles = fs.readdirSync(trackDir);
+        const dirFiles = await fs.promises.readdir(trackDir);
         const lowerSet = new Map(dirFiles.map((f) => [f.toLowerCase(), f]));
         for (const candidateName of COVER_FILENAMES) {
           const actualName = lowerSet.get(candidateName.toLowerCase());
           if (actualName) {
             const candidateFile = path.join(trackDir, actualName);
-            fs.copyFileSync(candidateFile, targetCoverPath);
+            await fs.promises.mkdir(COVERS_DIR, { recursive: true });
+            await fs.promises.copyFile(candidateFile, targetCoverPath);
             finalCoverPath = targetCoverPath;
             break;
           }
@@ -1136,12 +1211,14 @@ export function removeAudioFileFromIndex(filePath: string) {
   } catch {}
 }
 
-export function importM3uPlaylistFile(m3uFilePath: string): string | null {
+export async function importM3uPlaylistFile(
+  m3uFilePath: string
+): Promise<string | null> {
   try {
     const resolvedM3u = path.resolve(m3uFilePath);
-    if (!fs.existsSync(resolvedM3u)) return null;
+    if (!(await pathExistsAsync(resolvedM3u))) return null;
 
-    const rawContent = fs.readFileSync(resolvedM3u, 'utf-8');
+    const rawContent = await fs.promises.readFile(resolvedM3u, 'utf-8');
     const m3uDir = path.dirname(resolvedM3u);
     const playlistName = path
       .basename(resolvedM3u, path.extname(resolvedM3u))
@@ -1181,7 +1258,7 @@ export function importM3uPlaylistFile(m3uFilePath: string): string | null {
       }
     }
 
-    upsertPlaylistWithTracks({
+    await upsertPlaylistWithTracks({
       id: playlistId,
       name: playlistName || 'Imported M3U Playlist',
       description: `Auto-imported from ${path.basename(resolvedM3u)} (${matchedTrackIds.length} tracks)`,
@@ -1207,18 +1284,18 @@ const LEGACY_SAMPLE_FOLDERS = [
 
 const LEGACY_SAMPLE_FILES = ['Night Drive Synthwave.m3u8'];
 
-export function purgeLegacySampleFiles(baseDir: string = MUSIC_DIR) {
+export async function purgeLegacySampleFiles(baseDir: string = MUSIC_DIR) {
   try {
     for (const folder of LEGACY_SAMPLE_FOLDERS) {
       const target = path.join(baseDir, folder);
-      if (fs.existsSync(target)) {
-        fs.rmSync(target, { recursive: true, force: true });
+      if (await pathExistsAsync(target)) {
+        await fs.promises.rm(target, { recursive: true, force: true });
       }
     }
     for (const file of LEGACY_SAMPLE_FILES) {
       const targetFile = path.join(baseDir, file);
-      if (fs.existsSync(targetFile)) {
-        fs.rmSync(targetFile, { force: true });
+      if (await pathExistsAsync(targetFile)) {
+        await fs.promises.rm(targetFile, { force: true });
       }
     }
 
@@ -1256,7 +1333,9 @@ export interface MusicDriveStatus {
   statusMessage: string;
 }
 
-export function inspectMusicDrive(targetDir?: string): MusicDriveStatus {
+export async function inspectMusicDrive(
+  targetDir?: string
+): Promise<MusicDriveStatus> {
   const dirToCheck = (targetDir || MUSIC_DIR).trim() || '/music';
   let exists = false;
   let readable = false;
@@ -1264,27 +1343,28 @@ export function inspectMusicDrive(targetDir?: string): MusicDriveStatus {
   const subfolders: string[] = [];
 
   try {
-    exists = fs.existsSync(dirToCheck) && fs.statSync(dirToCheck).isDirectory();
+    const st = await fs.promises.stat(dirToCheck);
+    exists = st.isDirectory();
   } catch {
     exists = false;
   }
 
   if (exists) {
     try {
-      fs.accessSync(dirToCheck, fs.constants.R_OK);
+      await fs.promises.access(dirToCheck, fs.constants.R_OK);
       readable = true;
     } catch {
       readable = false;
     }
     try {
-      fs.accessSync(dirToCheck, fs.constants.W_OK);
+      await fs.promises.access(dirToCheck, fs.constants.W_OK);
       writable = true;
     } catch {
       writable = false;
     }
     if (readable) {
       try {
-        const names = fs.readdirSync(dirToCheck);
+        const names = await fs.promises.readdir(dirToCheck);
         for (const name of names) {
           if (
             name.startsWith('.') ||
@@ -1295,7 +1375,8 @@ export function inspectMusicDrive(targetDir?: string): MusicDriveStatus {
           }
           try {
             const fullSubPath = path.join(dirToCheck, name);
-            if (fs.statSync(fullSubPath).isDirectory()) {
+            const subStat = await fs.promises.stat(fullSubPath);
+            if (subStat.isDirectory()) {
               subfolders.push(name);
             }
           } catch {
@@ -1310,7 +1391,7 @@ export function inspectMusicDrive(targetDir?: string): MusicDriveStatus {
 
   const walked =
     exists && readable
-      ? walkMusicDirectory(dirToCheck, { logDiscovery: false })
+      ? await walkMusicDirectory(dirToCheck, { logDiscovery: false })
       : { audioFiles: [], m3uFiles: [], directoriesScanned: 0 };
   const indexedTrackCount = db.tracks.size;
 
@@ -1344,29 +1425,29 @@ export function inspectMusicDrive(targetDir?: string): MusicDriveStatus {
 }
 
 /**
- * Recursively traverses `/music/**` across all nested Artist / Album / Disc subfolders.
- * Uses `fs.statSync(fullPath)` rather than relying on `Dirent.isDirectory()` so Windows
- * NTFS bind mounts, WSL2 9P, SMB/CIFS, NFS, and symlinks are always
- * traversed deeply without stopping at the root folder.
+ * Recursively traverses `/music/**` across all nested Artist / Album / Disc subfolders
+ * using async `fs.promises.stat` rather than relying on `Dirent.isDirectory()` so Windows
+ * NTFS bind mounts, WSL2 9P, SMB/CIFS, NFS, and symlinks are always traversed deeply without blocking.
  */
-export function walkMusicDirectory(
+export async function walkMusicDirectory(
   dir: string,
   options?: { logDiscovery?: boolean }
-): {
+): Promise<{
   audioFiles: string[];
   m3uFiles: string[];
   directoriesScanned: number;
-} {
+}> {
   const audioFiles: string[] = [];
   const m3uFiles: string[] = [];
   const visitedDirs = new Set<string>();
   let directoriesScanned = 0;
+  let statOps = 0;
   const shouldLog = options?.logDiscovery !== false;
 
-  function walk(currentDir: string) {
+  async function walk(currentDir: string): Promise<void> {
     let resolvedCurrent: string;
     try {
-      resolvedCurrent = fs.realpathSync(currentDir);
+      resolvedCurrent = await fs.promises.realpath(currentDir);
     } catch {
       resolvedCurrent = path.resolve(currentDir);
     }
@@ -1377,7 +1458,7 @@ export function walkMusicDirectory(
 
     let itemNames: string[] = [];
     try {
-      itemNames = fs.readdirSync(currentDir);
+      itemNames = await fs.promises.readdir(currentDir);
     } catch (err) {
       if (shouldLog) {
         console.warn(`[Scanner] Could not read directory ${currentDir}:`, err);
@@ -1399,13 +1480,18 @@ export function walkMusicDirectory(
       const fullPath = path.join(currentDir, name);
       let stat: fs.Stats;
       try {
-        stat = fs.statSync(fullPath);
+        stat = await fs.promises.stat(fullPath);
       } catch {
         continue;
       }
 
+      statOps += 1;
+      if (statOps % 64 === 0) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+
       if (stat.isDirectory()) {
-        walk(fullPath);
+        await walk(fullPath);
       } else if (stat.isFile()) {
         if (isSupportedAudioFile(fullPath)) {
           audioFiles.push(fullPath);
@@ -1422,8 +1508,8 @@ export function walkMusicDirectory(
     }
   }
 
-  if (fs.existsSync(dir)) {
-    walk(dir);
+  if (await pathExistsAsync(dir)) {
+    await walk(dir);
   }
 
   if (shouldLog) {
@@ -1450,11 +1536,9 @@ export async function runFullLibraryScan(): Promise<{
   scannerState.isScanning = true;
   try {
     console.log(`[Scanner] Starting recursive scan of ${MUSIC_DIR}/** ...`);
-    purgeLegacySampleFiles(MUSIC_DIR);
-    const { audioFiles, m3uFiles, directoriesScanned } = walkMusicDirectory(
-      MUSIC_DIR,
-      { logDiscovery: true }
-    );
+    await purgeLegacySampleFiles(MUSIC_DIR);
+    const { audioFiles, m3uFiles, directoriesScanned } =
+      await walkMusicDirectory(MUSIC_DIR, { logDiscovery: true });
 
     // Prune deleted files from DB first
     const diskSet = new Set(audioFiles.map((f) => path.resolve(f)));
@@ -1477,7 +1561,7 @@ export async function runFullLibraryScan(): Promise<{
 
     let m3uCount = 0;
     for (const m3u of m3uFiles) {
-      const pid = importM3uPlaylistFile(m3u);
+      const pid = await importM3uPlaylistFile(m3u);
       if (pid) m3uCount++;
     }
 
@@ -1518,7 +1602,7 @@ export async function setMusicDirectory(newDir: string): Promise<MusicDriveStatu
 export function startChokidarMusicWatcher() {
   if (activeWatcher) return activeWatcher;
 
-  purgeLegacySampleFiles(MUSIC_DIR);
+  void purgeLegacySampleFiles(MUSIC_DIR);
 
   setTimeout(() => {
     runFullLibraryScan().catch((err) =>
@@ -1526,55 +1610,57 @@ export function startChokidarMusicWatcher() {
     );
   }, 300);
 
-  try {
-    if (fs.existsSync(MUSIC_DIR)) {
-      activeWatcher = chokidar.watch(MUSIC_DIR, {
-        ignored: /(^|[/\\])(\..|\$RECYCLE\.BIN|System Volume Information)/,
-        persistent: true,
-        ignoreInitial: true,
-        ignorePermissionErrors: true,
-        followSymlinks: true,
-        usePolling: process.env.CHOKIDAR_USEPOLLING === 'true',
-        awaitWriteFinish: {
-          stabilityThreshold: 1500,
-          pollInterval: 250,
-        },
-      });
-
-      activeWatcher
-        .on('add', async (filePath) => {
-          if (isSupportedAudioFile(filePath)) {
-            console.log(`[Scanner] Found track: ${filePath}`);
-            await indexAudioFile(filePath);
-            syncDatabaseToPersistentDisk();
-          } else if (isSupportedPlaylistFile(filePath)) {
-            console.log(`[Scanner] Found playlist: ${filePath}`);
-            importM3uPlaylistFile(filePath);
-            syncDatabaseToPersistentDisk();
-          }
-        })
-        .on('change', async (filePath) => {
-          if (isSupportedAudioFile(filePath)) {
-            await indexAudioFile(filePath);
-            syncDatabaseToPersistentDisk();
-          } else if (isSupportedPlaylistFile(filePath)) {
-            importM3uPlaylistFile(filePath);
-            syncDatabaseToPersistentDisk();
-          }
-        })
-        .on('unlink', (filePath) => {
-          if (isSupportedAudioFile(filePath)) {
-            removeAudioFileFromIndex(filePath);
-            syncDatabaseToPersistentDisk();
-          }
-        })
-        .on('error', (err) => {
-          console.warn('[Brokeify Watcher] Non-fatal watcher warning:', err);
+  void (async () => {
+    try {
+      if (await pathExistsAsync(MUSIC_DIR)) {
+        activeWatcher = chokidar.watch(MUSIC_DIR, {
+          ignored: /(^|[/\\])(\..|\$RECYCLE\.BIN|System Volume Information)/,
+          persistent: true,
+          ignoreInitial: true,
+          ignorePermissionErrors: true,
+          followSymlinks: true,
+          usePolling: process.env.CHOKIDAR_USEPOLLING === 'true',
+          awaitWriteFinish: {
+            stabilityThreshold: 1500,
+            pollInterval: 250,
+          },
         });
+
+        activeWatcher
+          .on('add', async (filePath) => {
+            if (isSupportedAudioFile(filePath)) {
+              console.log(`[Scanner] Found track: ${filePath}`);
+              await indexAudioFile(filePath);
+              syncDatabaseToPersistentDisk();
+            } else if (isSupportedPlaylistFile(filePath)) {
+              console.log(`[Scanner] Found playlist: ${filePath}`);
+              await importM3uPlaylistFile(filePath);
+              syncDatabaseToPersistentDisk();
+            }
+          })
+          .on('change', async (filePath) => {
+            if (isSupportedAudioFile(filePath)) {
+              await indexAudioFile(filePath);
+              syncDatabaseToPersistentDisk();
+            } else if (isSupportedPlaylistFile(filePath)) {
+              await importM3uPlaylistFile(filePath);
+              syncDatabaseToPersistentDisk();
+            }
+          })
+          .on('unlink', (filePath) => {
+            if (isSupportedAudioFile(filePath)) {
+              removeAudioFileFromIndex(filePath);
+              syncDatabaseToPersistentDisk();
+            }
+          })
+          .on('error', (err) => {
+            console.warn('[Brokeify Watcher] Non-fatal watcher warning:', err);
+          });
+      }
+    } catch (err) {
+      console.warn('[Brokeify Watcher] Failed to start chokidar watcher:', err);
     }
-  } catch (err) {
-    console.warn('[Brokeify Watcher] Failed to start chokidar watcher:', err);
-  }
+  })();
 
   return activeWatcher;
 }
@@ -1889,8 +1975,12 @@ function normalizeMatchToken(str = ''): string {
     .trim();
 }
 
-export function reconcilePlaylistsWithLibrary(): void {
-  if (db.playlists.size === 0 || db.tracks.size === 0) return;
+export function reconcilePlaylistsWithLibrary(): {
+  playlistsUpdated: number;
+} {
+  if (db.playlists.size === 0 || db.tracks.size === 0) {
+    return { playlistsUpdated: 0 };
+  }
 
   const indexedCatalog: Array<{
     id: string;
@@ -1907,7 +1997,7 @@ export function reconcilePlaylistsWithLibrary(): void {
     }
   }
 
-  let anyModified = false;
+  let playlistsUpdated = 0;
 
   for (const p of db.playlists.values()) {
     if (!p.ghost_tracks_json) continue;
@@ -1983,13 +2073,14 @@ export function reconcilePlaylistsWithLibrary(): void {
     if (playlistChanged) {
       p.ghost_tracks_json = JSON.stringify(updatedGhosts);
       db.playlistTracks.set(p.id, currentTrackIds);
-      anyModified = true;
+      playlistsUpdated += 1;
     }
   }
 
-  if (anyModified) {
+  if (playlistsUpdated > 0) {
     syncDatabaseToPersistentDisk();
   }
+  return { playlistsUpdated };
 }
 
 export function queryPlaylists() {
@@ -2061,7 +2152,7 @@ const MIME_BY_EXT: Record<string, string> = {
   '.wma': 'audio/x-ms-wma',
 };
 
-export function handleStreamTrack(req: Request, res: Response) {
+export async function handleStreamTrack(req: Request, res: Response) {
   const trackId = String(req.params.trackId || req.params.id || '').trim();
   if (!trackId || trackId.includes('..') || trackId.includes('/') || trackId.includes('\\')) {
     return res.status(400).json({ ok: false, error: 'Invalid track ID' });
@@ -2073,7 +2164,7 @@ export function handleStreamTrack(req: Request, res: Response) {
   }
 
   const resolvedFilePath = path.resolve(row.file_path);
-  if (!isSafePathWithinAllowedRoots(resolvedFilePath)) {
+  if (!(await isSafePathWithinAllowedRootsStrict(resolvedFilePath))) {
     console.warn(
       `[Brokeify][SECURITY][WARN] Blocked path traversal attempt on /api/stream/${trackId} -> ${resolvedFilePath}`
     );
@@ -2083,11 +2174,11 @@ export function handleStreamTrack(req: Request, res: Response) {
     });
   }
 
-  if (!fs.existsSync(resolvedFilePath)) {
+  if (!(await pathExistsAsync(resolvedFilePath))) {
     return res.status(404).json({ ok: false, error: 'Track audio file not found on disk' });
   }
 
-  const stat = fs.statSync(resolvedFilePath);
+  const stat = await fs.promises.stat(resolvedFilePath);
   const fileSize = stat.size;
   const ext = path.extname(resolvedFilePath).toLowerCase();
   const contentType = MIME_BY_EXT[ext] || 'application/octet-stream';
@@ -2167,7 +2258,7 @@ function generateCoverSvg(title: string, subtitle: string, accent: string): stri
   </svg>`;
 }
 
-export function handleServeCover(req: Request, res: Response) {
+export async function handleServeCover(req: Request, res: Response) {
   let type = String(req.params.type || '').toLowerCase();
   const id = String(req.params.id || '').trim();
 
@@ -2204,7 +2295,7 @@ export function handleServeCover(req: Request, res: Response) {
       if (al) {
         coverPath = al.cover_path;
         const diskCandidate = path.join(COVERS_DIR, `${al.id}.jpg`);
-        if (!coverPath && fs.existsSync(diskCandidate)) {
+        if (!coverPath && (await pathExistsAsync(diskCandidate))) {
           coverPath = diskCandidate;
         }
       }
@@ -2218,7 +2309,7 @@ export function handleServeCover(req: Request, res: Response) {
       coverPath = alb.cover_path;
     }
     const diskCandidate = path.join(COVERS_DIR, `${id}.jpg`);
-    if (!coverPath && fs.existsSync(diskCandidate)) {
+    if (!coverPath && (await pathExistsAsync(diskCandidate))) {
       coverPath = diskCandidate;
     }
   } else if (type === 'artist') {
@@ -2257,9 +2348,12 @@ export function handleServeCover(req: Request, res: Response) {
 
   if (coverPath) {
     const resolvedCover = path.resolve(coverPath);
-    if (isSafePathWithinAllowedRoots(resolvedCover) && fs.existsSync(resolvedCover)) {
+    if (
+      (await isSafePathWithinAllowedRootsStrict(resolvedCover)) &&
+      (await pathExistsAsync(resolvedCover))
+    ) {
       try {
-        const st = fs.statSync(resolvedCover);
+        const st = await fs.promises.stat(resolvedCover);
         const etag = `W/"${st.size.toString(16)}-${Math.round(st.mtimeMs).toString(16)}"`;
         if (req.headers['if-none-match'] === etag) {
           return res.status(304).end();
@@ -2382,7 +2476,8 @@ export async function enrichTrackFromMusicBrainz(trackId: string): Promise<{
         if (coverResp.ok) {
           const arrBuf = await coverResp.arrayBuffer();
           const targetCover = path.join(COVERS_DIR, `${albumRow.id}.jpg`);
-          fs.writeFileSync(targetCover, Buffer.from(arrBuf));
+          await fs.promises.mkdir(COVERS_DIR, { recursive: true });
+          await fs.promises.writeFile(targetCover, Buffer.from(arrBuf));
           albumRow.cover_path = targetCover;
         }
       } catch {
@@ -2477,13 +2572,13 @@ export async function updateTrackMetadataInDb(params: {
     if (params.customCoverImage && params.customCoverImage.trim()) {
       const rawImg = params.customCoverImage.trim();
       const targetCover = path.join(COVERS_DIR, `${albumRow.id}.jpg`);
-      fs.mkdirSync(COVERS_DIR, { recursive: true });
+      await fs.promises.mkdir(COVERS_DIR, { recursive: true });
       if (rawImg.startsWith('data:image/')) {
         try {
           const commaIdx = rawImg.indexOf(',');
           if (commaIdx !== -1) {
             const buf = Buffer.from(rawImg.slice(commaIdx + 1), 'base64');
-            fs.writeFileSync(targetCover, buf);
+            await fs.promises.writeFile(targetCover, buf);
             albumRow.cover_path = targetCover;
           }
         } catch {}
@@ -2494,7 +2589,7 @@ export async function updateTrackMetadataInDb(params: {
           });
           if (imgResp.ok) {
             const arrBuf = await imgResp.arrayBuffer();
-            fs.writeFileSync(targetCover, Buffer.from(arrBuf));
+            await fs.promises.writeFile(targetCover, Buffer.from(arrBuf));
             albumRow.cover_path = targetCover;
           }
         } catch {}
@@ -2515,8 +2610,8 @@ export async function updateTrackMetadataInDb(params: {
           if (coverResp.ok) {
             const arrBuf = await coverResp.arrayBuffer();
             const targetCover = path.join(COVERS_DIR, `${albumRow.id}.jpg`);
-            fs.mkdirSync(COVERS_DIR, { recursive: true });
-            fs.writeFileSync(targetCover, Buffer.from(arrBuf));
+            await fs.promises.mkdir(COVERS_DIR, { recursive: true });
+            await fs.promises.writeFile(targetCover, Buffer.from(arrBuf));
             albumRow.cover_path = targetCover;
           }
         } catch {

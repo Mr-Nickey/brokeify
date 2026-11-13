@@ -806,7 +806,109 @@ export default function App() {
     }
   };
 
-  // Call navigator.storage.persist() on app startup, load /api/config from server, and enforce Per-Device Jellyfin Login Gate
+  const loadServerConfigAndLibrary = async (isStillMounted: () => boolean = () => true) => {
+    try {
+      const r = await fetch('/api/config');
+      if (r.status === 401) {
+        hasLoadedServerConfigRef.current = true;
+        return;
+      }
+      const data = r.ok ? await r.json() : null;
+      if (!isStillMounted()) return;
+      if (!data?.ok || !data.config) {
+        hasLoadedServerConfigRef.current = true;
+        const localProvs = MusicProviderManager.loadProviders();
+        const jfLocal = localProvs.find((p) => p.type === 'jellyfin');
+        if (jfLocal) syncJellyfinProvider(jfLocal);
+        return;
+      }
+
+      if (data.configPath) {
+        setServerConfigPath(data.configPath);
+      }
+      const srv = data.config;
+      if (srv.integrations) {
+        setServerIntegrations((prev) => ({
+          ...prev,
+          ...srv.integrations,
+          requireDeviceLogin: srv.integrations.requireDeviceLogin !== false,
+          lidarrUrl: srv.integrations.lidarrUrl || prev.lidarrUrl || 'http://lidarr:8686',
+          listenbrainzUsername:
+            srv.integrations.listenbrainzUsername || '',
+        }));
+      }
+      if (srv.discoveryFilters) {
+        setDiscoveryFilters((prev) => ({
+          ...prev,
+          ...srv.discoveryFilters,
+        }));
+      }
+      if (srv.customTheme) {
+        setCustomTheme((prev) => ({
+          ...prev,
+          ...srv.customTheme,
+        }));
+      }
+      if (srv.picardConfig) {
+        setPicardConfig((prev) => ({
+          ...prev,
+          ...srv.picardConfig,
+        }));
+      }
+      if (Array.isArray(srv.autopilotRules)) {
+        setAutopilotRules(srv.autopilotRules);
+      }
+      if (srv.playStats && typeof srv.playStats === 'object') {
+        setPlayStats(srv.playStats);
+      }
+      if (srv.customPlaylistNames) {
+        MusicProviderManager.saveCustomPlaylistNames(srv.customPlaylistNames);
+      }
+      if (srv.audioPrefs) {
+        audio.restoreAudioPreferences(srv.audioPrefs);
+      }
+      if (srv.playbackSession && srv.playbackSession.track) {
+        setRemotePlaybackSession(srv.playbackSession);
+      }
+
+      let activeProvs = MusicProviderManager.loadProviders();
+      if (Array.isArray(srv.providers) && srv.providers.length > 0) {
+        activeProvs = mergeProvidersPreservingAuth(
+          activeProvs,
+          srv.providers
+        );
+      }
+      setProviders(activeProvs);
+      MusicProviderManager.saveProviders(activeProvs);
+      setIsOnboardingOpen(false);
+
+      if (Array.isArray(srv.playlists) && srv.playlists.length > 0) {
+        setPlaylists((prev) => {
+          const customNames = MusicProviderManager.loadCustomPlaylistNames();
+          const merged = mergePlaylistsPreservingCustomNames(
+            prev,
+            srv.playlists,
+            customNames
+          );
+          MusicProviderManager.savePlaylists(merged);
+          return merged;
+        });
+      }
+
+      hasLoadedServerConfigRef.current = true;
+      const primaryProv =
+        activeProvs.find((p) => p.type === 'built-in') || activeProvs[0];
+      syncJellyfinProvider(primaryProv);
+    } catch (err) {
+      if (!isStillMounted()) return;
+      logDebugError('system', 'Failed to load /api/config on startup', err);
+      hasLoadedServerConfigRef.current = true;
+      const initialProviders = MusicProviderManager.loadProviders();
+      syncJellyfinProvider(initialProviders[0]);
+    }
+  };
+
+  // Call navigator.storage.persist() on app startup, load /api/config from server, and enforce Per-Device Login Gate
   useEffect(() => {
     let mounted = true;
     installGlobalErrorCapture();
@@ -822,112 +924,7 @@ export default function App() {
       }
     });
 
-    fetch('/api/config')
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (!mounted || !data?.ok || !data.config) {
-          hasLoadedServerConfigRef.current = true;
-          const localProvs = MusicProviderManager.loadProviders();
-          const jfLocal = localProvs.find((p) => p.type === 'jellyfin');
-          if (jfLocal) syncJellyfinProvider(jfLocal);
-          return;
-        }
-
-        if (data.configPath) {
-          setServerConfigPath(data.configPath);
-        }
-        const srv = data.config;
-        if (srv.integrations) {
-          setServerIntegrations((prev) => ({
-            ...prev,
-            ...srv.integrations,
-            requireDeviceLogin: srv.integrations.requireDeviceLogin !== false,
-            lidarrUrl: srv.integrations.lidarrUrl || prev.lidarrUrl || 'http://lidarr:8686',
-            listenbrainzUsername:
-              srv.integrations.listenbrainzUsername || '',
-          }));
-        }
-        if (srv.discoveryFilters) {
-          setDiscoveryFilters((prev) => ({
-            ...prev,
-            ...srv.discoveryFilters,
-          }));
-        }
-        if (srv.customTheme) {
-          setCustomTheme((prev) => ({
-            ...prev,
-            ...srv.customTheme,
-          }));
-        }
-        if (srv.picardConfig) {
-          setPicardConfig((prev) => ({
-            ...prev,
-            ...srv.picardConfig,
-          }));
-        }
-        if (Array.isArray(srv.autopilotRules)) {
-          setAutopilotRules(srv.autopilotRules);
-        }
-        if (srv.playStats && typeof srv.playStats === 'object') {
-          setPlayStats(srv.playStats);
-        }
-        if (srv.customPlaylistNames) {
-          MusicProviderManager.saveCustomPlaylistNames(srv.customPlaylistNames);
-        }
-        if (srv.audioPrefs) {
-          audio.restoreAudioPreferences(srv.audioPrefs);
-        }
-        if (srv.playbackSession && srv.playbackSession.track) {
-          setRemotePlaybackSession(srv.playbackSession);
-        }
-
-        let isDeviceVerified = false;
-        try {
-          isDeviceVerified = Boolean(
-            localStorage.getItem('jellyfin_token') ||
-              localStorage.getItem(DEVICE_VERIFIED_STORAGE_KEY)
-          );
-        } catch {
-          // ignore
-        }
-        const requireLoginOnEachDevice =
-          srv.integrations?.requireDeviceLogin !== false;
-
-        let activeProvs = MusicProviderManager.loadProviders();
-        if (Array.isArray(srv.providers) && srv.providers.length > 0) {
-          activeProvs = mergeProvidersPreservingAuth(
-            activeProvs,
-            srv.providers
-          );
-        }
-        setProviders(activeProvs);
-        MusicProviderManager.saveProviders(activeProvs);
-        setIsOnboardingOpen(false);
-
-        if (Array.isArray(srv.playlists) && srv.playlists.length > 0) {
-          setPlaylists((prev) => {
-            const customNames = MusicProviderManager.loadCustomPlaylistNames();
-            const merged = mergePlaylistsPreservingCustomNames(
-              prev,
-              srv.playlists,
-              customNames
-            );
-            MusicProviderManager.savePlaylists(merged);
-            return merged;
-          });
-        }
-
-        hasLoadedServerConfigRef.current = true;
-        const primaryProv =
-          activeProvs.find((p) => p.type === 'built-in') || activeProvs[0];
-        syncJellyfinProvider(primaryProv);
-      })
-      .catch((err) => {
-        logDebugError('system', 'Failed to load /api/config on startup', err);
-        hasLoadedServerConfigRef.current = true;
-        const initialProviders = MusicProviderManager.loadProviders();
-        syncJellyfinProvider(initialProviders[0]);
-      });
+    void loadServerConfigAndLibrary(() => mounted);
 
     return () => {
       mounted = false;
@@ -2791,6 +2788,8 @@ export default function App() {
             user,
             manualLockScreen: false,
           }));
+          void refreshAuthStatus();
+          void loadServerConfigAndLibrary();
           setToastMessage(
             `🔓 Signed in as ${user.displayName || user.username} (${user.role.toUpperCase()})`
           );

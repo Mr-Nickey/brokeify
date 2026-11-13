@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "npm run clean && vite build && rm -rf dist/assets/aistudio && esbuild server.ts --bundle --platform=node --target=node20 --format=esm --external:vite --banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\" --outfile=server.js",
-    "start": "node server.js",
+    "build": "npm run clean && vite build && rm -rf dist/assets/aistudio && esbuild server.ts --bundle --platform=node --target=node20 --format=esm --external:vite --banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\" --outfile=dist/server.js",
+    "start": "node dist/server.js",
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit"

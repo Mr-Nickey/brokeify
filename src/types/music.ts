@@ -365,12 +365,15 @@ export interface SlskdGrabJob {
   id: string;
   type: 'album' | 'track' | 'playlist';
   sourceEngine?: 'slskd' | 'lidarr' | 'youtube' | 'archive';
+  sourceMode?: string;
   playlistId?: string | null;
   ghostTrackId?: string | null;
   queuePosition?: number;
+  batchNumber?: number;
   label: string;
   artist: string;
   title: string;
+  album?: string;
   searchText: string;
   status:
     | 'searching'
@@ -385,11 +388,25 @@ export interface SlskdGrabJob {
   matchedFormat: string | null;
   organizedPath?: string | null;
   streamUrl?: string;
+  progressPercent?: number;
+  transferredBytes?: number;
+  totalBytes?: number;
+  speedBytesPerSec?: number;
+  speedText?: string | null;
+  etaSeconds?: number | null;
+  etaText?: string | null;
+  isAlmostDone?: boolean;
   files: Array<{
     filename: string;
     size: number;
+    bytesTransferred?: number;
+    percentComplete?: number;
+    speedBytesPerSec?: number;
+    remainingTime?: number;
+    state?: string;
     username: string;
     completed: boolean;
+    failed?: boolean;
   }>;
   createdAt: string;
   completedAt: string | null;

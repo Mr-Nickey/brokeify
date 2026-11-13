@@ -186,6 +186,120 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
     source: string;
   } | null>(null);
 
+  // Mode 5 Downloads Tab Filters & Bulk Action State
+  const [transferStatusFilter, setTransferStatusFilter] = useState<
+    | 'all'
+    | 'active'
+    | 'almost_done'
+    | 'queued'
+    | 'completed'
+    | 'failed'
+    | 'filtered'
+  >('all');
+  const [transferEngineFilter, setTransferEngineFilter] = useState<
+    'all' | 'slskd' | 'youtube' | 'archive' | 'lidarr'
+  >('all');
+  const [transferSearchQuery, setTransferSearchQuery] = useState<string>('');
+  const [managingJobsAction, setManagingJobsAction] = useState<string | null>(
+    null
+  );
+
+  const formatDownloadBytes = (bytes?: number): string => {
+    const b = Number(bytes || 0);
+    if (!Number.isFinite(b) || b <= 0) return '0 B';
+    if (b >= 1024 * 1024 * 1024) {
+      return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    }
+    if (b >= 1024 * 1024) {
+      return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+    }
+    if (b >= 1024) {
+      return `${Math.round(b / 1024)} KB`;
+    }
+    return `${b} B`;
+  };
+
+  const computeJobProgressPercent = (job: SlskdGrabJob): number => {
+    if (job.status === 'completed') return 100;
+    if (
+      typeof job.progressPercent === 'number' &&
+      Number.isFinite(job.progressPercent)
+    ) {
+      return Math.min(100, Math.max(0, Math.round(job.progressPercent)));
+    }
+    if (Array.isArray(job.files) && job.files.length > 0) {
+      let sumPct = 0;
+      for (const f of job.files) {
+        if (f.completed) {
+          sumPct += 100;
+        } else if (typeof f.percentComplete === 'number') {
+          sumPct += Math.min(100, Math.max(0, f.percentComplete));
+        } else if (f.size > 0 && typeof f.bytesTransferred === 'number') {
+          sumPct += Math.min(100, Math.round((f.bytesTransferred / f.size) * 100));
+        }
+      }
+      return Math.min(100, Math.max(0, Math.round(sumPct / job.files.length)));
+    }
+    if (job.status === 'downloading') return 12;
+    if (job.status === 'searching') return 4;
+    return 0;
+  };
+
+  const handleManageDownloadJobs = async (payload: {
+    action:
+      | 'clear-completed'
+      | 'clear-failed'
+      | 'clear-all'
+      | 'remove-job'
+      | 'retry-job'
+      | 'retry-all-failed';
+    jobId?: string;
+    sourceMode?: string;
+    includeFiltered?: boolean;
+    ignoreFilters?: boolean;
+  }) => {
+    const actionKey = payload.jobId
+      ? `${payload.action}-${payload.jobId}`
+      : payload.action;
+    setManagingJobsAction(actionKey);
+    try {
+      const resp = await fetch('/api/slskd/jobs/manage', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (resp.ok && data.ok) {
+        if (payload.action === 'clear-completed') {
+          onShowToast(
+            `Removed ${data.removedCount || 0} completed download(s).`
+          );
+        } else if (payload.action === 'clear-failed') {
+          onShowToast(
+            `Cleared ${data.removedCount || 0} failed/filtered download(s).`
+          );
+        } else if (payload.action === 'retry-all-failed') {
+          onShowToast(
+            `Re-queued ${data.retriedCount || 0} failed download(s)${
+              payload.sourceMode ? ` via ${payload.sourceMode.toUpperCase()}` : ''
+            }!`
+          );
+        } else if (payload.action === 'retry-job') {
+          onShowToast('Re-queued download job!');
+        } else if (payload.action === 'remove-job') {
+          onShowToast('Removed download job from list.');
+        }
+        onRefreshStatus();
+      } else {
+        onShowToast(data.error || 'Failed to update download jobs.');
+      }
+    } catch {
+      onShowToast('Network error while managing download jobs.');
+    } finally {
+      setManagingJobsAction(null);
+    }
+  };
+
   useEffect(() => {
     if (integrations.listenbrainzUsername) {
       setLbUsernameInput(integrations.listenbrainzUsername);
@@ -2909,128 +3023,497 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
       {/* =====================================================================
           MODE 5: ACTIVE & COMPLETED DOWNLOAD TRANSFERS (slskd + YouTube Music)
          ===================================================================== */}
-      {subMode === 'transfers' && (
-        <div className="winamp-bezel rounded-2xl border border-zinc-700/80 p-5 space-y-4">
-          <div className="flex items-center justify-between gap-2">
-            <div>
-              <h2 className="text-base font-bold text-white font-mono">
-                Automated Download Transfers &amp; Library Auto-Importer
-              </h2>
-              <p className="text-xs text-zinc-400">
-                Tracks downloads across <code className="text-[#00ff66]">slskd</code>,{' '}
-                <code className="text-rose-300">YouTube Music</code>, and{' '}
-                <code className="text-sky-300">Open Audio Archive</code>. Automatically
-                fingerprints, tags, and imports completed tracks into your{' '}
-                <code className="text-[#00ff66]">/music</code> library!
-              </p>
-            </div>
+      {subMode === 'transfers' && (() => {
+        const activeCount = jobs.filter(
+          (j) => j.status === 'downloading' || j.status === 'searching'
+        ).length;
+        const almostDoneCount = jobs.filter((j) => {
+          const pct = computeJobProgressPercent(j);
+          return (
+            j.status === 'downloading' &&
+            (Boolean(j.isAlmostDone) || (pct >= 85 && pct < 100))
+          );
+        }).length;
+        const queuedCount = jobs.filter((j) => j.status === 'queued').length;
+        const completedCount = jobs.filter(
+          (j) => j.status === 'completed'
+        ).length;
+        const failedCount = jobs.filter(
+          (j) => j.status === 'failed' || j.status === 'not_found'
+        ).length;
+        const filteredCount = jobs.filter(
+          (j) => j.status === 'filtered'
+        ).length;
 
-            <button
-              type="button"
-              onClick={onRefreshStatus}
-              className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs font-mono text-zinc-200 hover:text-white min-h-[36px]"
-            >
-              <RefreshCw className="w-3.5 h-3.5 text-[#00ff66]" />
-              <span>Refresh</span>
-            </button>
-          </div>
+        const searchClean = transferSearchQuery.trim().toLowerCase();
+        const filteredTransferJobs = jobs.filter((job) => {
+          const pct = computeJobProgressPercent(job);
+          const isAlmost =
+            job.status === 'downloading' &&
+            (Boolean(job.isAlmostDone) || (pct >= 85 && pct < 100));
 
-          {jobs.length === 0 ? (
-            <div className="py-10 text-center text-xs font-mono text-zinc-400 space-y-2">
-              <Music className="w-8 h-8 text-zinc-600 mx-auto" />
-              <p>
-                No download jobs queued yet. Grab an album, song, Spotify
-                playlist, or ListenBrainz mix!
-              </p>
-            </div>
-          ) : (
-            <div className="space-y-3">
-              {jobs.map((job) => (
-                <div
-                  key={job.id}
-                  className="rounded-2xl border border-zinc-800 bg-zinc-950/90 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+          if (transferStatusFilter === 'active') {
+            if (job.status !== 'downloading' && job.status !== 'searching') {
+              return false;
+            }
+          } else if (transferStatusFilter === 'almost_done') {
+            if (!isAlmost) return false;
+          } else if (transferStatusFilter === 'queued') {
+            if (job.status !== 'queued') return false;
+          } else if (transferStatusFilter === 'completed') {
+            if (job.status !== 'completed') return false;
+          } else if (transferStatusFilter === 'failed') {
+            if (job.status !== 'failed' && job.status !== 'not_found') {
+              return false;
+            }
+          } else if (transferStatusFilter === 'filtered') {
+            if (job.status !== 'filtered') return false;
+          }
+
+          if (
+            transferEngineFilter !== 'all' &&
+            (job.sourceEngine || 'slskd') !== transferEngineFilter
+          ) {
+            return false;
+          }
+
+          if (searchClean) {
+            const hay = `${job.label || ''} ${job.artist || ''} ${
+              job.title || ''
+            } ${job.matchedPeer || ''} ${job.message || ''} ${
+              job.sourceEngine || ''
+            }`.toLowerCase();
+            if (!hay.includes(searchClean)) return false;
+          }
+
+          return true;
+        });
+
+        return (
+          <div className="winamp-bezel rounded-2xl border border-zinc-700/80 p-5 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div>
+                <h2 className="text-base font-bold text-white font-mono">
+                  Automated Download Transfers &amp; Library Auto-Importer
+                </h2>
+                <p className="text-xs text-zinc-400">
+                  Live transfer progress from{' '}
+                  <code className="text-[#00ff66]">slskd</code>,{' '}
+                  <code className="text-rose-300">YouTube Music (yt-dlp)</code>,
+                  and <code className="text-sky-300">Open Audio Archive</code>.
+                  Automatically fingerprints, tags, and organizes completed
+                  tracks into <code className="text-[#00ff66]">/music</code>!
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                {completedCount > 0 && (
+                  <button
+                    type="button"
+                    disabled={managingJobsAction !== null}
+                    onClick={() =>
+                      handleManageDownloadJobs({ action: 'clear-completed' })
+                    }
+                    data-testid="downloads-remove-completed-btn"
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-500/40 bg-emerald-500/15 hover:bg-emerald-500/25 px-3 py-2 text-xs font-mono font-bold text-[#00ff66] transition-colors min-h-[36px] disabled:opacity-50"
+                  >
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>Remove Completed ({completedCount})</span>
+                  </button>
+                )}
+
+                {failedCount > 0 && (
+                  <>
+                    <button
+                      type="button"
+                      disabled={managingJobsAction !== null}
+                      onClick={() =>
+                        handleManageDownloadJobs({
+                          action: 'retry-all-failed',
+                        })
+                      }
+                      data-testid="downloads-retry-errors-btn"
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-amber-500/50 bg-amber-500/15 hover:bg-amber-500/25 px-3 py-2 text-xs font-mono font-bold text-amber-300 transition-colors min-h-[36px] disabled:opacity-50"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>Retry All Errors ({failedCount})</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={managingJobsAction !== null}
+                      onClick={() =>
+                        handleManageDownloadJobs({
+                          action: 'retry-all-failed',
+                          sourceMode: 'youtube',
+                          ignoreFilters: true,
+                        })
+                      }
+                      data-testid="downloads-retry-errors-yt-btn"
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-rose-500/50 bg-rose-500/15 hover:bg-rose-500/25 px-3 py-2 text-xs font-mono font-bold text-rose-300 transition-colors min-h-[36px] disabled:opacity-50"
+                    >
+                      <Youtube className="w-3.5 h-3.5" />
+                      <span>Retry Errors via YouTube</span>
+                    </button>
+                  </>
+                )}
+
+                {(failedCount > 0 || filteredCount > 0) && (
+                  <button
+                    type="button"
+                    disabled={managingJobsAction !== null}
+                    onClick={() =>
+                      handleManageDownloadJobs({ action: 'clear-failed' })
+                    }
+                    data-testid="downloads-clear-failed-btn"
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-900 hover:border-rose-500/50 hover:text-rose-300 px-3 py-2 text-xs font-mono text-zinc-300 transition-colors min-h-[36px] disabled:opacity-50"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>
+                      Clear Failed/Filtered ({failedCount + filteredCount})
+                    </span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={onRefreshStatus}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs font-mono text-zinc-200 hover:text-white min-h-[36px]"
                 >
-                  <div className="space-y-1 min-w-0">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span
-                        className={`rounded px-2 py-0.5 text-[10px] font-mono font-bold uppercase ${
-                          job.status === 'completed'
-                            ? 'bg-emerald-500/20 text-[#00ff66] border border-emerald-500/40'
-                            : job.status === 'failed' ||
-                              job.status === 'not_found'
-                            ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
-                            : job.status === 'filtered'
-                            ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40'
-                            : 'bg-sky-500/20 text-sky-300 border border-sky-500/40'
+                  <RefreshCw className="w-3.5 h-3.5 text-[#00ff66]" />
+                  <span>Refresh</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Filter Bar: Status Pills + Engine Filter + Search Input */}
+            <div className="rounded-xl border border-zinc-800 bg-zinc-950/75 p-3 space-y-3">
+              <div className="flex flex-wrap items-center gap-1.5">
+                {(
+                  [
+                    { id: 'all', label: `All (${jobs.length})` },
+                    {
+                      id: 'active',
+                      label: `Downloading / Active (${activeCount})`,
+                    },
+                    {
+                      id: 'almost_done',
+                      label: `Almost Done 85%+ (${almostDoneCount})`,
+                    },
+                    { id: 'queued', label: `Queued (${queuedCount})` },
+                    { id: 'completed', label: `Completed (${completedCount})` },
+                    {
+                      id: 'failed',
+                      label: `Errors / Failed (${failedCount})`,
+                    },
+                    { id: 'filtered', label: `Filtered (${filteredCount})` },
+                  ] as const
+                ).map((pill) => {
+                  const active = transferStatusFilter === pill.id;
+                  return (
+                    <button
+                      key={pill.id}
+                      type="button"
+                      onClick={() => setTransferStatusFilter(pill.id)}
+                      data-testid={`downloads-filter-${pill.id}`}
+                      className={`rounded-lg px-2.5 py-1.5 text-[11px] font-mono font-bold transition-colors ${
+                        active
+                          ? 'bg-[#00ff66] text-zinc-950 shadow-sm'
+                          : 'bg-zinc-900 text-zinc-300 border border-zinc-800 hover:border-zinc-700 hover:text-white'
+                      }`}
+                    >
+                      {pill.label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] font-mono text-zinc-400 mr-1">
+                    Engine:
+                  </span>
+                  {(
+                    [
+                      { id: 'all', label: 'All Engines' },
+                      { id: 'slskd', label: 'slskd P2P' },
+                      { id: 'youtube', label: 'YouTube (yt-dlp)' },
+                      { id: 'archive', label: 'Open Archive' },
+                      { id: 'lidarr', label: 'Lidarr' },
+                    ] as const
+                  ).map((eng) => {
+                    const active = transferEngineFilter === eng.id;
+                    return (
+                      <button
+                        key={eng.id}
+                        type="button"
+                        onClick={() => setTransferEngineFilter(eng.id)}
+                        className={`rounded-lg px-2.5 py-1 text-[11px] font-mono transition-colors ${
+                          active
+                            ? 'bg-sky-500/20 text-sky-300 border border-sky-500/50 font-bold'
+                            : 'bg-zinc-900/90 text-zinc-400 border border-zinc-800 hover:text-zinc-200'
                         }`}
                       >
-                        {job.status}
-                      </span>
-                      {job.sourceEngine && (
-                        <span className="rounded bg-zinc-900 border border-zinc-700 px-2 py-0.5 text-[10px] font-mono text-zinc-300 uppercase">
-                          Engine: {job.sourceEngine}
-                        </span>
-                      )}
-                      {job.matchedFormat && (
-                        <span className="rounded bg-zinc-900 border border-zinc-700 px-2 py-0.5 text-[10px] font-mono text-[#00ff66]">
-                          {job.matchedFormat}
-                        </span>
-                      )}
-                      {job.matchedPeer && (
-                        <span className="text-[11px] font-mono text-zinc-400">
-                          Source: {job.matchedPeer}
-                        </span>
-                      )}
-                    </div>
-                    <div className="text-sm font-bold text-white truncate">
-                      {job.label}
-                    </div>
-                    <div className="text-xs font-mono text-zinc-400">
-                      {job.message}
-                    </div>
-                    {job.organizedPath && (
-                      <div className="text-[11px] font-mono text-[#00ff66]">
-                        📁 Picard Path: {job.organizedPath}
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="flex items-center gap-2 shrink-0">
-                    {(job.status === 'not_found' ||
-                      job.status === 'failed' ||
-                      job.status === 'filtered') && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          handleGrabViaDownloader({
-                            key: `retry-yt-${job.id}`,
-                            type: 'track',
-                            artist: job.artist,
-                            title: job.title || job.label,
-                            overrideSource: 'youtube',
-                            ignoreFilters: true,
-                          })
-                        }
-                        className="inline-flex items-center gap-1.5 rounded-xl border border-rose-500/50 bg-rose-500/15 hover:bg-rose-500 hover:text-zinc-950 px-3 py-1.5 text-xs font-mono font-bold text-rose-300 transition-colors"
-                      >
-                        <Youtube className="w-3.5 h-3.5" />
-                        <span>Retry via YouTube Music</span>
+                        {eng.label}
                       </button>
-                    )}
-
-                    {job.files?.length > 0 && (
-                      <div className="text-xs font-mono text-zinc-300">
-                        {job.files.filter((f) => f.completed).length}/
-                        {job.files.length} files
-                      </div>
-                    )}
-                  </div>
+                    );
+                  })}
                 </div>
-              ))}
+
+                <div className="relative flex-1 max-w-xs">
+                  <Search className="w-3.5 h-3.5 text-zinc-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    value={transferSearchQuery}
+                    onChange={(e) => setTransferSearchQuery(e.target.value)}
+                    placeholder="Filter downloads by song, artist, peer..."
+                    data-testid="downloads-search-input"
+                    className="w-full rounded-xl border border-zinc-800 bg-zinc-900/90 pl-8 pr-3 py-1.5 text-xs font-mono text-white placeholder:text-zinc-500 focus:outline-none focus:border-[#00ff66]"
+                  />
+                </div>
+              </div>
             </div>
-          )}
-        </div>
-      )}
+
+            {jobs.length === 0 ? (
+              <div className="py-10 text-center text-xs font-mono text-zinc-400 space-y-2">
+                <Music className="w-8 h-8 text-zinc-600 mx-auto" />
+                <p>
+                  No download jobs queued yet. Grab an album, song, Spotify
+                  playlist, or ListenBrainz mix!
+                </p>
+              </div>
+            ) : filteredTransferJobs.length === 0 ? (
+              <div className="py-8 text-center text-xs font-mono text-zinc-400 space-y-2">
+                <Filter className="w-6 h-6 text-zinc-600 mx-auto" />
+                <p>No download transfers match your current filters.</p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTransferStatusFilter('all');
+                    setTransferEngineFilter('all');
+                    setTransferSearchQuery('');
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs font-mono text-[#00ff66] hover:bg-zinc-800"
+                >
+                  Reset Filters
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {filteredTransferJobs.map((job) => {
+                  const pct = computeJobProgressPercent(job);
+                  const isAlmostDone =
+                    job.status === 'downloading' &&
+                    (Boolean(job.isAlmostDone) || (pct >= 85 && pct < 100));
+                  const showProgressBar =
+                    job.status === 'downloading' ||
+                    job.status === 'searching' ||
+                    job.status === 'completed' ||
+                    pct > 0;
+
+                  return (
+                    <div
+                      key={job.id}
+                      className={`rounded-2xl border p-4 flex flex-col gap-3 transition-colors ${
+                        isAlmostDone
+                          ? 'border-emerald-500/50 bg-emerald-950/15'
+                          : job.status === 'failed' ||
+                            job.status === 'not_found'
+                          ? 'border-rose-500/35 bg-zinc-950/90'
+                          : 'border-zinc-800 bg-zinc-950/90'
+                      }`}
+                    >
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <div className="space-y-1 min-w-0 flex-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span
+                              className={`rounded px-2 py-0.5 text-[10px] font-mono font-bold uppercase ${
+                                job.status === 'completed'
+                                  ? 'bg-emerald-500/20 text-[#00ff66] border border-emerald-500/40'
+                                  : job.status === 'failed' ||
+                                    job.status === 'not_found'
+                                  ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                                  : job.status === 'filtered'
+                                  ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40'
+                                  : 'bg-sky-500/20 text-sky-300 border border-sky-500/40'
+                              }`}
+                            >
+                              {job.status}
+                            </span>
+
+                            {isAlmostDone && (
+                              <span className="rounded bg-emerald-500/25 border border-emerald-400/60 px-2 py-0.5 text-[10px] font-mono font-bold text-[#00ff66] animate-pulse">
+                                ⚡ ALMOST DONE ({pct}%)
+                              </span>
+                            )}
+
+                            {job.sourceEngine && (
+                              <span className="rounded bg-zinc-900 border border-zinc-700 px-2 py-0.5 text-[10px] font-mono text-zinc-300 uppercase">
+                                Engine: {job.sourceEngine}
+                              </span>
+                            )}
+                            {job.matchedFormat && (
+                              <span className="rounded bg-zinc-900 border border-zinc-700 px-2 py-0.5 text-[10px] font-mono text-[#00ff66]">
+                                {job.matchedFormat}
+                              </span>
+                            )}
+                            {job.matchedPeer && (
+                              <span className="text-[11px] font-mono text-zinc-400">
+                                Source: {job.matchedPeer}
+                              </span>
+                            )}
+                            {job.queuePosition && job.status === 'queued' && (
+                              <span className="rounded bg-zinc-900 border border-zinc-800 px-2 py-0.5 text-[10px] font-mono text-amber-300">
+                                Queue #{job.queuePosition}
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="text-sm font-bold text-white truncate">
+                            {job.label}
+                          </div>
+                          <div className="text-xs font-mono text-zinc-400">
+                            {job.message}
+                          </div>
+                          {job.organizedPath && (
+                            <div className="text-[11px] font-mono text-[#00ff66]">
+                              📁 Picard Path: {job.organizedPath}
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-2 shrink-0">
+                          {job.files?.length > 0 && (
+                            <div className="text-xs font-mono text-zinc-300 mr-1">
+                              {job.files.filter((f) => f.completed).length}/
+                              {job.files.length} files
+                            </div>
+                          )}
+
+                          {(job.status === 'not_found' ||
+                            job.status === 'failed' ||
+                            job.status === 'filtered') && (
+                            <>
+                              <button
+                                type="button"
+                                disabled={managingJobsAction !== null}
+                                onClick={() =>
+                                  handleManageDownloadJobs({
+                                    action: 'retry-job',
+                                    jobId: job.id,
+                                    ignoreFilters: job.status === 'filtered',
+                                  })
+                                }
+                                className="inline-flex items-center gap-1.5 rounded-xl border border-amber-500/50 bg-amber-500/15 hover:bg-amber-500 hover:text-zinc-950 px-3 py-1.5 text-xs font-mono font-bold text-amber-300 transition-colors"
+                              >
+                                <RefreshCw className="w-3.5 h-3.5" />
+                                <span>Retry</span>
+                              </button>
+
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleManageDownloadJobs({
+                                    action: 'retry-job',
+                                    jobId: job.id,
+                                    sourceMode: 'youtube',
+                                    ignoreFilters: true,
+                                  })
+                                }
+                                className="inline-flex items-center gap-1.5 rounded-xl border border-rose-500/50 bg-rose-500/15 hover:bg-rose-500 hover:text-zinc-950 px-3 py-1.5 text-xs font-mono font-bold text-rose-300 transition-colors"
+                              >
+                                <Youtube className="w-3.5 h-3.5" />
+                                <span>Retry via YouTube</span>
+                              </button>
+                            </>
+                          )}
+
+                          <button
+                            type="button"
+                            title="Remove from downloads list"
+                            disabled={managingJobsAction !== null}
+                            onClick={() =>
+                              handleManageDownloadJobs({
+                                action: 'remove-job',
+                                jobId: job.id,
+                              })
+                            }
+                            className="inline-flex items-center justify-center rounded-xl border border-zinc-800 bg-zinc-900 hover:border-rose-500/50 hover:text-rose-300 px-2.5 py-1.5 text-xs font-mono text-zinc-400 transition-colors"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Live SDK / yt-dlp Progress Bar & Transfer Telemetry */}
+                      {showProgressBar && (
+                        <div className="space-y-1.5 pt-1 border-t border-zinc-800/80">
+                          <div className="flex items-center justify-between text-[11px] font-mono">
+                            <div className="flex items-center gap-2 text-zinc-300 flex-wrap">
+                              <span
+                                className={`font-bold ${
+                                  job.status === 'completed' || isAlmostDone
+                                    ? 'text-[#00ff66]'
+                                    : 'text-sky-300'
+                                }`}
+                              >
+                                {pct}% Complete
+                              </span>
+                              {Boolean(job.totalBytes && job.totalBytes > 0) && (
+                                <span className="text-zinc-400">
+                                  ({formatDownloadBytes(job.transferredBytes)} /{' '}
+                                  {formatDownloadBytes(job.totalBytes)})
+                                </span>
+                              )}
+                              {job.speedText && (
+                                <span className="text-emerald-300">
+                                  · {job.speedText}
+                                </span>
+                              )}
+                              {job.etaText && job.status === 'downloading' && (
+                                <span className="text-amber-300">
+                                  · ETA {job.etaText}
+                                </span>
+                              )}
+                            </div>
+
+                            <span className="text-zinc-400">
+                              {job.status === 'completed'
+                                ? '100% · Ready in Library'
+                                : isAlmostDone
+                                ? 'Finishing transfer...'
+                                : job.status === 'searching'
+                                ? 'Querying peers / streams...'
+                                : 'Transferring...'}
+                            </span>
+                          </div>
+
+                          <div className="w-full h-2 rounded-full bg-zinc-900 overflow-hidden border border-zinc-800">
+                            <div
+                              className={`h-full transition-all duration-300 ${
+                                job.status === 'completed'
+                                  ? 'bg-[#00ff66]'
+                                  : isAlmostDone
+                                  ? 'bg-gradient-to-r from-[#00ff66] to-emerald-400'
+                                  : job.status === 'failed'
+                                  ? 'bg-rose-500'
+                                  : 'bg-gradient-to-r from-sky-500 to-[#00ff66]'
+                              }`}
+                              style={{
+                                width: `${Math.min(100, Math.max(3, pct))}%`,
+                              }}
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })()}
     </section>
   );
 };

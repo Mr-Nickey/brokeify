@@ -1102,11 +1102,14 @@ export const PWAInstallButton: React.FC = () => {
         type="button"
         onClick={() => setShowQrModal(true)}
         data-testid="navbar-android-qr-btn"
-        className="inline-flex items-center gap-1.5 rounded-xl border border-[#00ff66]/50 bg-[#00ff66]/15 hover:bg-[#00ff66]/25 px-3 py-1.5 text-xs font-mono font-bold text-[#00ff66] transition-colors whitespace-nowrap shrink-0 min-h-[36px]"
-        title="Connect Android App with 6-Digit Quick Connect or QR Code"
+        aria-label="Connect Android App"
+        className="inline-flex items-center justify-center gap-1 rounded-xl border border-[#00ff66]/50 bg-[#00ff66]/15 hover:bg-[#00ff66]/25 px-2.5 py-1.5 text-sm font-mono font-bold text-[#00ff66] transition-colors whitespace-nowrap shrink-0 min-h-[36px] min-w-[36px]"
+        title="Connect Android App (6-Digit Quick Connect & QR Code)"
       >
-        <QrCode className="w-3.5 h-3.5 text-[#00ff66]" />
-        <span>📱 Connect Android</span>
+        <QrCode className="w-4 h-4 text-[#00ff66] shrink-0" />
+        <span aria-hidden="true" className="text-sm leading-none">
+          📲
+        </span>
       </button>
 
       <AndroidQrPairingModal
