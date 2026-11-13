@@ -239,10 +239,25 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
     onLibraryChangedRef.current = onLibraryChanged;
   }, [onLibraryChanged]);
 
-  const fetchStorageStats = useCallback(async () => {
+  const directoryCacheRef = useRef<
+    Map<
+      string,
+      {
+        currentPath: string;
+        musicRoot: string;
+        folders: BrowseFolderItem[];
+        files: BrowseFileItem[];
+        cachedAt: number;
+      }
+    >
+  >(new Map());
+
+  const fetchStorageStats = useCallback(async (forceRefresh = true) => {
     setLoadingStorageStats(true);
     try {
-      const resp = await fetch('/api/storage/stats');
+      const resp = await fetch(
+        forceRefresh ? '/api/storage/stats?refresh=1' : '/api/storage/stats'
+      );
       const data = await resp.json();
       if (resp.ok && data?.ok && data.stats) {
         setStorageStats(data.stats);
@@ -281,6 +296,7 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
             data.job.status === 'completed' &&
             data.job.organizedCount > 0
           ) {
+            directoryCacheRef.current.clear();
             onLibraryChangedRef.current?.();
           }
           return data.job;
@@ -293,7 +309,7 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
 
   useEffect(() => {
     fetchOrganizeJobStatus();
-    fetchStorageStats();
+    fetchStorageStats(false);
     fetchCronJobs();
   }, [fetchOrganizeJobStatus, fetchStorageStats, fetchCronJobs]);
 
@@ -387,7 +403,7 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
           type: 'ok',
           text: 'Library organizer operation cancelled.',
         });
-        loadDirectory(currentPath);
+        loadDirectory(currentPath, true);
         onLibraryChangedRef.current?.();
       }
     } catch {
@@ -398,39 +414,78 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
     }
   };
 
-  const loadDirectory = useCallback(async (relPath: string) => {
-    setLoading(true);
-    try {
-      const resp = await fetch(
-        `/api/files/browse?path=${encodeURIComponent(relPath)}`
-      );
-      const data = await resp.json();
-      if (resp.ok && data?.ok) {
-        setCurrentPath(data.currentPath || '');
-        setMusicRoot(data.musicRoot || '/music');
-        setFolders(Array.isArray(data.folders) ? data.folders : []);
-        setFiles(Array.isArray(data.files) ? data.files : []);
+  const loadDirectory = useCallback(
+    async (relPath: string, forceRefresh = true) => {
+      const normalizedKey = relPath || '';
+      if (forceRefresh) {
+        directoryCacheRef.current.clear();
+      }
+      const cached = directoryCacheRef.current.get(normalizedKey);
+      if (cached && !forceRefresh) {
+        setCurrentPath(cached.currentPath);
+        setMusicRoot(cached.musicRoot);
+        setFolders(cached.folders);
+        setFiles(cached.files);
         setSelectedPaths(new Set());
         setLastClickedPath(null);
+        // If cache is fresh (< 30s), skip network call completely
+        if (Date.now() - cached.cachedAt < 30_000) {
+          return;
+        }
       } else {
-        setStatusBanner({
-          type: 'err',
-          text: data?.error || 'Failed to browse directory.',
-        });
+        setLoading(true);
       }
-    } catch (err) {
-      setStatusBanner({
-        type: 'err',
-        text:
-          err instanceof Error ? err.message : 'Network error loading folder.',
-      });
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+
+      try {
+        const resp = await fetch(
+          `/api/files/browse?path=${encodeURIComponent(normalizedKey)}`
+        );
+        const data = await resp.json();
+        if (resp.ok && data?.ok) {
+          const nextFolders = Array.isArray(data.folders) ? data.folders : [];
+          const nextFiles = Array.isArray(data.files) ? data.files : [];
+          const nextPath = data.currentPath || '';
+          const nextRoot = data.musicRoot || '/music';
+          directoryCacheRef.current.set(normalizedKey, {
+            currentPath: nextPath,
+            musicRoot: nextRoot,
+            folders: nextFolders,
+            files: nextFiles,
+            cachedAt: Date.now(),
+          });
+          setCurrentPath(nextPath);
+          setMusicRoot(nextRoot);
+          setFolders(nextFolders);
+          setFiles(nextFiles);
+          if (!cached) {
+            setSelectedPaths(new Set());
+            setLastClickedPath(null);
+          }
+        } else if (!cached) {
+          setStatusBanner({
+            type: 'err',
+            text: data?.error || 'Failed to browse directory.',
+          });
+        }
+      } catch (err) {
+        if (!cached) {
+          setStatusBanner({
+            type: 'err',
+            text:
+              err instanceof Error
+                ? err.message
+                : 'Network error loading folder.',
+          });
+        }
+      } finally {
+        setLoading(false);
+      }
+    },
+    []
+  );
 
   useEffect(() => {
-    loadDirectory(currentPath);
+    loadDirectory(currentPath, false);
   }, [currentPath, loadDirectory]);
 
   const pathSegments = currentPath

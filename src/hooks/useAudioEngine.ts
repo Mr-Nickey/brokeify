@@ -1307,8 +1307,92 @@ export function useAudioEngine(initialQueue: Track[]) {
   const queueTrackNext = useCallback(
     (track: Track) => {
       setQueue((prev) => {
+        if (prev.length === 0) {
+          setCurrentIndex(0);
+          return [track];
+        }
         const next = [...prev];
-        next.splice(currentIndex + 1, 0, track);
+        const insertAt = Math.min(next.length, currentIndex + 1);
+        next.splice(insertAt, 0, track);
+        return next;
+      });
+    },
+    [currentIndex]
+  );
+
+  const addTrackToQueue = useCallback((track: Track) => {
+    setQueue((prev) => [...prev, track]);
+  }, []);
+
+  const removeFromQueue = useCallback(
+    (targetIndex: number) => {
+      setQueue((prev) => {
+        if (targetIndex < 0 || targetIndex >= prev.length) return prev;
+        const next = prev.filter((_, idx) => idx !== targetIndex);
+        if (targetIndex < currentIndex) {
+          setCurrentIndex((ci) => Math.max(0, ci - 1));
+        } else if (targetIndex === currentIndex && next.length > 0) {
+          const nextIdx = Math.min(currentIndex, next.length - 1);
+          setCurrentIndex(nextIdx);
+          if (isPlaying && next[nextIdx]) {
+            setTimeout(() => loadAndPlayTrack(next[nextIdx], true), 0);
+          }
+        }
+        return next;
+      });
+    },
+    [currentIndex, isPlaying, loadAndPlayTrack]
+  );
+
+  const reorderQueue = useCallback(
+    (fromIndex: number, toIndex: number) => {
+      if (fromIndex === toIndex) return;
+      setQueue((prev) => {
+        if (
+          fromIndex < 0 ||
+          fromIndex >= prev.length ||
+          toIndex < 0 ||
+          toIndex >= prev.length
+        ) {
+          return prev;
+        }
+        const next = [...prev];
+        const [moved] = next.splice(fromIndex, 1);
+        next.splice(toIndex, 0, moved);
+
+        setCurrentIndex((ci) => {
+          if (ci === fromIndex) return toIndex;
+          if (fromIndex < ci && toIndex >= ci) return ci - 1;
+          if (fromIndex > ci && toIndex <= ci) return ci + 1;
+          return ci;
+        });
+
+        return next;
+      });
+    },
+    []
+  );
+
+  const moveTrackPlayNext = useCallback(
+    (fromIndex: number) => {
+      setQueue((prev) => {
+        if (
+          fromIndex < 0 ||
+          fromIndex >= prev.length ||
+          fromIndex === currentIndex ||
+          fromIndex === currentIndex + 1
+        ) {
+          return prev;
+        }
+        const next = [...prev];
+        const [moved] = next.splice(fromIndex, 1);
+        const adjustedCurrent =
+          fromIndex < currentIndex ? currentIndex - 1 : currentIndex;
+        const insertAt = Math.min(next.length, adjustedCurrent + 1);
+        next.splice(insertAt, 0, moved);
+        if (fromIndex < currentIndex) {
+          setCurrentIndex(adjustedCurrent);
+        }
         return next;
       });
     },
@@ -1749,5 +1833,9 @@ export function useAudioEngine(initialQueue: Track[]) {
     seekTo,
     playSpecificTrack,
     queueTrackNext,
+    addTrackToQueue,
+    removeFromQueue,
+    reorderQueue,
+    moveTrackPlayNext,
   };
 }

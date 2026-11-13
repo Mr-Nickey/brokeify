@@ -66,6 +66,8 @@ export interface Track {
   dateAdded?: string;
   fileSizeBytes?: number;
   year?: number | null;
+  trackNumber?: number | null;
+  discNumber?: number | null;
   filePath?: string;
   musicbrainzId?: string | null;
   artistMusicbrainzId?: string | null;
@@ -94,6 +96,7 @@ export interface Playlist {
   ghostTracks?: PlaylistGhostTrack[];
   createdAt: string;
   coverAccent: string;
+  coverUrl?: string;
   linkedSpotifyUrl?: string;
   autopilotSpotifyUrl?: string;
   autopilotSchedule?: AutopilotSyncSchedule;

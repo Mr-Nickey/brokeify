@@ -74,6 +74,9 @@ interface PlaylistDetailViewProps {
   onToggleLikeTrack?: (track: Track) => void;
   onStartTrackRadio?: (track: Track) => void;
   onReportWrongTrack?: (track: Track, playlistId: string) => void;
+  onOpenEditPlaylistMetadata?: (pl: Playlist) => void;
+  onQueueTrackNext?: (track: Track) => void;
+  onAddTrackToQueue?: (track: Track) => void;
 }
 
 export interface UnifiedPlaylistItem {
@@ -115,6 +118,9 @@ export const PlaylistDetailView: React.FC<PlaylistDetailViewProps> = ({
   onToggleLikeTrack,
   onStartTrackRadio,
   onReportWrongTrack,
+  onOpenEditPlaylistMetadata,
+  onQueueTrackNext,
+  onAddTrackToQueue,
 }) => {
   // Inline rename state
   const [isEditingName, setIsEditingName] = useState(false);
@@ -427,6 +433,18 @@ export const PlaylistDetailView: React.FC<PlaylistDetailViewProps> = ({
               <Link2 className="w-4 h-4" />
               <span>Link with Playlist</span>
             </button>
+
+            {onOpenEditPlaylistMetadata && (
+              <button
+                type="button"
+                onClick={() => onOpenEditPlaylistMetadata(playlist)}
+                data-testid="playlist-detail-edit-metadata-btn"
+                className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-900 hover:border-[#00ff66]/60 hover:text-[#00ff66] px-3.5 py-2 text-xs font-mono font-semibold text-zinc-200 transition-colors min-h-[38px]"
+              >
+                <Pencil className="w-3.5 h-3.5 text-[#00ff66]" />
+                <span>Edit Cover &amp; Info</span>
+              </button>
+            )}
 
             <button
               type="button"
@@ -1081,6 +1099,36 @@ export const PlaylistDetailView: React.FC<PlaylistDetailViewProps> = ({
                                 </button>
                               )}
 
+                              {onQueueTrackNext && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    onQueueTrackNext(item.libraryTrack as Track);
+                                    setOpenMenuTrackKey(null);
+                                  }}
+                                  className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-[#00ff66]"
+                                >
+                                  <Play className="w-3.5 h-3.5 text-[#00ff66]" />
+                                  <span>Play Next in Queue</span>
+                                </button>
+                              )}
+
+                              {onAddTrackToQueue && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    onAddTrackToQueue(
+                                      item.libraryTrack as Track
+                                    );
+                                    setOpenMenuTrackKey(null);
+                                  }}
+                                  className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-[#00ff66]"
+                                >
+                                  <ListPlus className="w-3.5 h-3.5 text-[#00ff66]" />
+                                  <span>Add to Queue</span>
+                                </button>
+                              )}
+
                               {onStartTrackRadio && (
                                 <button
                                   type="button"
@@ -1108,7 +1156,7 @@ export const PlaylistDetailView: React.FC<PlaylistDetailViewProps> = ({
                                 className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-purple-300"
                               >
                                 <Sparkles className="w-3.5 h-3.5 text-purple-400" />
-                                <span>Check Metadata (MusicBrainz MBID)</span>
+                                <span>Edit Metadata &amp; Auto-Fill</span>
                               </button>
 
                               <button

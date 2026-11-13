@@ -569,6 +569,7 @@ export function upsertPlaylistWithTracks(params: {
   id: string;
   name: string;
   description?: string;
+  coverPath?: string | null;
   isSmart?: boolean;
   smartRulesJson?: string | null;
   ghostTracks?: PlaylistGhostItem[] | null;
@@ -587,11 +588,36 @@ export function upsertPlaylistWithTracks(params: {
         : null;
   }
 
+  let resolvedCoverPath =
+    params.coverPath !== undefined
+      ? params.coverPath
+      : existing?.cover_path ?? null;
+
+  if (
+    typeof resolvedCoverPath === 'string' &&
+    resolvedCoverPath.startsWith('data:image/')
+  ) {
+    try {
+      const commaIdx = resolvedCoverPath.indexOf(',');
+      if (commaIdx !== -1) {
+        const b64 = resolvedCoverPath.slice(commaIdx + 1);
+        const buf = Buffer.from(b64, 'base64');
+        const safeId = params.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const diskCover = path.join(COVERS_DIR, `playlist-${safeId}.jpg`);
+        fs.mkdirSync(COVERS_DIR, { recursive: true });
+        fs.writeFileSync(diskCover, buf);
+        resolvedCoverPath = diskCover;
+      }
+    } catch {
+      // keep existing if write fails
+    }
+  }
+
   db.playlists.set(params.id, {
     id: params.id,
     name: params.name,
     description: params.description ?? existing?.description ?? '',
-    cover_path: existing?.cover_path ?? null,
+    cover_path: resolvedCoverPath,
     is_smart: params.isSmart !== undefined ? (params.isSmart ? 1 : 0) : existing?.is_smart ?? 0,
     smart_rules_json:
       params.smartRulesJson !== undefined
@@ -1988,12 +2014,23 @@ export function queryPlaylists() {
       } catch {}
     }
 
+    const rawCoverPath = p.cover_path ? String(p.cover_path) : '';
+    const isExternalCover =
+      rawCoverPath.startsWith('http://') ||
+      rawCoverPath.startsWith('https://') ||
+      rawCoverPath.startsWith('data:image/');
+    const versionTag = p.updated_at
+      ? `?v=${encodeURIComponent(String(p.updated_at))}`
+      : '';
+
     return {
       id: pid,
       name: String(p.name),
       originalName: String(p.name),
       description: String(p.description || ''),
-      coverUrl: `/api/cover/playlist/${encodeURIComponent(pid)}`,
+      coverUrl: isExternalCover
+        ? rawCoverPath
+        : `/api/cover/playlist/${encodeURIComponent(pid)}${versionTag}`,
       coverAccent: pickAccentColor(pid),
       isSmart: Boolean(p.is_smart),
       smartRules: p.smart_rules_json ? JSON.parse(p.smart_rules_json) : null,
@@ -2375,7 +2412,10 @@ export async function updateTrackMetadataInDb(params: {
   artist?: string;
   album?: string;
   year?: number | null;
+  trackNumber?: number | null;
+  discNumber?: number | null;
   genre?: string;
+  customCoverImage?: string | null;
   musicbrainzId?: string | null;
   artistMusicbrainzId?: string | null;
   albumMusicbrainzId?: string | null;
@@ -2385,6 +2425,18 @@ export async function updateTrackMetadataInDb(params: {
 
   if (params.title && params.title.trim()) {
     trackRow.title = params.title.trim();
+  }
+  if (params.trackNumber !== undefined && params.trackNumber !== null) {
+    const tn = Number(params.trackNumber);
+    if (Number.isFinite(tn) && tn > 0) {
+      trackRow.track_number = Math.round(tn);
+    }
+  }
+  if (params.discNumber !== undefined && params.discNumber !== null) {
+    const dn = Number(params.discNumber);
+    if (Number.isFinite(dn) && dn > 0) {
+      trackRow.disc_number = Math.round(dn);
+    }
   }
   if (params.musicbrainzId !== undefined) {
     trackRow.musicbrainz_id = params.musicbrainzId
@@ -2420,12 +2472,41 @@ export async function updateTrackMetadataInDb(params: {
     if (params.genre && params.genre.trim()) {
       albumRow.genre = params.genre.trim();
     }
+
+    // Handle custom uploaded or URL cover image first
+    if (params.customCoverImage && params.customCoverImage.trim()) {
+      const rawImg = params.customCoverImage.trim();
+      const targetCover = path.join(COVERS_DIR, `${albumRow.id}.jpg`);
+      fs.mkdirSync(COVERS_DIR, { recursive: true });
+      if (rawImg.startsWith('data:image/')) {
+        try {
+          const commaIdx = rawImg.indexOf(',');
+          if (commaIdx !== -1) {
+            const buf = Buffer.from(rawImg.slice(commaIdx + 1), 'base64');
+            fs.writeFileSync(targetCover, buf);
+            albumRow.cover_path = targetCover;
+          }
+        } catch {}
+      } else if (rawImg.startsWith('http://') || rawImg.startsWith('https://')) {
+        try {
+          const imgResp = await fetch(rawImg, {
+            signal: AbortSignal.timeout(8000),
+          });
+          if (imgResp.ok) {
+            const arrBuf = await imgResp.arrayBuffer();
+            fs.writeFileSync(targetCover, Buffer.from(arrBuf));
+            albumRow.cover_path = targetCover;
+          }
+        } catch {}
+      }
+    }
+
     if (params.albumMusicbrainzId !== undefined) {
       const relMbid = params.albumMusicbrainzId
         ? String(params.albumMusicbrainzId).trim()
         : null;
       albumRow.musicbrainz_id = relMbid;
-      if (relMbid) {
+      if (relMbid && !params.customCoverImage) {
         try {
           const coverResp = await fetch(
             `https://coverartarchive.org/release/${encodeURIComponent(relMbid)}/front-500`,
@@ -2434,6 +2515,7 @@ export async function updateTrackMetadataInDb(params: {
           if (coverResp.ok) {
             const arrBuf = await coverResp.arrayBuffer();
             const targetCover = path.join(COVERS_DIR, `${albumRow.id}.jpg`);
+            fs.mkdirSync(COVERS_DIR, { recursive: true });
             fs.writeFileSync(targetCover, Buffer.from(arrBuf));
             albumRow.cover_path = targetCover;
           }

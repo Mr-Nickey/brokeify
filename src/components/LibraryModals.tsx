@@ -878,13 +878,14 @@ export const MergePlaylistsModal: React.FC<MergePlaylistsModalProps> = ({
 };
 
 // ============================================================================
-// 3. MUSICBRAINZ (MBID — THE IMDb OF MUSIC) METADATA INSPECTOR & MATCHER MODAL
+// 3. UNIFIED METADATA EDITOR & MUSICBRAINZ AUTO-FILLER (PLAYLISTS, SONGS, ALBUMS & ARTISTS)
 // ============================================================================
 
 export interface MetadataInspectorTarget {
-  mode: 'track' | 'album' | 'artist' | 'bulk';
+  mode: 'track' | 'album' | 'artist' | 'bulk' | 'playlist';
   label: string;
   tracks: Track[];
+  playlist?: Playlist;
 }
 
 interface MusicBrainzSearchResult {
@@ -904,6 +905,7 @@ interface MetadataInspectorModalProps {
   target: MetadataInspectorTarget | null;
   onClose: () => void;
   onMetadataUpdated: () => void;
+  onPlaylistUpdated?: (updatedPlaylist: Playlist, allPlaylists?: Playlist[]) => void;
   onShowToast: (msg: string) => void;
 }
 
@@ -911,17 +913,29 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
   target,
   onClose,
   onMetadataUpdated,
+  onPlaylistUpdated,
   onShowToast,
 }) => {
+  const isPlaylistMode = target?.mode === 'playlist' && Boolean(target?.playlist);
   const primaryTrack = target?.tracks[0] || null;
+
+  // Track / Album / Artist metadata state
   const [title, setTitle] = useState('');
   const [artist, setArtist] = useState('');
   const [album, setAlbum] = useState('');
   const [year, setYear] = useState('');
+  const [trackNumber, setTrackNumber] = useState('');
+  const [discNumber, setDiscNumber] = useState('');
   const [genre, setGenre] = useState('');
+  const [customCoverImage, setCustomCoverImage] = useState('');
   const [musicbrainzId, setMusicbrainzId] = useState('');
   const [albumMusicbrainzId, setAlbumMusicbrainzId] = useState('');
   const [artistMusicbrainzId, setArtistMusicbrainzId] = useState('');
+
+  // Playlist metadata state
+  const [playlistName, setPlaylistName] = useState('');
+  const [playlistDescription, setPlaylistDescription] = useState('');
+  const [playlistCoverUrl, setPlaylistCoverUrl] = useState('');
 
   const [isSearchingMb, setIsSearchingMb] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -929,32 +943,67 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
 
   useEffect(() => {
-    if (target && primaryTrack) {
+    if (!target) return;
+    setMbResults([]);
+    setStatusMsg(null);
+
+    if (target.mode === 'playlist' && target.playlist) {
+      setPlaylistName(target.playlist.name || '');
+      setPlaylistDescription(target.playlist.description || '');
+      setPlaylistCoverUrl(target.playlist.coverUrl || '');
+      return;
+    }
+
+    if (primaryTrack) {
       setTitle(primaryTrack.title || '');
       setArtist(primaryTrack.artist || '');
       setAlbum(primaryTrack.album || '');
       setYear(primaryTrack.year ? String(primaryTrack.year) : '');
+      setTrackNumber(
+        primaryTrack.trackNumber ? String(primaryTrack.trackNumber) : '1'
+      );
+      setDiscNumber(
+        primaryTrack.discNumber ? String(primaryTrack.discNumber) : '1'
+      );
       setGenre(primaryTrack.genre || 'Music');
+      setCustomCoverImage('');
       setMusicbrainzId(primaryTrack.musicbrainzId || '');
       setAlbumMusicbrainzId(primaryTrack.albumMusicbrainzId || '');
       setArtistMusicbrainzId(primaryTrack.artistMusicbrainzId || '');
-      setMbResults([]);
-      setStatusMsg(null);
     }
   }, [target, primaryTrack]);
 
-  if (!target || !primaryTrack) return null;
+  if (!target) return null;
+  if (!isPlaylistMode && !primaryTrack) return null;
 
-  const isSingleTrack = target.tracks.length === 1;
+  const isSingleTrack = !isPlaylistMode && target.tracks.length === 1;
 
-  const handleSearchMusicBrainz = async () => {
+  const handleImageFileUpload = (
+    e: React.ChangeEvent<HTMLInputElement>,
+    onDataUrl: (dataUrl: string) => void
+  ) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        onDataUrl(reader.result);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Search MusicBrainz using the user's currently typed Song Name + Artist Name and auto-fill the rest!
+  const handleFindAndFillFromTypedFields = async (autoFillBestMatch = true) => {
     setIsSearchingMb(true);
-    setStatusMsg(null);
+    setStatusMsg(
+      'Searching MusicBrainz for official Album, Year, Cover Art & MBIDs...'
+    );
     try {
       const params = new URLSearchParams();
       if (isSingleTrack && title.trim()) params.set('title', title.trim());
       if (artist.trim()) params.set('artist', artist.trim());
-      if (album.trim() && album.trim() !== 'Singles') {
+      if (!isSingleTrack && album.trim() && album.trim() !== 'Singles') {
         params.set('album', album.trim());
       }
       if (!params.toString()) {
@@ -969,7 +1018,28 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
         setMbResults(data.results);
         if (data.results.length === 0) {
           setStatusMsg(
-            'No exact MusicBrainz match found. Try adjusting Artist or Title and searching again.'
+            'No exact MusicBrainz match found. Try adjusting Artist or Song Title and click Find & Auto-Fill again.'
+          );
+        } else if (autoFillBestMatch) {
+          const best = data.results[0];
+          if (isSingleTrack && best.title) setTitle(best.title);
+          if (best.artist) setArtist(best.artist);
+          if (best.album) setAlbum(best.album);
+          if (best.year) setYear(String(best.year));
+          if (isSingleTrack && best.recordingMbid) {
+            setMusicbrainzId(best.recordingMbid);
+          }
+          if (best.releaseMbid) setAlbumMusicbrainzId(best.releaseMbid);
+          if (best.artistMbid) setArtistMusicbrainzId(best.artistMbid);
+          if (best.coverArtUrl) {
+            setCustomCoverImage(
+              best.coverArtUrl.replace('/front-250', '/front-500')
+            );
+          }
+          setStatusMsg(
+            `Auto-filled from "${best.artist} — ${best.title}" (${best.album}${
+              best.year ? `, ${best.year}` : ''
+            }). Click "Save & Write to File(s)" below to permanently save!`
           );
         }
       } else {
@@ -984,30 +1054,43 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
     }
   };
 
-  const handleAutoRefreshMusicBrainz = async () => {
+  const handleSavePlaylistMetadata = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!target.playlist) return;
     setIsSaving(true);
-    setStatusMsg('Querying MusicBrainz & Cover Art Archive...');
+    setStatusMsg(null);
     try {
-      const resp = await fetch('/api/metadata/enrich', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          trackIds: target.tracks.map((t) => t.id),
-        }),
-      });
+      const resp = await fetch(
+        `/api/playlists/${encodeURIComponent(target.playlist.id)}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: playlistName.trim() || target.playlist.name,
+            description: playlistDescription.trim(),
+            coverUrl: playlistCoverUrl.trim() || undefined,
+          }),
+        }
+      );
       const data = await resp.json().catch(() => ({}));
       if (resp.ok && data.ok) {
         onShowToast(
-          `🔗 ${data.message || 'Refreshed metadata & MusicBrainz IDs!'}`
+          `💾 Updated playlist "${playlistName.trim() || target.playlist.name}"!`
         );
+        if (onPlaylistUpdated && data.playlist) {
+          onPlaylistUpdated(
+            data.playlist,
+            Array.isArray(data.playlists) ? data.playlists : undefined
+          );
+        }
         onMetadataUpdated();
         onClose();
       } else {
-        setStatusMsg(data.error || data.message || 'Auto-match failed.');
+        setStatusMsg(data.error || 'Failed to update playlist metadata.');
       }
     } catch (err) {
       setStatusMsg(
-        err instanceof Error ? err.message : 'Failed to auto-refresh metadata.'
+        err instanceof Error ? err.message : 'Failed to save playlist.'
       );
     } finally {
       setIsSaving(false);
@@ -1029,8 +1112,16 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
             artist: artist.trim() || undefined,
             album: album.trim() || undefined,
             year: year.trim() ? Number(year.trim()) : null,
+            trackNumber:
+              isSingleTrack && trackNumber.trim()
+                ? Number(trackNumber.trim())
+                : undefined,
+            discNumber: discNumber.trim() ? Number(discNumber.trim()) : undefined,
             genre: genre.trim() || undefined,
-            musicbrainzId: isSingleTrack ? musicbrainzId.trim() || null : undefined,
+            customCoverImage: customCoverImage.trim() || undefined,
+            musicbrainzId: isSingleTrack
+              ? musicbrainzId.trim() || null
+              : undefined,
             albumMusicbrainzId: albumMusicbrainzId.trim() || null,
             artistMusicbrainzId: artistMusicbrainzId.trim() || null,
           },
@@ -1039,7 +1130,10 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
       const data = await resp.json().catch(() => ({}));
       if (resp.ok && data.ok) {
         onShowToast(
-          `💾 Saved metadata & MusicBrainz IDs for ${target.tracks.length} track(s)!`
+          `💾 ${
+            data.message ||
+            `Saved metadata & wrote file tags for ${target.tracks.length} track(s)!`
+          }`
         );
         onMetadataUpdated();
         onClose();
@@ -1054,6 +1148,172 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
       setIsSaving(false);
     }
   };
+
+  // PLAYLIST METADATA EDITOR VIEW
+  if (isPlaylistMode && target.playlist) {
+    const playlistTracksWithArt = target.tracks.filter(
+      (t) => t.artworkUrl && !t.artworkUrl.startsWith('data:image/svg')
+    );
+
+    return (
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 overflow-y-auto"
+        onClick={onClose}
+      >
+        <div
+          role="dialog"
+          aria-modal="true"
+          data-testid="playlist-metadata-editor-modal"
+          onClick={(e) => e.stopPropagation()}
+          className="w-full max-w-xl rounded-3xl border-2 border-[#00ff66]/60 bg-zinc-950 p-5 sm:p-6 space-y-4 shadow-2xl my-8"
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h3 className="text-base sm:text-lg font-bold text-white font-mono flex items-center gap-2">
+                <Database className="w-5 h-5 text-[#00ff66]" />
+                <span>Edit Playlist Details, Description &amp; Cover Image</span>
+              </h3>
+              <p className="text-xs text-zinc-400 mt-1">
+                Customize the title, description, and cover artwork for{' '}
+                <strong className="text-[#00ff66]">{target.playlist.name}</strong>.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-xl border border-zinc-800 bg-zinc-900 p-2 text-zinc-400 hover:text-white"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          <form onSubmit={handleSavePlaylistMetadata} className="space-y-4">
+            <div className="flex flex-col sm:flex-row items-start gap-4">
+              {/* Cover Image Preview & Upload */}
+              <div className="flex flex-col items-center gap-2 shrink-0">
+                <div className="w-28 h-28 rounded-2xl border-2 border-zinc-700 bg-zinc-900 overflow-hidden flex items-center justify-center shadow-lg">
+                  {playlistCoverUrl ? (
+                    <img
+                      src={playlistCoverUrl}
+                      alt={playlistName}
+                      className="w-full h-full object-cover"
+                    />
+                  ) : (
+                    <Music className="w-10 h-10 text-[#00ff66]" />
+                  )}
+                </div>
+                <label className="cursor-pointer rounded-xl border border-[#00ff66]/50 bg-emerald-950/40 hover:bg-emerald-900/50 px-3 py-1.5 text-[11px] font-mono font-bold text-[#00ff66] text-center">
+                  Upload Image
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={(e) =>
+                      handleImageFileUpload(e, (url) => setPlaylistCoverUrl(url))
+                    }
+                  />
+                </label>
+              </div>
+
+              <div className="flex-1 w-full space-y-3">
+                <div>
+                  <label className="block text-[11px] font-mono text-zinc-300 mb-1">
+                    Playlist Title
+                  </label>
+                  <input
+                    type="text"
+                    value={playlistName}
+                    onChange={(e) => setPlaylistName(e.target.value)}
+                    placeholder="Playlist Name"
+                    className="w-full rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-mono text-zinc-300 mb-1">
+                    Description / Notes
+                  </label>
+                  <textarea
+                    rows={3}
+                    value={playlistDescription}
+                    onChange={(e) => setPlaylistDescription(e.target.value)}
+                    placeholder="Add a description, mood notes, or source info for this playlist..."
+                    className="w-full rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-mono text-zinc-300 mb-1">
+                    Cover Image URL (or upload image on left)
+                  </label>
+                  <input
+                    type="text"
+                    value={playlistCoverUrl}
+                    onChange={(e) => setPlaylistCoverUrl(e.target.value)}
+                    placeholder="https://... or upload an image file"
+                    className="w-full rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {playlistTracksWithArt.length > 0 && (
+              <div className="space-y-1.5">
+                <div className="text-[11px] font-mono text-zinc-400">
+                  Or pick cover artwork from a song in this playlist:
+                </div>
+                <div className="flex items-center gap-2 overflow-x-auto pb-1">
+                  {playlistTracksWithArt.slice(0, 10).map((t) => (
+                    <button
+                      key={`pick-art-${t.id}`}
+                      type="button"
+                      onClick={() => t.artworkUrl && setPlaylistCoverUrl(t.artworkUrl)}
+                      title={`Use cover from ${t.title}`}
+                      className="w-12 h-12 rounded-xl border border-zinc-700 hover:border-[#00ff66] overflow-hidden shrink-0 transition-transform hover:scale-105"
+                    >
+                      <img
+                        src={t.artworkUrl}
+                        alt={t.title}
+                        className="w-full h-full object-cover"
+                      />
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {statusMsg && (
+              <div className="rounded-xl border border-zinc-700 bg-zinc-900 px-3.5 py-2 text-xs font-mono text-[#00ff66]">
+                {statusMsg}
+              </div>
+            )}
+
+            <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-zinc-800">
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-xl border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 px-4 py-2 text-xs font-mono font-semibold text-zinc-300"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={isSaving}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-[#00ff66] hover:bg-emerald-400 disabled:opacity-50 px-5 py-2 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[38px]"
+              >
+                <Check className="w-4 h-4" />
+                <span>Save Playlist Metadata</span>
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
+  // TRACK / ALBUM / ARTIST METADATA EDITOR VIEW
+  const previewCover =
+    customCoverImage || primaryTrack?.artworkUrl || '';
 
   return (
     <div
@@ -1072,18 +1332,19 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
             <h3 className="text-base sm:text-lg font-bold text-white font-mono flex items-center gap-2">
               <Database className="w-5 h-5 text-[#00ff66]" />
               <span>
-                Metadata Inspector &amp; MusicBrainz ID Linker (The IMDb of
-                Music)
+                Edit Metadata, Cover Art &amp; Auto-Fill (Writes to Audio File)
               </span>
             </h3>
             <p className="text-xs text-zinc-300 mt-1">
-              Inspecting{' '}
+              Editing{' '}
               <strong className="text-[#00ff66]">{target.label}</strong> (
               {target.tracks.length} track
-              {target.tracks.length === 1 ? '' : 's'}). MusicBrainz IDs (
-              <code className="text-purple-300">MBID</code>) work just like IMDb
-              IDs for movies — linking exact songs, official albums, release
-              years, and Cover Art Archive artwork!
+              {target.tracks.length === 1 ? '' : 's'}). Enter the{' '}
+              <strong className="text-white">Song Name &amp; Artist</strong> and
+              click <strong className="text-[#00ff66]">Find &amp; Auto-Fill Rest</strong>{' '}
+              to automatically populate Album, Year, Cover Art, and MusicBrainz
+              IDs. Saving embeds tags directly into the audio file on disk so
+              library refreshes keep your changes!
             </p>
           </div>
           <button
@@ -1096,7 +1357,7 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
         </div>
 
         {/* File & Audio Technical Readout */}
-        {isSingleTrack && (
+        {isSingleTrack && primaryTrack && (
           <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-3 text-[11px] font-mono text-zinc-300 space-y-1">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <span>
@@ -1112,7 +1373,10 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
               </span>
             </div>
             {primaryTrack.filePath && (
-              <div className="truncate text-zinc-400" title={primaryTrack.filePath}>
+              <div
+                className="truncate text-zinc-400"
+                title={primaryTrack.filePath}
+              >
                 <strong>Disk Path:</strong>{' '}
                 <code className="text-zinc-200">{primaryTrack.filePath}</code>
               </div>
@@ -1120,36 +1384,33 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
           </div>
         )}
 
-        {/* Quick 1-Click MusicBrainz Lookup Bar */}
+        {/* Quick 1-Click Auto-Fill from Typed Artist + Title */}
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
-            disabled={isSaving}
-            onClick={handleAutoRefreshMusicBrainz}
+            disabled={isSearchingMb || isSaving}
+            onClick={() => handleFindAndFillFromTypedFields(true)}
+            data-testid="btn-metadata-find-and-autofill"
             className="inline-flex items-center gap-1.5 rounded-xl bg-[#00ff66] hover:bg-emerald-400 disabled:opacity-50 px-4 py-2 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[38px]"
           >
-            {isSaving ? (
+            {isSearchingMb ? (
               <Loader2 className="w-4 h-4 animate-spin" />
             ) : (
-              <RefreshCw className="w-4 h-4" />
+              <Sparkles className="w-4 h-4" />
             )}
             <span>
-              1-Click Auto-Match &amp; Pull Official Metadata (MusicBrainz)
+              Find &amp; Auto-Fill Rest from Artist + Song Name (MusicBrainz)
             </span>
           </button>
 
           <button
             type="button"
             disabled={isSearchingMb}
-            onClick={handleSearchMusicBrainz}
+            onClick={() => handleFindAndFillFromTypedFields(false)}
             className="inline-flex items-center gap-1.5 rounded-xl border border-purple-500/50 bg-purple-950/40 hover:bg-purple-900/50 px-3.5 py-2 text-xs font-mono font-bold text-purple-200 transition-colors min-h-[38px]"
           >
-            {isSearchingMb ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            ) : (
-              <Search className="w-3.5 h-3.5" />
-            )}
-            <span>Search MusicBrainz Releases</span>
+            <Search className="w-3.5 h-3.5" />
+            <span>Browse All Releases</span>
           </button>
         </div>
 
@@ -1157,7 +1418,7 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
         {mbResults.length > 0 && (
           <div className="rounded-2xl border border-purple-500/40 bg-zinc-900/90 p-3 space-y-2 max-h-56 overflow-y-auto">
             <div className="text-[11px] font-mono font-bold uppercase text-purple-300">
-              Select a MusicBrainz Match to Populate Tags &amp; MBIDs:
+              Select a MusicBrainz Match to Populate Tags, Cover Art &amp; MBIDs:
             </div>
             {mbResults.map((r) => (
               <div
@@ -1199,8 +1460,13 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
                       if (isSingleTrack) setMusicbrainzId(r.recordingMbid);
                       if (r.releaseMbid) setAlbumMusicbrainzId(r.releaseMbid);
                       if (r.artistMbid) setArtistMusicbrainzId(r.artistMbid);
+                      if (r.coverArtUrl) {
+                        setCustomCoverImage(
+                          r.coverArtUrl.replace('/front-250', '/front-500')
+                        );
+                      }
                       setStatusMsg(
-                        `Loaded match "${r.artist} - ${r.title}" (${r.album}). Click Save below to apply!`
+                        `Loaded match "${r.artist} - ${r.title}" (${r.album}). Click Save below to write to file & database!`
                       );
                     }}
                     className="rounded-lg bg-purple-600 hover:bg-purple-500 px-2.5 py-1.5 text-[11px] font-mono font-bold text-white"
@@ -1213,16 +1479,56 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
           </div>
         )}
 
-        {/* Editable Metadata & MusicBrainz ID Form */}
+        {/* Editable Metadata, Cover Artwork & MusicBrainz ID Form */}
         <form
           onSubmit={handleSaveManualOrSelectedMetadata}
           className="space-y-3"
         >
+          {/* Cover Art Preview + Upload / URL Row */}
+          <div className="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-3 flex flex-col sm:flex-row items-center gap-3.5">
+            <div className="w-20 h-20 rounded-xl border border-zinc-700 bg-zinc-950 overflow-hidden shrink-0 flex items-center justify-center">
+              {previewCover ? (
+                <img
+                  src={previewCover}
+                  alt={title || album}
+                  className="w-full h-full object-cover"
+                />
+              ) : (
+                <Disc className="w-8 h-8 text-zinc-500" />
+              )}
+            </div>
+            <div className="flex-1 w-full space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <label className="text-[11px] font-mono font-bold text-zinc-300">
+                  Album / Song Cover Artwork (URL or Upload Image)
+                </label>
+                <label className="cursor-pointer rounded-lg border border-[#00ff66]/50 bg-emerald-950/40 hover:bg-emerald-900/50 px-2.5 py-1 text-[10px] font-mono font-bold text-[#00ff66]">
+                  Upload Cover Image
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={(e) =>
+                      handleImageFileUpload(e, (url) => setCustomCoverImage(url))
+                    }
+                  />
+                </label>
+              </div>
+              <input
+                type="text"
+                value={customCoverImage}
+                onChange={(e) => setCustomCoverImage(e.target.value)}
+                placeholder="Paste image URL (https://...) or click Upload Cover Image"
+                className="w-full rounded-xl border border-zinc-700 bg-zinc-950 px-3 py-1.5 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+              />
+            </div>
+          </div>
+
           <div className="grid grid-cols-1 sm:grid-cols-12 gap-3">
             {isSingleTrack && (
               <div className="sm:col-span-6">
-                <label className="block text-[11px] font-mono text-zinc-400 mb-1">
-                  Track Title
+                <label className="block text-[11px] font-mono text-zinc-300 mb-1">
+                  Song Title
                 </label>
                 <input
                   type="text"
@@ -1234,7 +1540,7 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
             )}
 
             <div className={isSingleTrack ? 'sm:col-span-6' : 'sm:col-span-6'}>
-              <label className="block text-[11px] font-mono text-zinc-400 mb-1">
+              <label className="block text-[11px] font-mono text-zinc-300 mb-1">
                 Artist Name
               </label>
               <input
@@ -1245,8 +1551,8 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
               />
             </div>
 
-            <div className="sm:col-span-6">
-              <label className="block text-[11px] font-mono text-zinc-400 mb-1">
+            <div className="sm:col-span-5">
+              <label className="block text-[11px] font-mono text-zinc-300 mb-1">
                 Album Title
               </label>
               <input
@@ -1257,9 +1563,9 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
               />
             </div>
 
-            <div className="sm:col-span-3">
-              <label className="block text-[11px] font-mono text-zinc-400 mb-1">
-                Release Year
+            <div className="sm:col-span-2">
+              <label className="block text-[11px] font-mono text-zinc-300 mb-1">
+                Year
               </label>
               <input
                 type="number"
@@ -1270,8 +1576,23 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
               />
             </div>
 
-            <div className="sm:col-span-3">
-              <label className="block text-[11px] font-mono text-zinc-400 mb-1">
+            {isSingleTrack && (
+              <div className="sm:col-span-2">
+                <label className="block text-[11px] font-mono text-zinc-300 mb-1">
+                  Track #
+                </label>
+                <input
+                  type="number"
+                  value={trackNumber}
+                  onChange={(e) => setTrackNumber(e.target.value)}
+                  placeholder="1"
+                  className="w-full rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+                />
+              </div>
+            )}
+
+            <div className={isSingleTrack ? 'sm:col-span-3' : 'sm:col-span-5'}>
+              <label className="block text-[11px] font-mono text-zinc-300 mb-1">
                 Genre
               </label>
               <input
@@ -1380,10 +1701,15 @@ export const MetadataInspectorModal: React.FC<MetadataInspectorModalProps> = ({
             <button
               type="submit"
               disabled={isSaving}
+              data-testid="btn-save-metadata-to-file"
               className="inline-flex items-center gap-1.5 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:opacity-50 px-4 py-2 text-xs font-mono font-bold text-white transition-colors min-h-[38px]"
             >
-              <Check className="w-4 h-4" />
-              <span>Save Metadata &amp; MBIDs</span>
+              {isSaving ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Check className="w-4 h-4" />
+              )}
+              <span>Save &amp; Write to Audio File(s)</span>
             </button>
           </div>
         </form>

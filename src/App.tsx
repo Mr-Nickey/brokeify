@@ -17,6 +17,7 @@ import {
   Database,
   Disc,
   Gauge,
+  GripVertical,
   History,
   Link2,
   ListMusic,
@@ -344,12 +345,19 @@ export default function App() {
   const [isLeftSidebarCollapsed, setIsLeftSidebarCollapsed] = useState<boolean>(
     () => {
       try {
+        if (typeof window !== 'undefined' && window.innerWidth < 1100) {
+          return true;
+        }
         return localStorage.getItem('brokeify_left_sidebar_collapsed_v1') === '1';
       } catch {
         return false;
       }
     }
   );
+  const [windowWidth, setWindowWidth] = useState<number>(() =>
+    typeof window !== 'undefined' ? window.innerWidth : 1440
+  );
+  const userManuallyCollapsedSidebarRef = useRef<boolean | null>(null);
   const [leftSidebarWidth, setLeftSidebarWidth] = useState<number>(() => {
     try {
       const saved = Number(
@@ -364,6 +372,14 @@ export default function App() {
   const isResizingLeftSidebarRef = useRef<boolean>(false);
   const [isLeftQueueExpanded, setIsLeftQueueExpanded] =
     useState<boolean>(false);
+  const [draggedQueueIndex, setDraggedQueueIndex] = useState<number | null>(
+    null
+  );
+  const [dragOverQueueIndex, setDragOverQueueIndex] = useState<number | null>(
+    null
+  );
+  const leftQueueScrollRef = useRef<HTMLDivElement | null>(null);
+  const [hasVisitedFilesTab, setHasVisitedFilesTab] = useState<boolean>(false);
 
   // Report Wrong Track & Smart Re-Grab Modal target
   const [reportWrongTrackTarget, setReportWrongTrackTarget] = useState<{
@@ -1022,11 +1038,46 @@ export default function App() {
     return () => clearInterval(timer);
   }, [syncPersistentNotificationsFromServer]);
 
-  // Left Sidebar drag-resize listener
+  // Track when Files & Organizer tab has been opened so it stays mounted for instant 0ms tab switching
+  useEffect(() => {
+    if (activeTab === 'files') {
+      setHasVisitedFilesTab(true);
+    }
+  }, [activeTab]);
+
+  // Responsive window resize listener: auto-collapse left sidebar when window gets smaller (< 1100px) without stacking library underneath
+  useEffect(() => {
+    const handleResize = () => {
+      const w = window.innerWidth;
+      setWindowWidth(w);
+      if (w < 1100) {
+        setIsLeftSidebarCollapsed(true);
+      } else if (
+        w >= 1120 &&
+        userManuallyCollapsedSidebarRef.current !== true
+      ) {
+        setIsLeftSidebarCollapsed(false);
+      }
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  // Left Sidebar drag-resize listener (also supports dragging all the way left to snap-collapse)
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
       if (!isResizingLeftSidebarRef.current) return;
-      const nextWidth = Math.min(540, Math.max(240, e.clientX - 24));
+      if (e.clientX < 130) {
+        setIsLeftSidebarCollapsed(true);
+        userManuallyCollapsedSidebarRef.current = true;
+        return;
+      }
+      if (isLeftSidebarCollapsed && e.clientX >= 180) {
+        setIsLeftSidebarCollapsed(false);
+        userManuallyCollapsedSidebarRef.current = false;
+      }
+      const maxAllowed = Math.min(540, Math.max(240, Math.floor(window.innerWidth * 0.42)));
+      const nextWidth = Math.min(maxAllowed, Math.max(230, e.clientX - 24));
       setLeftSidebarWidth(nextWidth);
       try {
         localStorage.setItem(
@@ -1046,7 +1097,7 @@ export default function App() {
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
     };
-  }, []);
+  }, [isLeftSidebarCollapsed]);
 
   const handleMarkNotificationsRead = useCallback((ids: string[]) => {
     const idSet = new Set(ids);
@@ -1191,6 +1242,13 @@ export default function App() {
   );
 
   const audio = useAudioEngine(allTracks);
+
+  // Auto-scroll Up Next Queue to top when the current song advances
+  useEffect(() => {
+    if (leftQueueScrollRef.current) {
+      leftQueueScrollRef.current.scrollTop = 0;
+    }
+  }, [audio.currentIndex]);
 
   // Global Keyboard Shortcut Listener (Space = Play/Pause, J/ArrowLeft = -10s, K/L/ArrowRight = +10s, M = Mute)
   useEffect(() => {
@@ -2880,17 +2938,18 @@ export default function App() {
               <Lock className="w-4 h-4" />
             </button>
 
-            {/* Cool Car Emoji Icon-Only Button */}
+            {/* High-Visibility Standout Car Mode Button */}
             <button
               type="button"
               onClick={() => setIsCarModeOpen(true)}
               data-testid="navbar-carmode-btn"
               aria-label="Launch Car Driving Mode"
               title="Launch 1-Tap Car Driving Mode"
-              className="inline-flex items-center justify-center rounded-xl border border-[#00ff66]/60 bg-[#00ff66]/15 hover:bg-[#00ff66] text-base px-2.5 py-1.5 transition-colors min-h-[36px] min-w-[38px]"
+              className="inline-flex items-center justify-center gap-1.5 rounded-xl border-2 border-[#00ff66] bg-[#00ff66] hover:bg-emerald-400 text-zinc-950 font-mono font-extrabold text-xs px-3 py-1.5 shadow-[0_0_14px_rgba(0,255,102,0.45)] transition-all hover:scale-105 min-h-[36px]"
             >
-              <span role="img" aria-label="Car Mode">
-                🏎️
+              <Car className="w-5 h-5 stroke-[2.4] shrink-0" />
+              <span className="hidden sm:inline tracking-wider uppercase">
+                Car
               </span>
             </button>
 
@@ -2964,22 +3023,27 @@ export default function App() {
           )}
 
         {/* =====================================================================
-            TAB 1: LIBRARY (SPOTIFY-INSPIRED WORKSPACE: RESIZABLE LEFT SIDEBAR WITH NOW PLAYING + PLAYLISTS & CENTER STAGE)
+            TAB 1: LIBRARY (ALWAYS SIDE-BY-SIDE FLEX-ROW: AUTO-COLLAPSING LEFT SIDEBAR + CENTER STAGE)
            ===================================================================== */}
         {activeTab === 'library' && (
-          <div className="flex flex-col xl:flex-row items-start gap-3">
-            {/* LEFT SIDEBAR: UNIFIED NOW PLAYING + EXPANDABLE QUEUE + PLAYLISTS + RESIZE SLIDER */}
+          <div className="flex flex-row items-start gap-2.5 sm:gap-3">
+            {/* LEFT SIDEBAR: AUTO-COLLAPSES ON SMALLER WINDOWS, NEVER PUSHES LIBRARY DOWN BELOW */}
             <aside
               data-testid="left-playlists-sidebar"
               style={
                 isLeftSidebarCollapsed
-                  ? { width: '64px' }
-                  : { width: `${leftSidebarWidth}px` }
+                  ? { width: '58px' }
+                  : {
+                      width: `${Math.min(
+                        leftSidebarWidth,
+                        Math.max(220, Math.floor(windowWidth * 0.38))
+                      )}px`,
+                    }
               }
-              className="hidden lg:flex shrink-0 items-stretch relative"
+              className="flex shrink-0 items-stretch relative transition-[width] duration-150 ease-out"
             >
               <div className="flex-1 min-w-0 winamp-bezel rounded-2xl border border-zinc-700/80 overflow-hidden flex flex-col">
-                <div className="winamp-titlebar px-3 py-2.5 border-b border-zinc-800 flex items-center justify-between gap-2">
+                <div className="winamp-titlebar px-2.5 py-2.5 border-b border-zinc-800 flex items-center justify-between gap-2">
                   {!isLeftSidebarCollapsed && (
                     <div className="flex items-center gap-2 min-w-0">
                       <ListMusic className="w-4 h-4 text-[#00ff66] shrink-0" />
@@ -2993,6 +3057,7 @@ export default function App() {
                     onClick={() => {
                       setIsLeftSidebarCollapsed((prev) => {
                         const next = !prev;
+                        userManuallyCollapsedSidebarRef.current = next;
                         try {
                           localStorage.setItem(
                             'brokeify_left_sidebar_collapsed_v1',
@@ -3019,9 +3084,110 @@ export default function App() {
                   </button>
                 </div>
 
-                {!isLeftSidebarCollapsed && (
+                {/* COLLAPSED ICON RAIL (WHEN WINDOW IS SMALL OR COLLAPSED) */}
+                {isLeftSidebarCollapsed ? (
+                  <div className="p-1.5 flex flex-col items-center gap-2 max-h-[82vh] overflow-y-auto">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsLeftSidebarCollapsed(false);
+                        userManuallyCollapsedSidebarRef.current = false;
+                        setIsLeftQueueExpanded(true);
+                      }}
+                      title={
+                        audio.currentTrack
+                          ? `Now Playing: ${audio.currentTrack.title} — ${audio.currentTrack.artist} (Click to view Queue)`
+                          : 'Open Player & Queue'
+                      }
+                      className="w-10 h-10 rounded-xl border border-emerald-500/50 bg-zinc-950 flex items-center justify-center overflow-hidden shadow-md hover:border-[#00ff66]"
+                    >
+                      {audio.currentTrack ? (
+                        <CachedArtworkImage
+                          src={audio.currentTrack.artworkUrl}
+                          alt={audio.currentTrack.title}
+                          fallbackTitle={audio.currentTrack.title}
+                          fallbackArtist={audio.currentTrack.artist}
+                          fallbackAccent={
+                            audio.currentTrack.accentColor || '#10b981'
+                          }
+                          className="w-full h-full object-cover"
+                        />
+                      ) : (
+                        <Radio className="w-4 h-4 text-[#00ff66]" />
+                      )}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedPlaylistId(null);
+                        setLibrarySubTab('liked');
+                      }}
+                      title={`Liked Songs (${likedTracks.length})`}
+                      className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-colors ${
+                        librarySubTab === 'liked'
+                          ? 'border-rose-500 bg-rose-500/20 text-rose-400'
+                          : 'border-zinc-800 bg-zinc-900/80 text-rose-400 hover:border-rose-500/50'
+                      }`}
+                    >
+                      <Heart className="w-4 h-4 fill-rose-500 text-rose-400" />
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleBackToPlaylists}
+                      title={`All Playlists (${visiblePlaylists.length})`}
+                      className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-colors ${
+                        librarySubTab === 'playlists' && !selectedPlaylistId
+                          ? 'border-[#00ff66] bg-[#00ff66]/15 text-[#00ff66]'
+                          : 'border-zinc-800 bg-zinc-900/80 text-zinc-300 hover:text-white'
+                      }`}
+                    >
+                      <ListMusic className="w-4 h-4" />
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedPlaylistId(null);
+                        setLibrarySubTab('songs');
+                      }}
+                      title={`All Songs (${allTracks.length})`}
+                      className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-colors ${
+                        librarySubTab === 'songs'
+                          ? 'border-[#00ff66] bg-[#00ff66]/15 text-[#00ff66]'
+                          : 'border-zinc-800 bg-zinc-900/80 text-zinc-300 hover:text-white'
+                      }`}
+                    >
+                      <Music className="w-4 h-4" />
+                    </button>
+
+                    <div className="w-7 border-t border-zinc-800 my-0.5" />
+
+                    {visiblePlaylists.slice(0, 12).map((pl) => {
+                      const isSelected =
+                        librarySubTab === 'playlists' &&
+                        selectedPlaylistId === pl.id;
+                      return (
+                        <button
+                          key={`rail-${pl.id}`}
+                          type="button"
+                          onClick={() => handleOpenPlaylist(pl)}
+                          title={`${pl.name} (${getTracksForPlaylist(pl).length} tracks)`}
+                          className={`w-9 h-9 rounded-xl border text-[11px] font-mono font-bold flex items-center justify-center shrink-0 transition-colors ${
+                            isSelected
+                              ? 'border-[#00ff66] bg-[#00ff66] text-zinc-950'
+                              : 'border-zinc-800 bg-zinc-900/90 text-zinc-300 hover:border-zinc-600 hover:text-white'
+                          }`}
+                        >
+                          {pl.name.slice(0, 2).toUpperCase()}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : (
                   <div className="p-2.5 space-y-2.5 max-h-[82vh] overflow-y-auto">
-                    {/* TOP OF LEFT SIDEBAR: NOW PLAYING CARD + EXPANDABLE UP NEXT QUEUE */}
+                    {/* TOP OF LEFT SIDEBAR: NOW PLAYING CARD + EXPANDABLE 15-TRACK AUTO-SCROLLING QUEUE */}
                     <div
                       data-testid="left-sidebar-nowplaying-card"
                       className="rounded-xl border border-zinc-800 bg-zinc-950/90 p-2.5 space-y-2.5"
@@ -3047,14 +3213,24 @@ export default function App() {
                               setIsLeftQueueExpanded((prev) => !prev)
                             }
                             data-testid="btn-toggle-left-queue"
-                            title="Expand or collapse Up Next Queue"
+                            title="Expand or collapse Up Next Queue (shows current 15 tracks)"
                             className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-bold transition-colors ${
                               isLeftQueueExpanded
                                 ? 'bg-[#00ff66] text-zinc-950'
                                 : 'bg-zinc-900 text-zinc-300 hover:text-white'
                             }`}
                           >
-                            <span>Queue ({audio.queue.length})</span>
+                            <span>
+                              Queue (
+                              {Math.min(
+                                15,
+                                Math.max(
+                                  0,
+                                  audio.queue.length - audio.currentIndex
+                                )
+                              )}
+                              )
+                            </span>
                             {isLeftQueueExpanded ? (
                               <ChevronUp className="w-3 h-3" />
                             ) : (
@@ -3114,6 +3290,23 @@ export default function App() {
                               type="button"
                               onClick={() =>
                                 audio.currentTrack &&
+                                setMetadataModalTarget({
+                                  mode: 'track',
+                                  label: `Track: "${audio.currentTrack.title}"`,
+                                  tracks: [audio.currentTrack],
+                                })
+                              }
+                              title="Edit Song Metadata & Cover Art"
+                              className="inline-flex items-center gap-1 rounded-lg border border-purple-500/40 bg-purple-950/35 hover:bg-purple-900/50 px-2 py-1 text-[10px] font-mono font-bold text-purple-300"
+                            >
+                              <Pencil className="w-3 h-3 text-purple-400" />
+                              <span>Edit Tag</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() =>
+                                audio.currentTrack &&
                                 setReportWrongTrackTarget({
                                   track: audio.currentTrack,
                                   playlistId: selectedPlaylistId,
@@ -3133,14 +3326,15 @@ export default function App() {
                         </div>
                       )}
 
-                      {/* Expandable Downward Up Next Queue */}
+                      {/* Expandable Downward 15-Track Auto-Scrolling Up Next Queue (Drag & Drop + Play Next + Remove) */}
                       {isLeftQueueExpanded && (
                         <div
+                          ref={leftQueueScrollRef}
                           data-testid="left-sidebar-expanded-queue"
-                          className="pt-2 border-t border-zinc-800/80 space-y-1 max-h-[260px] overflow-y-auto divide-y divide-zinc-800/40"
+                          className="pt-2 border-t border-zinc-800/80 space-y-1 max-h-[290px] overflow-y-auto divide-y divide-zinc-800/40"
                         >
                           <div className="flex items-center justify-between text-[10px] font-mono uppercase text-zinc-400 pb-1">
-                            <span>Up Next Queue</span>
+                            <span>Next 15 Tracks (Drag to Reorder)</span>
                             <div className="flex items-center gap-1">
                               <button
                                 type="button"
@@ -3165,57 +3359,124 @@ export default function App() {
                               </button>
                             </div>
                           </div>
-                          {audio.queue.slice(0, 40).map((qTrack, idx) => {
-                            const isCurrent = idx === audio.currentIndex;
-                            return (
-                              <div
-                                key={`left-q-${qTrack.id}-${idx}`}
-                                className={`py-1.5 px-1.5 rounded-lg flex items-center justify-between gap-1.5 text-[11px] font-mono ${
-                                  isCurrent
-                                    ? 'bg-emerald-500/15 border border-emerald-500/40'
-                                    : 'hover:bg-zinc-900/60'
-                                }`}
-                              >
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    isCurrent
-                                      ? audio.togglePlayPause()
-                                      : audio.playSpecificTrack(
-                                          qTrack,
-                                          audio.queue
-                                        )
-                                  }
-                                  className="min-w-0 flex-1 text-left"
+                          {audio.queue
+                            .slice(audio.currentIndex, audio.currentIndex + 15)
+                            .map((qTrack, offsetIdx) => {
+                              const realQueueIdx =
+                                audio.currentIndex + offsetIdx;
+                              const isCurrent = offsetIdx === 0;
+                              const isDragOver =
+                                dragOverQueueIndex === realQueueIdx;
+                              return (
+                                <div
+                                  key={`left-q-${qTrack.id}-${realQueueIdx}`}
+                                  draggable
+                                  onDragStart={(e) => {
+                                    setDraggedQueueIndex(realQueueIdx);
+                                    e.dataTransfer.effectAllowed = 'move';
+                                  }}
+                                  onDragOver={(e) => {
+                                    e.preventDefault();
+                                    if (dragOverQueueIndex !== realQueueIdx) {
+                                      setDragOverQueueIndex(realQueueIdx);
+                                    }
+                                  }}
+                                  onDragLeave={() => {
+                                    if (dragOverQueueIndex === realQueueIdx) {
+                                      setDragOverQueueIndex(null);
+                                    }
+                                  }}
+                                  onDrop={(e) => {
+                                    e.preventDefault();
+                                    if (
+                                      draggedQueueIndex !== null &&
+                                      draggedQueueIndex !== realQueueIdx
+                                    ) {
+                                      audio.reorderQueue(
+                                        draggedQueueIndex,
+                                        realQueueIdx
+                                      );
+                                    }
+                                    setDraggedQueueIndex(null);
+                                    setDragOverQueueIndex(null);
+                                  }}
+                                  onDragEnd={() => {
+                                    setDraggedQueueIndex(null);
+                                    setDragOverQueueIndex(null);
+                                  }}
+                                  className={`py-1.5 px-1.5 rounded-lg flex items-center justify-between gap-1 text-[11px] font-mono transition-colors ${
+                                    isDragOver
+                                      ? 'border border-[#00ff66] bg-[#00ff66]/20'
+                                      : isCurrent
+                                        ? 'bg-emerald-500/15 border border-emerald-500/40'
+                                        : 'hover:bg-zinc-900/60'
+                                  }`}
                                 >
-                                  <div
-                                    className={`truncate font-semibold ${
-                                      isCurrent ? 'text-[#00ff66]' : 'text-white'
-                                    }`}
+                                  <span
+                                    title="Drag to reorder in queue"
+                                    className="cursor-grab active:cursor-grabbing text-zinc-600 hover:text-zinc-300 shrink-0"
                                   >
-                                    {isCurrent ? '▶ ' : `${idx + 1}. `}
-                                    {qTrack.title}
-                                  </div>
-                                  <div className="text-[10px] text-zinc-400 truncate">
-                                    {qTrack.artist}
-                                  </div>
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setReportWrongTrackTarget({
-                                      track: qTrack,
-                                      playlistId: selectedPlaylistId,
-                                    })
-                                  }
-                                  title="Report Wrong Song"
-                                  className="p-1 rounded text-zinc-500 hover:text-amber-400 shrink-0"
-                                >
-                                  <Flag className="w-3 h-3" />
-                                </button>
-                              </div>
-                            );
-                          })}
+                                    <GripVertical className="w-3 h-3" />
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      isCurrent
+                                        ? audio.togglePlayPause()
+                                        : audio.playSpecificTrack(
+                                            qTrack,
+                                            audio.queue
+                                          )
+                                    }
+                                    className="min-w-0 flex-1 text-left"
+                                  >
+                                    <div
+                                      className={`truncate font-semibold ${
+                                        isCurrent
+                                          ? 'text-[#00ff66]'
+                                          : 'text-white'
+                                      }`}
+                                    >
+                                      {isCurrent
+                                        ? '▶ NOW: '
+                                        : `${offsetIdx}. `}
+                                      {qTrack.title}
+                                    </div>
+                                    <div className="text-[10px] text-zinc-400 truncate">
+                                      {qTrack.artist}
+                                    </div>
+                                  </button>
+
+                                  {!isCurrent && offsetIdx > 1 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        audio.moveTrackPlayNext(realQueueIdx);
+                                        setToastMessage(
+                                          `⏭️ Moved "${qTrack.title}" to Play Next`
+                                        );
+                                      }}
+                                      title="Move to Play Next (#1 in Queue)"
+                                      className="p-1 rounded text-zinc-500 hover:text-[#00ff66] shrink-0"
+                                    >
+                                      <SkipForward className="w-3 h-3" />
+                                    </button>
+                                  )}
+
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      audio.removeFromQueue(realQueueIdx)
+                                    }
+                                    title="Remove from Queue"
+                                    data-testid={`remove-from-queue-${realQueueIdx}`}
+                                    className="p-1 rounded text-zinc-500 hover:text-rose-400 shrink-0"
+                                  >
+                                    <X className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              );
+                            })}
                         </div>
                       )}
                     </div>
@@ -3299,22 +3560,20 @@ export default function App() {
               </div>
 
               {/* Right-Edge Drag Resize Slider for Left Sidebar */}
-              {!isLeftSidebarCollapsed && (
-                <div
-                  role="separator"
-                  aria-orientation="vertical"
-                  aria-label="Slide left or right to resize Library & Now Playing sidebar"
-                  title="Drag left or right to resize sidebar"
-                  data-testid="left-sidebar-resize-slider"
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    isResizingLeftSidebarRef.current = true;
-                  }}
-                  className="w-2.5 cursor-col-resize group flex items-center justify-center ml-1"
-                >
-                  <div className="w-1 h-20 rounded-full bg-zinc-700 group-hover:bg-[#00ff66] transition-colors" />
-                </div>
-              )}
+              <div
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Slide left or right to resize Library & Now Playing sidebar"
+                title="Drag left or right to resize sidebar (drag far left to collapse)"
+                data-testid="left-sidebar-resize-slider"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  isResizingLeftSidebarRef.current = true;
+                }}
+                className="w-2.5 cursor-col-resize group flex items-center justify-center ml-1"
+              >
+                <div className="w-1 h-20 rounded-full bg-zinc-700 group-hover:bg-[#00ff66] transition-colors" />
+              </div>
             </aside>
 
             {/* CENTER STAGE: COLLAPSIBLE QUICK LAUNCH + MADE FOR YOU + LIBRARY SUB-TABS */}
@@ -3968,6 +4227,22 @@ export default function App() {
                   onReportWrongTrack={(track, plId) =>
                     setReportWrongTrackTarget({ track, playlistId: plId })
                   }
+                  onOpenEditPlaylistMetadata={(pl) => {
+                    setMetadataModalTarget({
+                      mode: 'playlist',
+                      label: `Playlist: "${pl.name}"`,
+                      tracks: getTracksForPlaylist(pl),
+                      playlist: pl,
+                    });
+                  }}
+                  onQueueTrackNext={(track) => {
+                    audio.queueTrackNext(track);
+                    setToastMessage(`⏭️ Queued "${track.title}" to Play Next`);
+                  }}
+                  onAddTrackToQueue={(track) => {
+                    audio.addTrackToQueue(track);
+                    setToastMessage(`➕ Added "${track.title}" to Queue`);
+                  }}
                 />
               ) : (
                 <section aria-label="Unified Playlists Grid" className="space-y-5">
@@ -4251,6 +4526,24 @@ export default function App() {
                                     data-testid={`playlist-dropdown-menu-${pl.id}`}
                                     className="absolute right-0 top-10 z-30 w-56 rounded-2xl border border-zinc-700 bg-zinc-950/95 p-1.5 shadow-2xl backdrop-blur-md space-y-1 text-xs font-mono"
                                   >
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setMetadataModalTarget({
+                                          mode: 'playlist',
+                                          label: `Playlist: "${pl.name}"`,
+                                          tracks: getTracksForPlaylist(pl),
+                                          playlist: pl,
+                                        });
+                                        setOpenMenuPlaylistId(null);
+                                      }}
+                                      data-testid={`edit-playlist-metadata-btn-${pl.id}`}
+                                      className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-[#00ff66]"
+                                    >
+                                      <Database className="w-3.5 h-3.5 text-[#00ff66]" />
+                                      <span>Edit Image &amp; Description</span>
+                                    </button>
+
                                     <button
                                       type="button"
                                       onClick={() =>
@@ -5073,6 +5366,36 @@ export default function App() {
                                     <button
                                       type="button"
                                       onClick={() => {
+                                        audio.queueTrackNext(track);
+                                        setToastMessage(
+                                          `⏭️ Queued "${track.title}" to Play Next`
+                                        );
+                                        setOpenMenuSongId(null);
+                                      }}
+                                      className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-[#00ff66]"
+                                    >
+                                      <SkipForward className="w-3.5 h-3.5 text-[#00ff66]" />
+                                      <span>Play Next in Queue</span>
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        audio.addTrackToQueue(track);
+                                        setToastMessage(
+                                          `➕ Added "${track.title}" to Queue`
+                                        );
+                                        setOpenMenuSongId(null);
+                                      }}
+                                      className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-[#00ff66]"
+                                    >
+                                      <ListPlus className="w-3.5 h-3.5 text-[#00ff66]" />
+                                      <span>Add to Queue</span>
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      onClick={() => {
                                         handleStartTrackRadio(track);
                                         setOpenMenuSongId(null);
                                       }}
@@ -5095,7 +5418,7 @@ export default function App() {
                                       className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-zinc-200 hover:bg-zinc-900 hover:text-purple-300"
                                     >
                                       <Sparkles className="w-3.5 h-3.5 text-purple-400" />
-                                      <span>Check Metadata (MBID)</span>
+                                      <span>Edit Metadata &amp; Auto-Fill</span>
                                     </button>
 
                                     <button
@@ -5710,10 +6033,10 @@ export default function App() {
         )}
 
         {/* =====================================================================
-            TAB 1A: DEDICATED FILES & LIBRARY ORGANIZER + STORAGE STATS + 24H CRON + CLEANUP
+            TAB 1A: DEDICATED FILES & LIBRARY ORGANIZER (KEPT MOUNTED ONCE VISITED FOR 0MS INSTANT TAB SWITCHING)
            ===================================================================== */}
-        {activeTab === 'files' && (
-          <div className="space-y-6">
+        {(activeTab === 'files' || hasVisitedFilesTab) && (
+          <div className={activeTab === 'files' ? 'space-y-6' : 'hidden'}>
             <FileAndTagManagerView
               onLibraryChanged={() => syncJellyfinProvider()}
               onNotify={(msg) => setToastMessage(msg)}
@@ -6245,119 +6568,190 @@ export default function App() {
                 </div>
 
                 <div className="divide-y divide-zinc-800/60 max-h-[420px] overflow-y-auto pr-1">
-                  {audio.queue.map((qTrack, idx) => {
-                    const isCurrent = idx === audio.currentIndex;
-                    const isCached = audio.cachedTrackIds.has(qTrack.id);
-                    const isPreloading = audio.preloadingTrackIds.has(
-                      qTrack.id
-                    );
+                  {audio.queue
+                    .slice(audio.currentIndex, audio.currentIndex + 15)
+                    .map((qTrack, offsetIdx) => {
+                      const realIdx = audio.currentIndex + offsetIdx;
+                      const isCurrent = offsetIdx === 0;
+                      const isCached = audio.cachedTrackIds.has(qTrack.id);
+                      const isPreloading = audio.preloadingTrackIds.has(
+                        qTrack.id
+                      );
 
-                    return (
-                      <div
-                        key={`${qTrack.id}-np-${idx}`}
-                        className={`py-2.5 px-2.5 rounded-xl flex items-center justify-between gap-2 transition-colors ${
-                          isCurrent
-                            ? 'bg-emerald-500/15 border border-emerald-500/40'
-                            : 'hover:bg-zinc-900/60'
-                        }`}
-                      >
-                        <div className="min-w-0 flex-1">
-                          <div className="text-xs font-mono font-semibold text-white truncate flex items-center gap-1.5">
-                            {isCurrent ? (
-                              <span className="inline-flex items-center gap-1 text-[#00ff66] font-bold">
-                                <span
-                                  className={`w-2 h-2 rounded-full bg-[#00ff66] ${
-                                    audio.isPlaying ? 'animate-pulse' : ''
-                                  }`}
-                                />
-                                NOW:
-                              </span>
-                            ) : (
-                              <span className="text-zinc-500">
-                                {String(idx + 1).padStart(2, '0')}.
-                              </span>
-                            )}
-                            <span className={isCurrent ? 'text-[#00ff66]' : 'text-white'}>
-                              {qTrack.title}
-                            </span>
-                          </div>
-                          <div className="text-[11px] text-zinc-400 flex items-center gap-1.5 mt-0.5">
-                            <span className="truncate">{qTrack.artist}</span>
-                            <span>·</span>
-                            {isPreloading ? (
-                              <span className="text-amber-300 font-mono">
-                                Pre-loading...
-                              </span>
-                            ) : isCached ? (
-                              <span className="text-[#00ff66] font-mono font-semibold">
-                                Pre-Loaded &amp; Ready
-                              </span>
-                            ) : (
-                              <span className="font-mono">
-                                {qTrack.sourceName}
-                              </span>
-                            )}
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-1.5 shrink-0">
-                          <button
-                            type="button"
-                            onClick={() => handleToggleLikeTrack(qTrack)}
-                            aria-label={
-                              likedTrackIds.has(qTrack.id)
-                                ? `Unlike ${qTrack.title}`
-                                : `Like ${qTrack.title}`
+                      return (
+                        <div
+                          key={`${qTrack.id}-np-${realIdx}`}
+                          draggable
+                          onDragStart={(e) => {
+                            setDraggedQueueIndex(realIdx);
+                            e.dataTransfer.effectAllowed = 'move';
+                          }}
+                          onDragOver={(e) => {
+                            e.preventDefault();
+                            if (dragOverQueueIndex !== realIdx) {
+                              setDragOverQueueIndex(realIdx);
                             }
-                            className={`p-1.5 rounded-lg border transition-colors min-h-[32px] min-w-[32px] flex items-center justify-center ${
-                              likedTrackIds.has(qTrack.id)
-                                ? 'border-rose-500/50 bg-rose-500/15 text-rose-400'
-                                : 'border-zinc-800 bg-zinc-950 text-zinc-500 hover:text-rose-400'
-                            }`}
+                          }}
+                          onDrop={(e) => {
+                            e.preventDefault();
+                            if (
+                              draggedQueueIndex !== null &&
+                              draggedQueueIndex !== realIdx
+                            ) {
+                              audio.reorderQueue(draggedQueueIndex, realIdx);
+                            }
+                            setDraggedQueueIndex(null);
+                            setDragOverQueueIndex(null);
+                          }}
+                          onDragEnd={() => {
+                            setDraggedQueueIndex(null);
+                            setDragOverQueueIndex(null);
+                          }}
+                          className={`py-2.5 px-2.5 rounded-xl flex items-center justify-between gap-2 transition-colors ${
+                            dragOverQueueIndex === realIdx
+                              ? 'border border-[#00ff66] bg-[#00ff66]/20'
+                              : isCurrent
+                                ? 'bg-emerald-500/15 border border-emerald-500/40'
+                                : 'hover:bg-zinc-900/60'
+                          }`}
+                        >
+                          <span
+                            title="Drag to reorder in queue"
+                            className="cursor-grab active:cursor-grabbing text-zinc-600 hover:text-zinc-300 shrink-0"
                           >
-                            <Heart
-                              className={`w-3.5 h-3.5 ${
-                                likedTrackIds.has(qTrack.id)
-                                  ? 'fill-rose-500 text-rose-400'
-                                  : ''
-                              }`}
-                            />
-                          </button>
+                            <GripVertical className="w-4 h-4" />
+                          </span>
+                          <div className="min-w-0 flex-1">
+                            <div className="text-xs font-mono font-semibold text-white truncate flex items-center gap-1.5">
+                              {isCurrent ? (
+                                <span className="inline-flex items-center gap-1 text-[#00ff66] font-bold">
+                                  <span
+                                    className={`w-2 h-2 rounded-full bg-[#00ff66] ${
+                                      audio.isPlaying ? 'animate-pulse' : ''
+                                    }`}
+                                  />
+                                  NOW:
+                                </span>
+                              ) : (
+                                <span className="text-zinc-500">
+                                  {String(offsetIdx).padStart(2, '0')}.
+                                </span>
+                              )}
+                              <span
+                                className={
+                                  isCurrent ? 'text-[#00ff66]' : 'text-white'
+                                }
+                              >
+                                {qTrack.title}
+                              </span>
+                            </div>
+                            <div className="text-[11px] text-zinc-400 flex items-center gap-1.5 mt-0.5">
+                              <span className="truncate">{qTrack.artist}</span>
+                              <span>·</span>
+                              {isPreloading ? (
+                                <span className="text-amber-300 font-mono">
+                                  Pre-loading...
+                                </span>
+                              ) : isCached ? (
+                                <span className="text-[#00ff66] font-mono font-semibold">
+                                  Pre-Loaded &amp; Ready
+                                </span>
+                              ) : (
+                                <span className="font-mono">
+                                  {qTrack.sourceName}
+                                </span>
+                              )}
+                            </div>
+                          </div>
 
-                          {isCurrent ? (
+                          <div className="flex items-center gap-1.5 shrink-0">
                             <button
                               type="button"
-                              onClick={audio.togglePlayPause}
-                              data-testid="nowplaying-current-track-badge"
-                              title={
-                                audio.isPlaying
-                                  ? 'Currently playing — click to pause'
-                                  : 'Currently paused — click to resume'
+                              onClick={() => handleToggleLikeTrack(qTrack)}
+                              aria-label={
+                                likedTrackIds.has(qTrack.id)
+                                  ? `Unlike ${qTrack.title}`
+                                  : `Like ${qTrack.title}`
                               }
-                              className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/60 bg-emerald-500/20 hover:bg-emerald-500/30 px-2.5 py-1 text-xs font-mono font-bold text-[#00ff66] transition-colors min-h-[32px]"
+                              className={`p-1.5 rounded-lg border transition-colors min-h-[32px] min-w-[32px] flex items-center justify-center ${
+                                likedTrackIds.has(qTrack.id)
+                                  ? 'border-rose-500/50 bg-rose-500/15 text-rose-400'
+                                  : 'border-zinc-800 bg-zinc-950 text-zinc-500 hover:text-rose-400'
+                              }`}
                             >
-                              <span
-                                className={`w-2 h-2 rounded-full bg-[#00ff66] ${
-                                  audio.isPlaying ? 'animate-pulse' : 'opacity-60'
+                              <Heart
+                                className={`w-3.5 h-3.5 ${
+                                  likedTrackIds.has(qTrack.id)
+                                    ? 'fill-rose-500 text-rose-400'
+                                    : ''
                                 }`}
                               />
-                              <span>
-                                {audio.isPlaying ? 'Now Playing' : 'Paused · Resume'}
-                              </span>
                             </button>
-                          ) : (
+
+                            {isCurrent ? (
+                              <button
+                                type="button"
+                                onClick={audio.togglePlayPause}
+                                data-testid="nowplaying-current-track-badge"
+                                title={
+                                  audio.isPlaying
+                                    ? 'Currently playing — click to pause'
+                                    : 'Currently paused — click to resume'
+                                }
+                                className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/60 bg-emerald-500/20 hover:bg-emerald-500/30 px-2.5 py-1 text-xs font-mono font-bold text-[#00ff66] transition-colors min-h-[32px]"
+                              >
+                                <span
+                                  className={`w-2 h-2 rounded-full bg-[#00ff66] ${
+                                    audio.isPlaying
+                                      ? 'animate-pulse'
+                                      : 'opacity-60'
+                                  }`}
+                                />
+                                <span>
+                                  {audio.isPlaying
+                                    ? 'Now Playing'
+                                    : 'Paused · Resume'}
+                                </span>
+                              </button>
+                            ) : (
+                              <>
+                                {offsetIdx > 1 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      audio.moveTrackPlayNext(realIdx);
+                                      setToastMessage(
+                                        `⏭️ Moved "${qTrack.title}" to Play Next`
+                                      );
+                                    }}
+                                    title="Move to Play Next"
+                                    className="rounded-lg border border-zinc-700 bg-zinc-900 hover:border-[#00ff66] hover:text-[#00ff66] px-2 py-1 text-[11px] font-mono text-zinc-300 min-h-[32px]"
+                                  >
+                                    Play Next
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => audio.playSpecificTrack(qTrack)}
+                                  className="rounded-lg bg-zinc-800 hover:bg-[#00ff66] hover:text-zinc-950 px-2.5 py-1 text-xs font-mono font-semibold text-zinc-200 transition-colors min-h-[32px]"
+                                >
+                                  Play
+                                </button>
+                              </>
+                            )}
+
                             <button
                               type="button"
-                              onClick={() => audio.playSpecificTrack(qTrack)}
-                              className="rounded-lg bg-zinc-800 hover:bg-[#00ff66] hover:text-zinc-950 px-2.5 py-1 text-xs font-mono font-semibold text-zinc-200 transition-colors min-h-[32px]"
+                              onClick={() => audio.removeFromQueue(realIdx)}
+                              title="Remove from Queue"
+                              className="p-1.5 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-500 hover:text-rose-400 hover:border-rose-500/40 min-h-[32px] min-w-[32px] flex items-center justify-center"
                             >
-                              Play
+                              <X className="w-3.5 h-3.5" />
                             </button>
-                          )}
+                          </div>
                         </div>
-                      </div>
-                    );
-                  })}
+                      );
+                    })}
                 </div>
               </div>
             </aside>
@@ -7369,12 +7763,21 @@ export default function App() {
         onShowToast={(msg) => setToastMessage(msg)}
       />
 
-      {/* 4. MusicBrainz MBID Metadata Inspector & Matcher Modal */}
+      {/* 4. Unified Metadata Editor & MusicBrainz Auto-Filler Modal (Playlists, Songs, Albums & Artists) */}
       <MetadataInspectorModal
         target={metadataModalTarget}
         onClose={() => setMetadataModalTarget(null)}
         onMetadataUpdated={() => {
           syncJellyfinProvider();
+        }}
+        onPlaylistUpdated={(updatedPl, allPls) => {
+          if (Array.isArray(allPls) && allPls.length > 0) {
+            setPlaylists(allPls);
+          } else if (updatedPl) {
+            setPlaylists((prev) =>
+              prev.map((p) => (p.id === updatedPl.id ? updatedPl : p))
+            );
+          }
         }}
         onShowToast={(msg) => setToastMessage(msg)}
       />
