@@ -9,6 +9,7 @@ import {
   Clock,
   Disc,
   ExternalLink,
+  Flag,
   Heart,
   Layers,
   Link2,
@@ -72,6 +73,7 @@ interface PlaylistDetailViewProps {
   likedTrackIds?: Set<string>;
   onToggleLikeTrack?: (track: Track) => void;
   onStartTrackRadio?: (track: Track) => void;
+  onReportWrongTrack?: (track: Track, playlistId: string) => void;
 }
 
 export interface UnifiedPlaylistItem {
@@ -112,6 +114,7 @@ export const PlaylistDetailView: React.FC<PlaylistDetailViewProps> = ({
   likedTrackIds,
   onToggleLikeTrack,
   onStartTrackRadio,
+  onReportWrongTrack,
 }) => {
   // Inline rename state
   const [isEditingName, setIsEditingName] = useState(false);
@@ -1122,6 +1125,24 @@ export const PlaylistDetailView: React.FC<PlaylistDetailViewProps> = ({
                                 <ListPlus className="w-3.5 h-3.5 text-[#00ff66]" />
                                 <span>Add to Another Playlist</span>
                               </button>
+
+                              {onReportWrongTrack && (
+                                <button
+                                  type="button"
+                                  data-testid={`menu-report-wrong-track-${item.libraryTrack.id}`}
+                                  onClick={() => {
+                                    onReportWrongTrack(
+                                      item.libraryTrack as Track,
+                                      playlist.id
+                                    );
+                                    setOpenMenuTrackKey(null);
+                                  }}
+                                  className="w-full flex items-center gap-2 rounded-xl px-3 py-2 text-left text-amber-300 hover:bg-amber-950/50"
+                                >
+                                  <Flag className="w-3.5 h-3.5 text-amber-400" />
+                                  <span>Report / Wrong Song (Re-Grab)</span>
+                                </button>
+                              )}
 
                               <div className="border-t border-zinc-800 my-1" />
                             </>

@@ -9,6 +9,7 @@ import {
   Download,
   Heart,
   Info,
+  Radio,
   Shield,
   Sparkles,
   Square,
@@ -20,12 +21,21 @@ export type AppNotificationCategory =
   | 'system'
   | 'download'
   | 'security'
-  | 'library';
+  | 'library'
+  | 'slskd'
+  | 'lidarr'
+  | 'youtube'
+  | 'listenbrainz'
+  | 'audio';
+
+export type AppNotificationSeverity = 'info' | 'success' | 'warn' | 'error';
 
 export interface AppNotificationItem {
   id: string;
   message: string;
   category: AppNotificationCategory;
+  severity?: AppNotificationSeverity;
+  service?: string;
   createdAt: string;
   read: boolean;
 }
@@ -34,11 +44,16 @@ export function inferNotificationCategory(
   message: string
 ): AppNotificationCategory {
   const lower = message.toLowerCase();
+  if (lower.includes('slskd') || lower.includes('soulseek')) return 'slskd';
+  if (lower.includes('lidarr')) return 'lidarr';
+  if (lower.includes('yt-dlp') || lower.includes('youtube')) return 'youtube';
+  if (lower.includes('listenbrainz') || lower.includes('scrobble'))
+    return 'listenbrainz';
   if (
     lower.includes('download') ||
     lower.includes('grab') ||
-    lower.includes('slskd') ||
-    lower.includes('lidarr') ||
+    lower.includes('ready to play') ||
+    lower.includes('ready via') ||
     lower.includes('spotify') ||
     lower.includes('sync') ||
     lower.includes('queue')
@@ -67,6 +82,38 @@ export function inferNotificationCategory(
   return 'system';
 }
 
+export function inferNotificationSeverity(
+  item: Pick<AppNotificationItem, 'message' | 'severity'>
+): AppNotificationSeverity {
+  if (item.severity) return item.severity;
+  const lower = String(item.message || '').toLowerCase();
+  if (
+    lower.includes('🚨') ||
+    lower.includes('unreachable') ||
+    lower.includes('failed') ||
+    lower.includes('error') ||
+    lower.includes('disconnected') ||
+    lower.includes('http 5') ||
+    lower.includes('http 4') ||
+    lower.includes('unmounted')
+  ) {
+    return 'error';
+  }
+  if (lower.includes('⚠️') || lower.includes('warn') || lower.includes('timeout')) {
+    return 'warn';
+  }
+  if (
+    lower.includes('ready to play') ||
+    lower.includes('ready via') ||
+    lower.includes('completed') ||
+    lower.includes('downloaded') ||
+    lower.includes('imported')
+  ) {
+    return 'success';
+  }
+  return 'info';
+}
+
 interface NotificationCenterBellProps {
   notifications: AppNotificationItem[];
   onMarkAsRead: (ids: string[]) => void;
@@ -88,22 +135,70 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [filter, setFilter] = useState<'all' | 'unread' | 'download' | 'system'>(
-    'all'
-  );
+  const [filter, setFilter] = useState<
+    'all' | 'unread' | 'download' | 'errors'
+  >('all');
+  const [hasCheckedCurrentBatch, setHasCheckedCurrentBatch] = useState(false);
+  const lastUnreadSignatureRef = useRef<string>('');
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  const unreadCount = useMemo(
-    () => notifications.filter((n) => !n.read).length,
+  const unreadItems = useMemo(
+    () => notifications.filter((n) => !n.read),
     [notifications]
   );
+
+  const unreadCount = unreadItems.length;
+
+  const unreadErrors = useMemo(
+    () =>
+      unreadItems.filter((n) => {
+        const sev = inferNotificationSeverity(n);
+        return sev === 'error' || sev === 'warn';
+      }).length,
+    [unreadItems]
+  );
+
+  // Re-arm bouncing/flashing whenever a new unread notification arrives
+  useEffect(() => {
+    const sig = unreadItems.map((n) => n.id).join('|');
+    if (unreadCount === 0) {
+      setHasCheckedCurrentBatch(true);
+      lastUnreadSignatureRef.current = '';
+      return;
+    }
+    if (sig !== lastUnreadSignatureRef.current) {
+      lastUnreadSignatureRef.current = sig;
+      if (!isOpen) {
+        setHasCheckedCurrentBatch(false);
+      }
+    }
+  }, [unreadItems, unreadCount, isOpen]);
+
+  // Auto-quiet immediately when the user opens the Alerts dropdown
+  useEffect(() => {
+    if (isOpen) {
+      setHasCheckedCurrentBatch(true);
+    }
+  }, [isOpen]);
+
+  const isFlashingActive = unreadCount > 0 && !hasCheckedCurrentBatch && !isOpen;
+  const hasUrgentError = unreadErrors > 0;
 
   const filteredNotifications = useMemo(() => {
     return notifications.filter((n) => {
       if (filter === 'unread') return !n.read;
-      if (filter === 'download') return n.category === 'download';
-      if (filter === 'system')
-        return n.category === 'system' || n.category === 'security';
+      if (filter === 'download')
+        return (
+          n.category === 'download' ||
+          n.category === 'slskd' ||
+          n.category === 'lidarr' ||
+          n.category === 'youtube' ||
+          n.category === 'listenbrainz'
+        );
+      if (filter === 'errors') {
+        const sev = inferNotificationSeverity(n);
+        return sev === 'error' || sev === 'warn';
+      }
       return true;
     });
   }, [notifications, filter]);
@@ -175,46 +270,96 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
     setSelectedIds(new Set());
   };
 
-  const renderCategoryIcon = (cat: AppNotificationCategory, msg: string) => {
-    if (msg.includes('⚠️') || msg.includes('🚨')) {
+  const renderCategoryIcon = (item: AppNotificationItem) => {
+    const sev = inferNotificationSeverity(item);
+    if (sev === 'error') {
+      return <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />;
+    }
+    if (sev === 'warn') {
       return <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />;
     }
-    if (cat === 'download') {
-      return <Download className="w-3.5 h-3.5 text-cyan-400 shrink-0" />;
+    if (
+      item.category === 'download' ||
+      item.category === 'slskd' ||
+      item.category === 'lidarr' ||
+      item.category === 'youtube'
+    ) {
+      return <Download className="w-3.5 h-3.5 text-[#10b981] shrink-0" />;
     }
-    if (cat === 'security') {
+    if (item.category === 'listenbrainz') {
+      return <Radio className="w-3.5 h-3.5 text-indigo-400 shrink-0" />;
+    }
+    if (item.category === 'security') {
       return <Shield className="w-3.5 h-3.5 text-purple-400 shrink-0" />;
     }
-    if (cat === 'library') {
+    if (item.category === 'library') {
       return <Heart className="w-3.5 h-3.5 text-[#00ff66] shrink-0" />;
     }
-    return <Sparkles className="w-3.5 h-3.5 text-[#00ff66] shrink-0" />;
+    return <Sparkles className="w-3.5 h-3.5 text-[#10b981] shrink-0" />;
   };
 
   return (
     <div ref={containerRef} className="relative">
+      {/* Radar Ping Ring when unread alerts are waiting for attention */}
+      {isFlashingActive && (
+        <span
+          aria-hidden="true"
+          data-testid="notification-bell-radar-ping"
+          className={`pointer-events-none absolute -inset-0.5 rounded-xl opacity-75 animate-ping ${
+            hasUrgentError
+              ? 'bg-red-500/50 border border-amber-400'
+              : 'bg-[#10b981]/45 border border-[#10b981]'
+          }`}
+        />
+      )}
+
       <button
         type="button"
-        onClick={() => setIsOpen((prev) => !prev)}
+        onClick={() => {
+          setHasCheckedCurrentBatch(true);
+          setIsOpen((prev) => !prev);
+        }}
         data-testid="btn-notification-center"
-        aria-label={`Notifications (${unreadCount} unread)`}
-        title={`Notifications (${unreadCount} unread, ${notifications.length} total)`}
-        className={`relative inline-flex items-center justify-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-mono font-semibold transition-colors min-h-[36px] min-w-[38px] ${
+        aria-label={`Notifications (${unreadCount} unread${
+          unreadErrors > 0 ? `, ${unreadErrors} errors` : ''
+        })`}
+        title={
+          hasUrgentError
+            ? `URGENT: ${unreadErrors} service error(s) (${unreadCount} unread total)`
+            : `Notifications (${unreadCount} unread, ${notifications.length} total)`
+        }
+        className={`relative inline-flex items-center justify-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-mono font-semibold transition-all min-h-[36px] min-w-[38px] ${
           isOpen
             ? 'border-[#00ff66] bg-emerald-500/20 text-[#00ff66]'
-            : unreadCount > 0
-              ? 'border-rose-500/50 bg-zinc-900 text-white hover:border-rose-400'
-              : 'border-zinc-700 bg-zinc-900 text-zinc-300 hover:text-white hover:border-zinc-600'
+            : isFlashingActive && hasUrgentError
+              ? 'border-[#ef4444] bg-red-950/80 text-amber-200 shadow-[0_0_20px_rgba(239,68,68,0.75)] animate-pulse'
+              : isFlashingActive
+                ? 'border-[#10b981] bg-emerald-950/75 text-[#10b981] shadow-[0_0_18px_rgba(16,185,129,0.65)]'
+                : unreadCount > 0 && hasUrgentError
+                  ? 'border-red-500/70 bg-zinc-900 text-red-300 hover:border-red-400'
+                  : unreadCount > 0
+                    ? 'border-[#10b981]/60 bg-zinc-900 text-emerald-300 hover:border-[#10b981]'
+                    : 'border-zinc-700 bg-zinc-900 text-zinc-300 hover:text-white hover:border-zinc-600'
         }`}
       >
-        <Bell className="w-4 h-4" />
+        <Bell
+          className={`w-4 h-4 ${
+            isFlashingActive
+              ? hasUrgentError
+                ? 'animate-bounce text-[#f59e0b]'
+                : 'animate-bounce text-[#10b981]'
+              : ''
+          }`}
+        />
         <span className="hidden xl:inline">Alerts</span>
 
-        {/* Red Unread Notification Count Badge */}
+        {/* Color-Coded Unread Notification Count Badge */}
         {unreadCount > 0 && (
           <span
             data-testid="notification-badge-count"
-            className=" -top-1.5 -right-1.5 absolute min-w-[18px] h-[18px] px-1 rounded-full bg-rose-600 border border-zinc-950 text-[10px] font-mono font-extrabold text-white flex items-center justify-center shadow-md"
+            className={`-top-1.5 -right-1.5 absolute min-w-[18px] h-[18px] px-1 rounded-full border border-zinc-950 text-[10px] font-mono font-extrabold text-white flex items-center justify-center shadow-md ${
+              hasUrgentError ? 'bg-[#ef4444]' : 'bg-[#10b981] text-zinc-950'
+            }`}
           >
             {unreadCount > 99 ? '99+' : unreadCount}
           </span>
@@ -225,17 +370,22 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
       {isOpen && (
         <div
           data-testid="notification-center-popover"
-          className="fixed sm:absolute right-2 sm:right-0 top-14 sm:top-full sm:mt-2 w-[calc(100vw-1rem)] sm:w-[420px] max-h-[80vh] rounded-2xl border border-zinc-700 bg-zinc-950/98 shadow-2xl backdrop-blur-xl z-50 flex flex-col overflow-hidden"
+          className="fixed sm:absolute right-2 sm:right-0 top-14 sm:top-full sm:mt-2 w-[calc(100vw-1rem)] sm:w-[440px] max-h-[82vh] rounded-2xl border border-zinc-700 bg-zinc-950/98 shadow-2xl backdrop-blur-xl z-50 flex flex-col overflow-hidden"
         >
           {/* Top Header */}
           <div className="px-4 py-3 border-b border-zinc-800 flex items-center justify-between gap-2 bg-zinc-900/80">
             <div className="flex items-center gap-2 min-w-0">
-              <Bell className="w-4 h-4 text-[#00ff66] shrink-0" />
+              <Bell
+                className={`w-4 h-4 shrink-0 ${
+                  hasUrgentError ? 'text-red-400' : 'text-[#10b981]'
+                }`}
+              />
               <span className="text-xs sm:text-sm font-mono font-bold text-white truncate">
-                Notifications
+                Alerts & Activity
               </span>
               <span className="text-[11px] font-mono text-zinc-400">
-                · {unreadCount} unread / {notifications.length} total
+                · {unreadCount} unread
+                {unreadErrors > 0 ? ` (${unreadErrors} errors)` : ''}
               </span>
             </div>
 
@@ -246,12 +396,12 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
                 data-testid="btn-toggle-mute-toasts"
                 title={
                   mutePopupBanners
-                    ? 'Quiet Mode ON: Notifications only collect in this Bell menu'
-                    : 'Popup Toasts ON: Click to silence floating toast banners'
+                    ? 'Bell Only Mode (Default): Zero layout-shifting banners; all alerts collect here'
+                    : 'Click to lock in Bell Only silent mode'
                 }
                 className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[10px] font-mono font-bold transition-colors ${
                   mutePopupBanners
-                    ? 'border-amber-500/40 bg-amber-500/15 text-amber-300'
+                    ? 'border-[#10b981]/40 bg-[#10b981]/15 text-[#10b981]'
                     : 'border-zinc-700 bg-zinc-900 text-zinc-300 hover:text-white'
                 }`}
               >
@@ -262,7 +412,7 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
                   </>
                 ) : (
                   <>
-                    <Bell className="w-3 h-3 text-[#00ff66]" />
+                    <Bell className="w-3 h-3 text-[#10b981]" />
                     <span>Popups ON</span>
                   </>
                 )}
@@ -283,13 +433,19 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
           <div className="px-3.5 py-2.5 border-b border-zinc-800/90 bg-zinc-950 space-y-2">
             {/* Filter Tabs */}
             <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-1">
+              <div className="flex items-center gap-1 flex-wrap">
                 {(
                   [
                     { id: 'all', label: `All (${notifications.length})` },
                     { id: 'unread', label: `Unread (${unreadCount})` },
                     { id: 'download', label: 'Downloads' },
-                    { id: 'system', label: 'System' },
+                    {
+                      id: 'errors',
+                      label:
+                        unreadErrors > 0
+                          ? `Errors (${unreadErrors})`
+                          : 'Errors / System',
+                    },
                   ] as const
                 ).map((tab) => (
                   <button
@@ -299,7 +455,9 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
                     data-testid={`notification-filter-${tab.id}`}
                     className={`px-2.5 py-1 rounded-lg text-[11px] font-mono font-semibold transition-colors ${
                       filter === tab.id
-                        ? 'bg-[#00ff66] text-zinc-950 font-bold'
+                        ? tab.id === 'errors' && unreadErrors > 0
+                          ? 'bg-red-500 text-white font-bold'
+                          : 'bg-[#10b981] text-zinc-950 font-bold'
                         : 'text-zinc-400 hover:text-white hover:bg-zinc-900'
                     }`}
                   >
@@ -319,7 +477,7 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
                 className="inline-flex items-center gap-1.5 text-[11px] font-mono text-zinc-300 hover:text-white disabled:opacity-40"
               >
                 {allVisibleSelected ? (
-                  <CheckSquare className="w-3.5 h-3.5 text-[#00ff66]" />
+                  <CheckSquare className="w-3.5 h-3.5 text-[#10b981]" />
                 ) : (
                   <Square className="w-3.5 h-3.5 text-zinc-500" />
                 )}
@@ -339,7 +497,7 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
                         setSelectedIds(new Set());
                       }}
                       data-testid="btn-notifications-mark-selected-read"
-                      className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/40 bg-emerald-950/30 hover:bg-emerald-900/40 px-2 py-1 text-[10px] font-mono font-bold text-[#00ff66]"
+                      className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/40 bg-emerald-950/30 hover:bg-emerald-900/40 px-2 py-1 text-[10px] font-mono font-bold text-[#10b981]"
                     >
                       <Check className="w-3 h-3" />
                       <span>Read ({selectedIds.size})</span>
@@ -360,11 +518,14 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
                 {unreadCount > 0 && selectedIds.size === 0 && (
                   <button
                     type="button"
-                    onClick={onMarkAllRead}
+                    onClick={() => {
+                      setHasCheckedCurrentBatch(true);
+                      onMarkAllRead();
+                    }}
                     data-testid="btn-notifications-mark-all-read"
-                    className="inline-flex items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-900 hover:border-[#00ff66]/40 px-2 py-1 text-[10px] font-mono font-semibold text-zinc-200 hover:text-white"
+                    className="inline-flex items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-900 hover:border-[#10b981]/40 px-2 py-1 text-[10px] font-mono font-semibold text-zinc-200 hover:text-white"
                   >
-                    <CheckCheck className="w-3 h-3 text-[#00ff66]" />
+                    <CheckCheck className="w-3 h-3 text-[#10b981]" />
                     <span>Mark All Read</span>
                   </button>
                 )}
@@ -373,6 +534,7 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
                   <button
                     type="button"
                     onClick={() => {
+                      setHasCheckedCurrentBatch(true);
                       onClearAll();
                       setSelectedIds(new Set());
                     }}
@@ -396,13 +558,15 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
                   No notifications to display
                 </div>
                 <p className="text-[11px] font-mono text-zinc-500">
-                  Library scans, Spotify playlist syncs, download completions,
-                  and security alerts will appear here.
+                  Completed track downloads, Spotify/ListenBrainz playlist syncs,
+                  and service health alerts collect quietly here without
+                  interrupting playback.
                 </p>
               </div>
             ) : (
               filteredNotifications.map((item) => {
                 const isSelected = selectedIds.has(item.id);
+                const sev = inferNotificationSeverity(item);
                 return (
                   <div
                     key={item.id}
@@ -410,9 +574,11 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
                     className={`px-3.5 py-2.5 flex items-start gap-2.5 text-xs font-mono transition-colors ${
                       isSelected
                         ? 'bg-emerald-950/25'
-                        : !item.read
-                          ? 'bg-zinc-900/70'
-                          : 'bg-zinc-950 hover:bg-zinc-900/40'
+                        : !item.read && (sev === 'error' || sev === 'warn')
+                          ? 'bg-red-950/25 border-l-2 border-l-red-500'
+                          : !item.read
+                            ? 'bg-zinc-900/70 border-l-2 border-l-[#10b981]'
+                            : 'bg-zinc-950 hover:bg-zinc-900/40'
                     }`}
                   >
                     {/* Select Checkbox */}
@@ -424,16 +590,14 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
                       className="mt-0.5 text-zinc-400 hover:text-white shrink-0"
                     >
                       {isSelected ? (
-                        <CheckSquare className="w-4 h-4 text-[#00ff66]" />
+                        <CheckSquare className="w-4 h-4 text-[#10b981]" />
                       ) : (
                         <Square className="w-4 h-4 text-zinc-600" />
                       )}
                     </button>
 
-                    {/* Category Icon */}
-                    <div className="mt-0.5">
-                      {renderCategoryIcon(item.category, item.message)}
-                    </div>
+                    {/* Category / Severity Icon */}
+                    <div className="mt-0.5">{renderCategoryIcon(item)}</div>
 
                     {/* Message & Timestamp */}
                     <button
@@ -450,21 +614,33 @@ export const NotificationCenterBell: React.FC<NotificationCenterBellProps> = ({
                       <div
                         className={`leading-snug break-words ${
                           !item.read
-                            ? 'text-white font-semibold'
+                            ? sev === 'error'
+                              ? 'text-red-200 font-semibold'
+                              : sev === 'warn'
+                                ? 'text-amber-200 font-semibold'
+                                : 'text-white font-semibold'
                             : 'text-zinc-300'
                         }`}
                       >
                         {item.message}
                       </div>
-                      <div className="text-[10px] text-zinc-500 flex items-center gap-1.5">
+                      <div className="text-[10px] text-zinc-500 flex items-center gap-1.5 flex-wrap">
                         <span>{item.createdAt}</span>
                         <span>·</span>
-                        <span className="uppercase">{item.category}</span>
+                        <span className="uppercase">
+                          {item.service || item.category}
+                        </span>
                         {!item.read && (
                           <>
                             <span>·</span>
-                            <span className="text-[#00ff66] font-bold">
-                              NEW
+                            <span
+                              className={`font-bold ${
+                                sev === 'error' || sev === 'warn'
+                                  ? 'text-red-400'
+                                  : 'text-[#10b981]'
+                              }`}
+                            >
+                              {sev === 'error' ? 'ERROR' : 'NEW'}
                             </span>
                           </>
                         )}

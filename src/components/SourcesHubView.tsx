@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   AlertCircle,
   AlertTriangle,
@@ -11,14 +11,19 @@ import {
   Radio,
   RefreshCw,
   Save,
+  Search,
   Server,
   ShieldCheck,
+  Sparkles,
   Terminal,
+  Wand2,
+  X,
 } from 'lucide-react';
 import type {
   BrokeifyCloudSettings,
   BrokeifyServerIntegrations,
   CloudSyncStatus,
+  LibraryOrganizeJobState,
   Playlist,
   ProviderConfig,
   ProviderType,
@@ -138,6 +143,102 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
     ok: boolean;
     message: string;
   } | null>(null);
+
+  // Background Full Established Library Organizer state
+  const [organizeJob, setOrganizeJob] =
+    useState<LibraryOrganizeJobState | null>(null);
+  const [organizeRecursive, setOrganizeRecursive] = useState<boolean>(true);
+  const [organizeSkipOrganized, setOrganizeSkipOrganized] =
+    useState<boolean>(false);
+
+  const fetchOrganizeJobStatus = async () => {
+    try {
+      const resp = await fetch('/api/library/organize/status');
+      const data = await resp.json();
+      if (resp.ok && data?.ok && data.job) {
+        setOrganizeJob(data.job);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  useEffect(() => {
+    fetchOrganizeJobStatus();
+  }, []);
+
+  useEffect(() => {
+    if (
+      organizeJob &&
+      (organizeJob.status === 'running' || organizeJob.status === 'scanning')
+    ) {
+      const timer = setInterval(() => {
+        fetchOrganizeJobStatus();
+      }, 1500);
+      return () => clearInterval(timer);
+    }
+  }, [organizeJob]);
+
+  const handleStartLibraryOrganize = async (dryRun: boolean) => {
+    try {
+      const resp = await fetch('/api/library/organize/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          targetPath: '',
+          recursive: organizeRecursive,
+          dryRun,
+          skipOrganized: organizeSkipOrganized,
+        }),
+      });
+      const data = await resp.json();
+      if (resp.ok && data?.ok && data.job) {
+        setOrganizeJob(data.job);
+        showSavedCard(
+          'acoustid',
+          dryRun
+            ? 'Started Dry-Run Preview for Entire /music Library'
+            : 'Started Full Cleanup & Organization for Entire /music Library'
+        );
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleApplyLibraryOrganize = async () => {
+    try {
+      const resp = await fetch('/api/library/organize/apply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await resp.json();
+      if (resp.ok && data?.ok && data.job) {
+        setOrganizeJob(data.job);
+        showSavedCard(
+          'acoustid',
+          `Applying tags, artwork & organizing ${data.job.totalFiles} tracks...`
+        );
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleCancelLibraryOrganize = async () => {
+    try {
+      const resp = await fetch('/api/library/organize/cancel', {
+        method: 'POST',
+      });
+      const data = await resp.json();
+      if (resp.ok && data?.ok && data.job) {
+        setOrganizeJob(data.job);
+        showSavedCard('acoustid', 'Library organizer cancelled.');
+      }
+    } catch {
+      // ignore
+    }
+  };
 
   const refreshSqliteHealth = async () => {
     try {
@@ -1398,6 +1499,368 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                   }`}
                 >
                   {listenbrainzTestStatus.message}
+                </div>
+              )}
+            </div>
+
+            {/* 5. Acoustic Fingerprinting (AcoustID + MusicBrainz + Cover Art Archive) & Automated Staging Inbox Organizer */}
+            <div
+              data-testid="acoustid-staging-organizer-card"
+              className="lg:col-span-2 rounded-2xl border border-emerald-500/40 bg-gradient-to-r from-emerald-950/40 via-zinc-950 to-indigo-950/30 p-4 sm:p-5 space-y-4"
+            >
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="space-y-1">
+                  <div className="text-xs font-mono font-bold text-[#00ff66] uppercase tracking-wider flex items-center gap-2">
+                    <span>
+                      5. Acoustic Fingerprinting (fpcalc + AcoustID + MusicBrainz) &amp; Staging Inbox Auto-Organizer
+                    </span>
+                  </div>
+                  <p className="text-xs text-zinc-400 max-w-3xl">
+                    Automatically fingerprints incoming downloads from{' '}
+                    <code>slskd</code> and <code>yt-dlp</code> using{' '}
+                    <code>fpcalc</code> + AcoustID, queries MusicBrainz (strictly
+                    throttled to 1 req/sec) + Cover Art Archive for high-res
+                    front-500 artwork, and moves clean files from your Staging
+                    Inbox into{' '}
+                    <code className="text-[#00ff66]">
+                      /music/&#123;Artist&#125;/&#123;Album&#125; (&#123;Year&#125;)/&#123;TrackNumber&#125; - &#123;Title&#125;.&#123;ext&#125;
+                    </code>
+                    .
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        const resp = await fetch('/api/staging/scan', {
+                          method: 'POST',
+                        });
+                        const data = await resp.json();
+                        if (resp.ok && data?.ok) {
+                          showSavedCard(
+                            'acoustid',
+                            `Scanned Staging Inbox: organized ${data.organizedCount || 0} track(s)`
+                          );
+                        }
+                      } catch {
+                        // ignore
+                      }
+                    }}
+                    data-testid="btn-scan-staging-inbox-now"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/15 hover:bg-emerald-500/25 px-3 py-1.5 text-[11px] font-mono font-bold text-[#00ff66] transition-colors"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Scan &amp; Organize Inbox Now</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isSavingConfigFile}
+                    onClick={() => handleSaveCard('acoustid')}
+                    data-testid="save-acoustid-staging-btn"
+                    className="inline-flex items-center gap-1 rounded-lg bg-[#00ff66] hover:bg-emerald-400 px-3 py-1.5 text-[11px] font-mono font-bold text-zinc-950 transition-colors"
+                  >
+                    <Save className="w-3.5 h-3.5" />
+                    <span>Save</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5">
+                {/* AcoustID API Key */}
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="block text-xs text-zinc-300">
+                      AcoustID API Key (<code>ACOUSTID_API_KEY</code>)
+                    </label>
+                    <a
+                      href="https://acoustid.org/new-application"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      data-testid="link-register-acoustid-key"
+                      className="text-[11px] font-mono text-[#00ff66] hover:underline"
+                    >
+                      Get Free Key at acoustid.org ↗
+                    </a>
+                  </div>
+                  <input
+                    type="password"
+                    value={serverIntegrations.acoustidApiKey ?? ''}
+                    onChange={(e) =>
+                      onUpdateServerIntegrations({
+                        ...serverIntegrations,
+                        acoustidApiKey: e.target.value,
+                      })
+                    }
+                    placeholder="Optional free key from acoustid.org..."
+                    data-testid="input-acoustid-api-key"
+                    className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+                  />
+                  <p className="text-[10px] font-mono text-zinc-500">
+                    Identifies real audio waveforms via <code>fpcalc</code> even
+                    when filenames are wrong or missing tags.
+                  </p>
+                </div>
+
+                {/* Staging / Inbox Folder Path */}
+                <div className="space-y-1">
+                  <label className="block text-xs text-zinc-300">
+                    Staging / Inbox Folder Path
+                  </label>
+                  <input
+                    type="text"
+                    value={serverIntegrations.stagingDir ?? '/music/_inbox'}
+                    onChange={(e) =>
+                      onUpdateServerIntegrations({
+                        ...serverIntegrations,
+                        stagingDir: e.target.value,
+                      })
+                    }
+                    placeholder="/music/_inbox or /downloads"
+                    data-testid="input-staging-dir"
+                    className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs font-mono text-white focus:border-[#00ff66] focus:outline-none"
+                  />
+                  <p className="text-[10px] font-mono text-zinc-500">
+                    Incoming downloads land here first before being tagged &amp;
+                    moved into <code>/music</code>.
+                  </p>
+                </div>
+
+                {/* Auto-Organize Incoming Downloads Toggle */}
+                <div className="space-y-1 flex flex-col justify-between">
+                  <label className="block text-xs text-zinc-300">
+                    Auto-Organize Incoming Downloads
+                  </label>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={
+                      serverIntegrations.autoOrganizeDownloads !== false
+                    }
+                    data-testid="toggle-auto-organize-downloads"
+                    onClick={() =>
+                      onUpdateServerIntegrations({
+                        ...serverIntegrations,
+                        autoOrganizeDownloads:
+                          serverIntegrations.autoOrganizeDownloads === false,
+                      })
+                    }
+                    className={`w-full rounded-xl border px-3 py-2 text-xs font-mono font-bold flex items-center justify-between transition-colors ${
+                      serverIntegrations.autoOrganizeDownloads !== false
+                        ? 'border-[#00ff66]/60 bg-[#00ff66]/15 text-[#00ff66]'
+                        : 'border-zinc-700 bg-zinc-900 text-zinc-400'
+                    }`}
+                  >
+                    <span>
+                      {serverIntegrations.autoOrganizeDownloads !== false
+                        ? 'ON — Fingerprint, Tag & Move to /music'
+                        : 'OFF — Keep in Raw Download Folder'}
+                    </span>
+                    <span
+                      className={`px-2 py-0.5 rounded text-[10px] ${
+                        serverIntegrations.autoOrganizeDownloads !== false
+                          ? 'bg-[#00ff66] text-zinc-950'
+                          : 'bg-zinc-800 text-zinc-400'
+                      }`}
+                    >
+                      {serverIntegrations.autoOrganizeDownloads !== false
+                        ? 'ENABLED'
+                        : 'DISABLED'}
+                    </span>
+                  </button>
+                  <p className="text-[10px] font-mono text-zinc-500">
+                    Cleans up empty leftover folders automatically after moving.
+                  </p>
+                </div>
+              </div>
+
+              {/* Established Library Full Organizer & Tag Cleaner Sub-Panel */}
+              <div
+                data-testid="established-library-organizer-panel"
+                className="pt-4 border-t border-emerald-500/30 space-y-3"
+              >
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="text-xs font-mono font-bold text-white flex items-center gap-2">
+                      <Sparkles className="w-3.5 h-3.5 text-[#00ff66]" />
+                      <span>Clean Up Established &amp; Disorganized Library (/music)</span>
+                    </div>
+                    <p className="text-[11px] text-zinc-400 max-w-2xl">
+                      Already have an established or disorganized music collection?
+                      Fingerprints every audio file via <code>fpcalc</code> + AcoustID, queries MusicBrainz for official Title, Artist, Album, Year, and MBID, downloads high-res artwork from Cover Art Archive, embeds clean ID3/FLAC tags via <code>ffmpeg</code>, and relocates tracks into standard <code>/music/&#123;Artist&#125;/&#123;Album&#125; (&#123;Year&#125;)/&#123;TrackNumber&#125; - &#123;Title&#125;.&#123;ext&#125;</code> while pruning empty leftover folders.
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      disabled={
+                        organizeJob?.status === 'running' ||
+                        organizeJob?.status === 'scanning'
+                      }
+                      onClick={() => handleStartLibraryOrganize(true)}
+                      data-testid="btn-preview-library-organize"
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 disabled:opacity-50 px-3 py-1.5 text-xs font-mono font-bold text-zinc-200 transition-colors"
+                    >
+                      <Search className="w-3.5 h-3.5 text-zinc-400" />
+                      <span>Dry-Run Preview</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={
+                        organizeJob?.status === 'running' ||
+                        organizeJob?.status === 'scanning'
+                      }
+                      onClick={() => handleStartLibraryOrganize(false)}
+                      data-testid="btn-start-library-organize-now"
+                      className="inline-flex items-center gap-1.5 rounded-xl bg-[#00ff66] hover:bg-emerald-400 disabled:opacity-50 px-3.5 py-1.5 text-xs font-mono font-bold text-zinc-950 transition-colors shadow-md"
+                    >
+                      <Wand2 className="w-3.5 h-3.5" />
+                      <span>Clean Up Entire Library Now</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-4 text-xs font-mono text-zinc-300">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={organizeRecursive}
+                      onChange={(e) => setOrganizeRecursive(e.target.checked)}
+                      className="rounded border-zinc-700 bg-zinc-900 text-[#00ff66] focus:ring-0"
+                    />
+                    <span>Include all subfolders recursively</span>
+                  </label>
+
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={organizeSkipOrganized}
+                      onChange={(e) => setOrganizeSkipOrganized(e.target.checked)}
+                      className="rounded border-zinc-700 bg-zinc-900 text-[#00ff66] focus:ring-0"
+                    />
+                    <span>Skip files already in Artist/Album format</span>
+                  </label>
+                </div>
+
+                {/* Live Progress Card in Settings */}
+                {organizeJob &&
+                  (organizeJob.status === 'running' ||
+                    organizeJob.status === 'scanning') && (
+                    <div
+                      data-testid="settings-organize-progress"
+                      className="p-3.5 rounded-xl border border-[#00ff66]/50 bg-black/60 space-y-2.5"
+                    >
+                      <div className="flex items-center justify-between text-xs font-mono">
+                        <div className="flex items-center gap-2">
+                          <Loader2 className="w-4 h-4 text-[#00ff66] animate-spin" />
+                          <span className="font-bold text-white">
+                            {organizeJob.dryRun
+                              ? 'Previewing Library Organization...'
+                              : 'Cleaning & Organizing Library...'}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-[#00ff66] font-bold">
+                            {organizeJob.processedFiles} / {organizeJob.totalFiles} tracks (
+                            {organizeJob.totalFiles > 0
+                              ? Math.round(
+                                  (organizeJob.processedFiles /
+                                    organizeJob.totalFiles) *
+                                    100
+                                )
+                              : 0}
+                            %)
+                          </span>
+                          <button
+                            type="button"
+                            onClick={handleCancelLibraryOrganize}
+                            className="px-2 py-0.5 rounded border border-rose-500/40 bg-rose-950/40 text-rose-300 text-[10px] font-bold"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="w-full bg-zinc-900 rounded-full h-2 overflow-hidden border border-zinc-800">
+                        <div
+                          className="bg-gradient-to-r from-[#00ff66] to-emerald-400 h-2 rounded-full transition-all duration-300"
+                          style={{
+                            width: `${
+                              organizeJob.totalFiles > 0
+                                ? Math.min(
+                                    100,
+                                    Math.round(
+                                      (organizeJob.processedFiles /
+                                        organizeJob.totalFiles) *
+                                        100
+                                    )
+                                  )
+                                : 5
+                            }%`,
+                          }}
+                        />
+                      </div>
+
+                      <div className="text-[11px] font-mono text-zinc-400 truncate">
+                        {organizeJob.currentTrackTitle ? (
+                          <span>
+                            Processing:{' '}
+                            <strong className="text-zinc-200">
+                              {organizeJob.currentTrackTitle}
+                            </strong>{' '}
+                            — {organizeJob.currentTrackArtist}
+                          </span>
+                        ) : (
+                          <span>{organizeJob.currentFile || 'Scanning...'}</span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                {/* Preview Ready in Settings */}
+                {organizeJob &&
+                  organizeJob.status === 'preview_ready' &&
+                  organizeJob.items.length > 0 && (
+                    <div
+                      data-testid="settings-organize-preview-ready"
+                      className="p-3.5 rounded-xl border border-purple-500/50 bg-purple-950/20 flex flex-wrap items-center justify-between gap-3 text-xs font-mono"
+                    >
+                      <div className="flex items-center gap-2 text-purple-200">
+                        <Sparkles className="w-4 h-4 text-purple-400 shrink-0" />
+                        <span>
+                          Preview ready: <strong>{organizeJob.items.length}</strong>{' '}
+                          tracks fingerprinted &amp; mapped to standard /music paths.
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={handleApplyLibraryOrganize}
+                          className="inline-flex items-center gap-1.5 rounded-lg bg-[#00ff66] hover:bg-emerald-400 px-3 py-1 text-xs font-bold text-zinc-950 shadow-md"
+                        >
+                          <Check className="w-3.5 h-3.5" />
+                          <span>Apply to Library Disk</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setOrganizeJob(null)}
+                          className="px-2.5 py-1 rounded-lg border border-zinc-700 text-zinc-400 hover:text-white"
+                        >
+                          Dismiss
+                        </button>
+                      </div>
+                    </div>
+                  )}
+              </div>
+
+              {savedCardFeedback['acoustid'] && (
+                <div className="rounded-lg border border-emerald-500/40 bg-emerald-950/30 px-2.5 py-1.5 text-[11px] font-mono text-[#00ff66] flex items-center gap-1.5">
+                  <Check className="w-3.5 h-3.5" />
+                  <span>{savedCardFeedback['acoustid']}</span>
                 </div>
               )}
             </div>

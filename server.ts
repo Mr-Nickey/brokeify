@@ -64,7 +64,26 @@ import {
   reorderPlaylistTracks,
   exportPlaylistM3u8,
   getRecentPlayHistory,
+  getPersistentNotifications,
+  addPersistentNotification,
+  markPersistentNotificationsRead,
+  deletePersistentNotifications,
 } from './src/server/libraryEngine.ts';
+import {
+  identifyAudioFileWithAcoustIdAndMusicBrainz,
+  embedMetadataAndArtworkIntoFile,
+  fingerprintTagAndOrganizeFile,
+  buildOrganizedTrackDestination,
+  cleanupEmptyParentDirs,
+  resolveSandboxedMusicPath,
+  detectVariantFlagsInText,
+  QUARANTINE_DIR,
+  AUDIO_FILE_EXTENSIONS,
+  getLibraryOrganizeJobState,
+  cancelLibraryOrganizeJob,
+  startLibraryOrganizeJob,
+  applyPreviewedLibraryOrganizeJob,
+} from './src/server/fingerprintAndFileManager.ts';
 import { generateBrokeifyApiSpecMarkdown } from './src/server/apiSpecGenerator.ts';
 
 const execFileAsync = promisify(execFile);
@@ -294,6 +313,45 @@ function pushServerLog(level, category, message, extra = {}) {
     serverDebugLogs.length = MAX_SERVER_DEBUG_LOGS;
   }
   saveServerDebugLogs();
+
+  // Wire backend service errors & warnings into persistent SQLite Notification Bell (deduplicated per outage)
+  if (entry.level === 'error' || entry.level === 'warn') {
+    const rawCat = String(entry.category || 'system').toLowerCase();
+    const mappedCat =
+      rawCat === 'slskd' ||
+      rawCat === 'lidarr' ||
+      rawCat === 'youtube' ||
+      rawCat === 'listenbrainz' ||
+      rawCat === 'audio'
+        ? rawCat
+        : 'system';
+    const serviceLabel =
+      rawCat === 'slskd'
+        ? 'slskd Soulseek P2P'
+        : rawCat === 'lidarr'
+        ? 'Lidarr Arr Stack'
+        : rawCat === 'youtube'
+        ? 'YouTube / yt-dlp'
+        : rawCat === 'listenbrainz'
+        ? 'ListenBrainz API'
+        : rawCat === 'audio'
+        ? 'Music Library (/music)'
+        : 'Brokeify Server';
+    try {
+      addPersistentNotification({
+        message: `${serviceLabel}: ${entry.message}${
+          entry.hint ? ` — ${entry.hint}` : ''
+        }`,
+        category: mappedCat as any,
+        severity: entry.level === 'error' ? 'error' : 'warn',
+        service: serviceLabel,
+        dedupKey: `${mappedCat}:${entry.level}:${String(entry.message).slice(0, 60)}`,
+      });
+    } catch {
+      // non-fatal if db is initializing
+    }
+  }
+
   return entry;
 }
 
@@ -421,6 +479,9 @@ const DEFAULT_SERVER_CONFIG = {
     listenbrainzUsername:
       process.env.LISTENBRAINZ_USER || process.env.LISTENBRAINZ_USERNAME || '',
     listenbrainzToken: process.env.LISTENBRAINZ_TOKEN || '',
+    acoustidApiKey: process.env.ACOUSTID_API_KEY || '',
+    stagingDir: process.env.STAGING_DIR || path.join(MUSIC_DIR, '_inbox'),
+    autoOrganizeDownloads: true,
     preferredDownloader: 'auto',
     downloadDir: MUSIC_DIR,
     youtubeAudioFormat: 'mp3',
@@ -479,6 +540,7 @@ return true;`,
   customPlaylistNames: {},
   pinnedPlaylistId: null,
   playbackSession: null,
+  notificationMode: 'bell_only',
 };
 
 function readServerConfig() {
@@ -507,6 +569,12 @@ function readServerConfig() {
         : {}),
       ...(process.env.LISTENBRAINZ_TOKEN
         ? { listenbrainzToken: process.env.LISTENBRAINZ_TOKEN }
+        : {}),
+      ...(process.env.ACOUSTID_API_KEY
+        ? { acoustidApiKey: process.env.ACOUSTID_API_KEY }
+        : {}),
+      ...(process.env.STAGING_DIR
+        ? { stagingDir: process.env.STAGING_DIR }
         : {}),
     };
 
@@ -3741,6 +3809,14 @@ app.get('/api/listenbrainz/discover', async (req, res) => {
           };
         });
 
+        const maxCountParam = Math.min(
+          50,
+          Math.max(10, Number(req.query.count) || 50)
+        );
+        const slicedTracks = req.query.count
+          ? tracks.slice(0, maxCountParam)
+          : tracks;
+
         detailedPlaylists.push({
           id: playlistMbid,
           title: fullPl.title || plSummary.title || 'ListenBrainz Mix',
@@ -3749,14 +3825,76 @@ app.get('/api/listenbrainz/discover', async (req, res) => {
             plSummary.annotation ||
             `Created for ${username} by ListenBrainz`,
           date: fullPl.date || plSummary.date || '',
-          trackCount: tracks.length,
-          inLibraryCount: tracks.filter((t) => t.inLibrary).length,
-          missingCount: tracks.filter((t) => !t.inLibrary).length,
-          tracks,
+          trackCount: slicedTracks.length,
+          inLibraryCount: slicedTracks.filter((t) => t.inLibrary).length,
+          missingCount: slicedTracks.filter((t) => !t.inLibrary).length,
+          tracks: slicedTracks,
         });
       } catch {
         // skip failed individual playlist
       }
+    }
+
+    // Also fetch user's Top Recordings (10 to 50 songs) from ListenBrainz Stats API
+    try {
+      const requestedCount = Math.min(
+        50,
+        Math.max(10, Number(req.query.count) || 25)
+      );
+      const topRecResp = await fetch(
+        `https://api.listenbrainz.org/1/stats/user/${encodeURIComponent(
+          username
+        )}/recordings?count=${requestedCount}&range=month`,
+        { headers: lbHeaders }
+      );
+      if (topRecResp.ok) {
+        const topRecData = await topRecResp.json();
+        const rawRecs = Array.isArray(topRecData?.payload?.recordings)
+          ? topRecData.payload.recordings
+          : [];
+        if (rawRecs.length > 0) {
+          const recTracks = rawRecs.slice(0, requestedCount).map((r, idx) => {
+            const title = r.track_name || 'Unknown Title';
+            const artist = r.artist_name || 'Unknown Artist';
+            const album = r.release_name || '';
+            const normT = normalizeText(title);
+            const normA = normalizeText(artist);
+            const matchedLocal = localLibrary.find(
+              (loc) =>
+                loc.normTitle &&
+                normT &&
+                (loc.normTitle === normT ||
+                  loc.normTitle.includes(normT) ||
+                  normT.includes(loc.normTitle)) &&
+                (!normA ||
+                  !loc.normArtist ||
+                  loc.normArtist.includes(normA) ||
+                  normA.includes(loc.normArtist))
+            );
+            return {
+              id: `lb-toprec-${idx}`,
+              title,
+              artist,
+              album,
+              durationMs: 215000,
+              inLibrary: Boolean(matchedLocal),
+              jellyfinTrackId: matchedLocal?.id || null,
+            };
+          });
+          detailedPlaylists.push({
+            id: `lb-top-recordings-${username}`,
+            title: `ListenBrainz Top ${recTracks.length} Recordings (${username})`,
+            annotation: `Top ${recTracks.length} most-listened recordings on ListenBrainz.org`,
+            date: new Date().toISOString().slice(0, 10),
+            trackCount: recTracks.length,
+            inLibraryCount: recTracks.filter((t) => t.inLibrary).length,
+            missingCount: recTracks.filter((t) => !t.inLibrary).length,
+            tracks: recTracks,
+          });
+        }
+      }
+    } catch {
+      // ignore optional top-recordings error
     }
 
     return res.json({
@@ -3765,6 +3903,13 @@ app.get('/api/listenbrainz/discover', async (req, res) => {
       playlists: detailedPlaylists,
     });
   } catch (err) {
+    pushServerLog(
+      'error',
+      'listenbrainz',
+      err instanceof Error
+        ? err.message
+        : 'Failed to fetch ListenBrainz discovery playlists.'
+    );
     return res.status(500).json({
       ok: false,
       error:
@@ -3772,6 +3917,261 @@ app.get('/api/listenbrainz/discover', async (req, res) => {
           ? err.message
           : 'Failed to fetch ListenBrainz discovery playlists.',
       playlists: [],
+    });
+  }
+});
+
+// POST /api/listenbrainz/grab-mix -> Fetch 10 to 50 songs from ListenBrainz.org, create a Brokeify playlist, and optionally queue missing downloads
+app.post('/api/listenbrainz/grab-mix', async (req, res) => {
+  try {
+    const cfg = readServerConfig();
+    const username = String(
+      req.body?.username || cfg.integrations?.listenbrainzUsername || ''
+    ).trim();
+    const feedType = String(req.body?.feedType || 'weekly-exploration').trim();
+    const songCount = Math.min(
+      50,
+      Math.max(10, Number(req.body?.count) || 25)
+    );
+    const autoDownload = Boolean(req.body?.autoDownload);
+    const downloaderMode = String(req.body?.downloaderMode || 'auto').trim();
+    const lbToken = String(cfg.integrations?.listenbrainzToken || '').trim();
+
+    if (!username) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          'Please enter a ListenBrainz.org username (e.g. your ListenBrainz handle) to fetch 10–50 songs.',
+      });
+    }
+
+    // Persist username in server config if not yet saved
+    if (username !== cfg.integrations?.listenbrainzUsername) {
+      writeServerConfig({
+        integrations: {
+          ...cfg.integrations,
+          listenbrainzUsername: username,
+        },
+      });
+    }
+
+    const lbHeaders: Record<string, string> = {
+      Accept: 'application/json',
+      'User-Agent':
+        'BrokeifyStandalone/3.0 (https://github.com/Mr-Nickey/brokeify)',
+    };
+    if (lbToken) {
+      lbHeaders['Authorization'] = `Token ${lbToken}`;
+    }
+
+    let fetchedTracks: Array<{
+      title: string;
+      artist: string;
+      album: string;
+      durationMs: number;
+    }> = [];
+    let mixTitle = `ListenBrainz Mix (${username})`;
+
+    if (feedType === 'top-recordings') {
+      mixTitle = `ListenBrainz Top ${songCount} (${username})`;
+      const statsResp = await fetch(
+        `https://api.listenbrainz.org/1/stats/user/${encodeURIComponent(
+          username
+        )}/recordings?count=${songCount}&range=all_time`,
+        { headers: lbHeaders }
+      );
+      if (statsResp.ok) {
+        const statsJson = await statsResp.json();
+        const recs = Array.isArray(statsJson?.payload?.recordings)
+          ? statsJson.payload.recordings
+          : [];
+        fetchedTracks = recs.slice(0, songCount).map((r: any) => ({
+          title: r.track_name || 'Unknown Title',
+          artist: r.artist_name || 'Unknown Artist',
+          album: r.release_name || 'ListenBrainz Top Recordings',
+          durationMs: 210000,
+        }));
+      }
+    }
+
+    // Try createdfor playlists (Weekly Exploration / Weekly Jams)
+    if (fetchedTracks.length === 0) {
+      const createdForUrl = `https://api.listenbrainz.org/1/user/${encodeURIComponent(
+        username
+      )}/playlists/createdfor?count=10`;
+      const listResp = await fetch(createdForUrl, { headers: lbHeaders });
+      if (!listResp.ok) {
+        pushServerLog(
+          'warn',
+          'listenbrainz',
+          `ListenBrainz API returned HTTP ${listResp.status} for user "${username}"`
+        );
+        return res.status(listResp.status).json({
+          ok: false,
+          error: `ListenBrainz.org returned HTTP ${listResp.status} for username "${username}". Verify the username exists on listenbrainz.org.`,
+        });
+      }
+      const listData = await listResp.json();
+      const rawPlaylists = Array.isArray(listData?.playlists)
+        ? listData.playlists
+        : [];
+
+      // Sort so preferred feedType (weekly-exploration or weekly-jams) comes first
+      const sorted = [...rawPlaylists].sort((a, b) => {
+        const titleA = String(a?.playlist?.title || '').toLowerCase();
+        const titleB = String(b?.playlist?.title || '').toLowerCase();
+        const targetKeyword =
+          feedType === 'weekly-jams' ? 'jams' : 'exploration';
+        const matchA = titleA.includes(targetKeyword) ? 0 : 1;
+        const matchB = titleB.includes(targetKeyword) ? 0 : 1;
+        return matchA - matchB;
+      });
+
+      for (const entry of sorted) {
+        if (fetchedTracks.length >= songCount) break;
+        const plSummary = entry?.playlist;
+        const mbidMatch = String(plSummary?.identifier || '').match(
+          /([a-f0-9-]{36})$/i
+        );
+        if (!mbidMatch) continue;
+        const plResp = await fetch(
+          `https://api.listenbrainz.org/1/playlist/${mbidMatch[1]}`,
+          { headers: lbHeaders }
+        );
+        if (!plResp.ok) continue;
+        const plData = await plResp.json();
+        const fullPl = plData?.playlist;
+        if (!fullPl) continue;
+        if (fetchedTracks.length === 0 && fullPl.title) {
+          mixTitle = `${fullPl.title} (${songCount} Songs)`;
+        }
+        const rawTracks = Array.isArray(fullPl.track) ? fullPl.track : [];
+        for (const t of rawTracks) {
+          if (fetchedTracks.length >= songCount) break;
+          fetchedTracks.push({
+            title: t.title || 'Unknown Title',
+            artist: t.creator || 'Unknown Artist',
+            album: t.album || fullPl.title || 'ListenBrainz Discovery',
+            durationMs: Number(t.duration || 210000),
+          });
+        }
+      }
+    }
+
+    if (fetchedTracks.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        error: `No Weekly Exploration, Weekly Jams, or Top Recordings found on ListenBrainz.org for "${username}".`,
+      });
+    }
+
+    const finalSlice = fetchedTracks.slice(0, songCount);
+    const localLibrary = getSqliteAudioFingerprints();
+    const playlistId = `lb-mix-${feedType}-${username
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')}`;
+
+    const playlistTracks = finalSlice.map((t, idx) => {
+      const normT = normalizeText(t.title);
+      const normA = normalizeText(t.artist);
+      const matchedLocal = localLibrary.find(
+        (loc) =>
+          loc.normTitle &&
+          normT &&
+          (loc.normTitle === normT ||
+            loc.normTitle.includes(normT) ||
+            normT.includes(loc.normTitle)) &&
+          (!normA ||
+            !loc.normArtist ||
+            loc.normArtist.includes(normA) ||
+            normA.includes(loc.normArtist))
+      );
+      return {
+        id: matchedLocal?.id || `${playlistId}-t-${idx + 1}`,
+        title: t.title,
+        artist: t.artist,
+        album: t.album,
+        durationMs: t.durationMs,
+        durationFormatted: formatDurationMs(t.durationMs),
+        inLibrary: Boolean(matchedLocal),
+        jellyfinId: matchedLocal?.id,
+        playCount: 0,
+      };
+    });
+
+    const savedPlaylist = {
+      id: playlistId,
+      name: mixTitle,
+      source: 'ListenBrainz' as const,
+      externalUrl: `https://listenbrainz.org/user/${encodeURIComponent(
+        username
+      )}/`,
+      lastSynced: 'Just now',
+      coverGradient: 'from-indigo-600 via-purple-700 to-emerald-600',
+      tracks: playlistTracks,
+    };
+
+    upsertPlaylistWithTracks(savedPlaylist);
+
+    const missingTracks = playlistTracks.filter((t) => !t.inLibrary);
+    let queuedCount = 0;
+
+    if (autoDownload && missingTracks.length > 0) {
+      for (const m of missingTracks) {
+        const jobId = `job-lb-${Date.now()}-${Math.random()
+          .toString(36)
+          .slice(2, 7)}`;
+        const label = `${m.artist} - ${m.title}`;
+        slskdJobs.set(jobId, {
+          id: jobId,
+          trackId: m.id,
+          artist: m.artist,
+          title: m.title,
+          album: m.album || '',
+          label,
+          searchText: `${m.artist} ${m.title}`,
+          sourceMode: downloaderMode,
+          sourceEngine: downloaderMode === 'auto' ? 'slskd' : downloaderMode,
+          status: 'queued',
+          message: `Queued from ListenBrainz (${finalSlice.length}-song grab)`,
+          startedAt: new Date().toISOString(),
+          files: [],
+        });
+        dripGrabQueue.push({
+          jobId,
+          sourceMode: downloaderMode,
+        });
+        queuedCount++;
+      }
+      scheduleDripWorker();
+    }
+
+    addPersistentNotification({
+      message: `ListenBrainz: Imported ${finalSlice.length} songs into "${mixTitle}" (${
+        playlistTracks.length - missingTracks.length
+      } in library${
+        queuedCount > 0 ? `, ${queuedCount} queued for download` : ''
+      }).`,
+      category: 'listenbrainz',
+      severity: 'success',
+      service: 'ListenBrainz',
+    });
+
+    return res.json({
+      ok: true,
+      playlist: savedPlaylist,
+      totalFetched: finalSlice.length,
+      inLibraryCount: playlistTracks.length - missingTracks.length,
+      missingCount: missingTracks.length,
+      queuedForDownload: queuedCount,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : 'Failed to grab ListenBrainz mix.',
     });
   }
 });
@@ -4993,10 +5393,17 @@ async function executeYouTubeOrArchiveGrabJob(
         const safeFileBase = `${safeArtist} - ${job.title || job.label}`
           .replace(/[<>:"/\\|?*]/g, '_')
           .slice(0, 120);
-        const artistFolder = path.join(downloadDir, safeArtist);
+        const stagingRoot =
+          cfg.integrations?.autoOrganizeDownloads !== false
+            ? cfg.integrations?.stagingDir || path.join(MUSIC_DIR, '_inbox')
+            : downloadDir;
+        const artistFolder = path.join(stagingRoot, safeArtist);
         fs.mkdirSync(artistFolder, { recursive: true });
         const outTemplate = path.join(artistFolder, `${safeFileBase}.%(ext)s`);
-        const query = `ytsearch1:${job.searchText} official audio`;
+        const negativeSuffix = Array.isArray(job.negativeKeywords) && job.negativeKeywords.length > 0
+          ? ' ' + job.negativeKeywords.map((kw: string) => `-${kw}`).join(' ')
+          : '';
+        const query = `ytsearch1:${job.searchText} official audio${negativeSuffix}`;
 
         job.status = 'downloading';
         job.matchedPeer = 'YouTube Music (yt-dlp)';
@@ -5020,12 +5427,33 @@ async function executeYouTubeOrArchiveGrabJob(
           { timeout: 120000 }
         );
 
-        const finalFile = path.join(
+        let finalFile = path.join(
           artistFolder,
           `${safeFileBase}.${audioFormat}`
         );
-        await indexAudioFile(finalFile);
-        reconcilePlaylistsWithLibrary();
+
+        // AcoustID + MusicBrainz + Cover Art Archive Auto-Identify & Organize into /music/{Artist}/{Album} ({Year})/{TrackNumber} - {Title}.{ext}
+        if (cfg.integrations?.autoOrganizeDownloads !== false) {
+          try {
+            const orgRes = await fingerprintTagAndOrganizeFile(finalFile, {
+              acoustidApiKey: cfg.integrations?.acoustidApiKey,
+              hintArtist: job.artist,
+              hintTitle: job.title || job.label,
+              hintAlbum: job.album,
+              moveToLibraryRoot: true,
+            });
+            if (orgRes.ok && orgRes.finalPath) {
+              finalFile = orgRes.finalPath;
+              job.organizedPath = orgRes.finalPath;
+            }
+          } catch {
+            await indexAudioFile(finalFile);
+            reconcilePlaylistsWithLibrary();
+          }
+        } else {
+          await indexAudioFile(finalFile);
+          reconcilePlaylistsWithLibrary();
+        }
 
         job.files = [
           {
@@ -5037,11 +5465,11 @@ async function executeYouTubeOrArchiveGrabJob(
         ];
         job.status = 'completed';
         job.completedAt = new Date().toISOString();
-        job.message = `✓ Downloaded via YouTube Music (yt-dlp) & added to library!`;
+        job.message = `✓ Downloaded, fingerprinted & organized into ${path.relative(MUSIC_DIR, finalFile)}!`;
         pushServerLog(
           'info',
           'youtube',
-          `Completed yt-dlp download for "${job.label}" -> ${finalFile}`
+          `Completed yt-dlp download & organized "${job.label}" -> ${finalFile}`
         );
 
         readyNotifications.unshift({
@@ -5050,6 +5478,14 @@ async function executeYouTubeOrArchiveGrabJob(
           label: job.label,
           message: `${job.label} is ready to play in your Brokeify library!`,
           completedAt: job.completedAt,
+        });
+        addPersistentNotification({
+          id: `notif-${job.id}`,
+          message: `${job.label} downloaded, fingerprinted & organized into /music!`,
+          category: 'download',
+          severity: 'success',
+          service: 'yt-dlp',
+          trackId: job.trackId || undefined,
         });
         return;
       } catch {
@@ -5118,6 +5554,14 @@ async function executeYouTubeOrArchiveGrabJob(
               message: `${job.label} is ready via YouTube Music!`,
               completedAt: job.completedAt,
             });
+            addPersistentNotification({
+              id: `notif-${job.id}`,
+              message: `${job.label} is ready via YouTube Music!`,
+              category: 'download',
+              severity: 'success',
+              service: 'YouTube Music',
+              trackId: job.trackId || undefined,
+            });
             return;
           }
         } catch {
@@ -5177,6 +5621,14 @@ async function executeYouTubeOrArchiveGrabJob(
               label: job.label,
               message: `${job.label} is ready via Open Audio Archive!`,
               completedAt: job.completedAt,
+            });
+            addPersistentNotification({
+              id: `notif-${job.id}`,
+              message: `${job.label} is ready via Open Audio Archive!`,
+              category: 'download',
+              severity: 'success',
+              service: 'Open Audio Archive',
+              trackId: job.trackId || undefined,
             });
             return;
           }
@@ -5789,6 +6241,14 @@ async function executeLidarrGrabJob(job, override = {}) {
       label: job.label,
       message: `${job.label} added & triggered in Lidarr (${rootFolderPath})!`,
       completedAt: job.completedAt,
+    });
+    addPersistentNotification({
+      id: `notif-${job.id}`,
+      message: `${job.label} added & triggered in Lidarr (${rootFolderPath})!`,
+      category: 'lidarr',
+      severity: 'success',
+      service: 'Lidarr',
+      trackId: job.trackId || undefined,
     });
     return true;
   } catch (err) {
@@ -6634,6 +7094,14 @@ async function pollSlskdTransfersAndScanLocalLibrary() {
           label: job.label,
           message: `${job.label} is ready to play in your library!`,
           completedAt: job.completedAt,
+        });
+        addPersistentNotification({
+          id: `notif-${job.id}`,
+          message: `${job.label} downloaded via slskd & indexed into /music!`,
+          category: 'download',
+          severity: 'success',
+          service: 'slskd',
+          trackId: job.trackId || undefined,
         });
       }
     }
@@ -7533,6 +8001,860 @@ const handleRunDiagnosticsCheck = async (_req: any, res: any) => {
 
 app.get('/api/debug/diagnostics', handleRunDiagnosticsCheck);
 app.post('/api/debug/diagnostics', handleRunDiagnosticsCheck);
+
+// ============================================================================
+// 13B. PERSISTENT NOTIFICATION CENTER API (/api/notifications)
+// ============================================================================
+
+app.get('/api/notifications', (_req, res) => {
+  const cfg = readServerConfig();
+  const data = getPersistentNotifications(120);
+  return res.json({
+    ok: true,
+    notificationMode: cfg.notificationMode || 'bell_only',
+    ...data,
+  });
+});
+
+app.post('/api/notifications/read', (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids : undefined;
+  const data = markPersistentNotificationsRead(ids);
+  return res.json({
+    ok: true,
+    ...data,
+  });
+});
+
+app.post('/api/notifications/delete', (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids : undefined;
+  if (!ids || ids.length === 0) {
+    readyNotifications.length = 0;
+  }
+  const data = deletePersistentNotifications(ids);
+  return res.json({
+    ok: true,
+    ...data,
+  });
+});
+
+app.delete('/api/notifications', (_req, res) => {
+  readyNotifications.length = 0;
+  const data = deletePersistentNotifications();
+  return res.json({
+    ok: true,
+    ...data,
+  });
+});
+
+// ============================================================================
+// 13C. STAGING INBOX AUTO-ORGANIZER, WEB FILE & TAG MANAGER, AND WRONG-TRACK AUTO-REPLACEMENT
+// ============================================================================
+
+const AUDIO_FILE_EXTENSIONS = new Set([
+  '.mp3',
+  '.flac',
+  '.m4a',
+  '.aac',
+  '.ogg',
+  '.opus',
+  '.wav',
+]);
+
+let isScanningStagingInbox = false;
+
+async function scanAndOrganizeStagingInbox() {
+  if (isScanningStagingInbox) return { organizedCount: 0, files: [] };
+  const cfg = readServerConfig();
+  if (cfg.integrations?.autoOrganizeDownloads === false) {
+    return { organizedCount: 0, files: [] };
+  }
+
+  const stagingDir =
+    cfg.integrations?.stagingDir || path.join(getMusicDir(), '_inbox');
+  if (!fs.existsSync(stagingDir)) {
+    return { organizedCount: 0, files: [] };
+  }
+
+  isScanningStagingInbox = true;
+  const organizedFiles: Array<{ from: string; to: string; title?: string; artist?: string }> = [];
+  try {
+    const collectAudioFiles = (dir: string, acc: string[] = []): string[] => {
+      if (!fs.existsSync(dir)) return acc;
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.name.startsWith('.')) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          collectAudioFiles(full, acc);
+        } else if (
+          entry.isFile() &&
+          AUDIO_FILE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())
+        ) {
+          acc.push(full);
+        }
+      }
+      return acc;
+    };
+
+    const inboxAudioFiles = collectAudioFiles(stagingDir);
+    for (const filePath of inboxAudioFiles) {
+      try {
+        const res = await fingerprintTagAndOrganizeFile(filePath, {
+          acoustidApiKey: cfg.integrations?.acoustidApiKey,
+          moveToLibraryRoot: true,
+        });
+        if (res.ok) {
+          organizedFiles.push({
+            from: filePath,
+            to: res.finalPath,
+            title: res.identified.title,
+            artist: res.identified.artist,
+          });
+        }
+      } catch {
+        // continue with next file
+      }
+    }
+
+    if (organizedFiles.length > 0) {
+      addPersistentNotification({
+        message: `Staging Auto-Organizer: Fingerprinted, tagged & organized ${organizedFiles.length} incoming track(s) from ${stagingDir} into /music.`,
+        category: 'library',
+        severity: 'success',
+        service: 'Auto-Organizer',
+      });
+    }
+  } catch {
+    // ignore
+  } finally {
+    isScanningStagingInbox = false;
+  }
+
+  return {
+    organizedCount: organizedFiles.length,
+    files: organizedFiles,
+  };
+}
+
+setInterval(() => {
+  scanAndOrganizeStagingInbox().catch(() => {});
+}, 15000);
+
+app.post('/api/staging/scan', async (_req, res) => {
+  const result = await scanAndOrganizeStagingInbox();
+  return res.json({
+    ok: true,
+    ...result,
+  });
+});
+
+// GET /api/files/browse?path=... -> Sandboxed directory & audio tag browser inside /music
+app.get('/api/files/browse', (req, res) => {
+  const relParam = String(req.query.path || '');
+  const resolved = resolveSandboxedMusicPath(relParam);
+  if (!resolved.ok) {
+    return res.status(400).json({ ok: false, error: resolved.error });
+  }
+
+  const musicRoot = getMusicDir();
+  try {
+    fs.mkdirSync(musicRoot, { recursive: true });
+    const inboxDir = path.join(musicRoot, '_inbox');
+    fs.mkdirSync(inboxDir, { recursive: true });
+  } catch {}
+
+  if (!fs.existsSync(resolved.fullPath)) {
+    return res.json({
+      ok: true,
+      musicRoot,
+      currentPath: resolved.relativePath,
+      folders: [],
+      files: [],
+    });
+  }
+
+  try {
+    const entries = fs.readdirSync(resolved.fullPath, { withFileTypes: true });
+    const allIndexedTracks = queryTracks({ limit: 10000 });
+    const trackByPath = new Map<string, any>();
+    for (const t of allIndexedTracks) {
+      if (t.filePath) {
+        trackByPath.set(path.resolve(t.filePath), t);
+      }
+    }
+
+    const folders: any[] = [];
+    const files: any[] = [];
+
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      const fullEntryPath = path.join(resolved.fullPath, entry.name);
+      const relEntryPath = path
+        .relative(musicRoot, fullEntryPath)
+        .replace(/\\/g, '/');
+
+      if (entry.isDirectory()) {
+        let childCount = 0;
+        try {
+          childCount = fs
+            .readdirSync(fullEntryPath)
+            .filter((n) => !n.startsWith('.')).length;
+        } catch {}
+        folders.push({
+          name: entry.name,
+          relativePath: relEntryPath,
+          childCount,
+          isStagingInbox: entry.name === '_inbox',
+        });
+      } else if (entry.isFile()) {
+        const ext = path.extname(entry.name).toLowerCase();
+        if (!AUDIO_FILE_EXTENSIONS.has(ext) && ext !== '.m3u' && ext !== '.m3u8') {
+          continue;
+        }
+        let stat: fs.Stats | null = null;
+        try {
+          stat = fs.statSync(fullEntryPath);
+        } catch {}
+        const indexed = trackByPath.get(path.resolve(fullEntryPath));
+        files.push({
+          name: entry.name,
+          relativePath: relEntryPath,
+          extension: ext,
+          sizeBytes: stat?.size || 0,
+          modifiedAt: stat?.mtime ? stat.mtime.toISOString() : '',
+          trackId: indexed?.id || null,
+          title: indexed?.title || path.basename(entry.name, ext),
+          artist: indexed?.artist || 'Unknown Artist',
+          album: indexed?.album || 'Unknown Album',
+          trackNumber: indexed?.trackNumber || 1,
+          discNumber: indexed?.discNumber || 1,
+          year: indexed?.year || null,
+          genre: indexed?.genre || 'Unknown',
+          durationSec: indexed?.duration || 0,
+          bitrate: indexed?.bitrate || 0,
+          format: indexed?.format || ext.replace('.', '').toUpperCase(),
+          artworkUrl: indexed?.artworkUrl || null,
+          mbid: indexed?.mbid || null,
+          variantFlags: detectVariantFlagsInText(
+            `${indexed?.title || entry.name} ${indexed?.album || ''}`
+          ),
+        });
+      }
+    }
+
+    folders.sort((a, b) => {
+      if (a.isStagingInbox && !b.isStagingInbox) return -1;
+      if (!a.isStagingInbox && b.isStagingInbox) return 1;
+      return a.name.localeCompare(b.name);
+    });
+    files.sort((a, b) => (a.trackNumber || 0) - (b.trackNumber || 0) || a.name.localeCompare(b.name));
+
+    return res.json({
+      ok: true,
+      musicRoot,
+      currentPath: resolved.relativePath,
+      folders,
+      files,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Failed to browse directory.',
+    });
+  }
+});
+
+// POST /api/files/mkdir -> Create a new folder inside /music
+app.post('/api/files/mkdir', (req, res) => {
+  const parentRel = String(req.body?.parentPath || '');
+  const folderName = String(req.body?.folderName || '').trim();
+  if (!folderName) {
+    return res.status(400).json({ ok: false, error: 'Folder name is required.' });
+  }
+  const resolved = resolveSandboxedMusicPath(
+    path.posix.join(parentRel, folderName.replace(/[<>:"/\\|?*]/g, '_'))
+  );
+  if (!resolved.ok) {
+    return res.status(400).json({ ok: false, error: resolved.error });
+  }
+  try {
+    fs.mkdirSync(resolved.fullPath, { recursive: true });
+    return res.json({ ok: true, relativePath: resolved.relativePath });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Failed to create folder.',
+    });
+  }
+});
+
+// POST /api/files/rename -> Rename a file or folder inside /music
+app.post('/api/files/rename', async (req, res) => {
+  const sourceRel = String(req.body?.relativePath || '');
+  const newName = String(req.body?.newName || '')
+    .replace(/[<>:"/\\|?*]/g, '_')
+    .trim();
+  if (!sourceRel || !newName) {
+    return res
+      .status(400)
+      .json({ ok: false, error: 'relativePath and newName are required.' });
+  }
+
+  const srcResolved = resolveSandboxedMusicPath(sourceRel);
+  if (!srcResolved.ok || !fs.existsSync(srcResolved.fullPath)) {
+    return res.status(404).json({ ok: false, error: 'Source file/folder not found.' });
+  }
+
+  const parentDirRel = path.posix.dirname(srcResolved.relativePath);
+  const destResolved = resolveSandboxedMusicPath(
+    parentDirRel === '.' ? newName : `${parentDirRel}/${newName}`
+  );
+  if (!destResolved.ok) {
+    return res.status(400).json({ ok: false, error: destResolved.error });
+  }
+
+  try {
+    const isDir = fs.statSync(srcResolved.fullPath).isDirectory();
+    if (!isDir) {
+      removeAudioFileFromIndex(srcResolved.fullPath);
+    }
+    fs.renameSync(srcResolved.fullPath, destResolved.fullPath);
+    if (isDir) {
+      await runFullLibraryScan();
+    } else {
+      await indexAudioFile(destResolved.fullPath);
+    }
+    reconcilePlaylistsWithLibrary();
+    return res.json({
+      ok: true,
+      oldPath: srcResolved.relativePath,
+      newPath: destResolved.relativePath,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Failed to rename item.',
+    });
+  }
+});
+
+// POST /api/files/move -> Move files/folders into target folder inside /music
+app.post('/api/files/move', async (req, res) => {
+  const pathsToMove: string[] = Array.isArray(req.body?.paths)
+    ? req.body.paths
+    : req.body?.relativePath
+      ? [req.body.relativePath]
+      : [];
+  const targetFolderRel = String(req.body?.targetFolder || '');
+
+  const destFolder = resolveSandboxedMusicPath(targetFolderRel);
+  if (!destFolder.ok) {
+    return res.status(400).json({ ok: false, error: destFolder.error });
+  }
+
+  try {
+    fs.mkdirSync(destFolder.fullPath, { recursive: true });
+    const moved: string[] = [];
+
+    for (const rel of pathsToMove) {
+      const src = resolveSandboxedMusicPath(rel);
+      if (!src.ok || !fs.existsSync(src.fullPath)) continue;
+      const baseName = path.basename(src.fullPath);
+      const targetFull = path.join(destFolder.fullPath, baseName);
+      if (path.resolve(targetFull) === path.resolve(src.fullPath)) continue;
+
+      const isDir = fs.statSync(src.fullPath).isDirectory();
+      if (!isDir) {
+        removeAudioFileFromIndex(src.fullPath);
+      }
+      const oldParent = path.dirname(src.fullPath);
+      fs.renameSync(src.fullPath, targetFull);
+      if (!isDir) {
+        await indexAudioFile(targetFull);
+      }
+      cleanupEmptyParentDirs(oldParent, getMusicDir());
+      moved.push(baseName);
+    }
+
+    await runFullLibraryScan();
+    reconcilePlaylistsWithLibrary();
+    return res.json({
+      ok: true,
+      movedCount: moved.length,
+      targetFolder: destFolder.relativePath,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Failed to move files.',
+    });
+  }
+});
+
+// POST /api/files/delete -> Delete unwanted files/folders inside /music
+app.post('/api/files/delete', async (req, res) => {
+  const pathsToDelete: string[] = Array.isArray(req.body?.paths)
+    ? req.body.paths
+    : req.body?.relativePath
+      ? [req.body.relativePath]
+      : [];
+
+  if (pathsToDelete.length === 0) {
+    return res.status(400).json({ ok: false, error: 'No paths specified.' });
+  }
+
+  try {
+    let deletedCount = 0;
+    for (const rel of pathsToDelete) {
+      const target = resolveSandboxedMusicPath(rel);
+      if (
+        !target.ok ||
+        !target.relativePath ||
+        !fs.existsSync(target.fullPath)
+      ) {
+        continue;
+      }
+      const stat = fs.statSync(target.fullPath);
+      const parentDir = path.dirname(target.fullPath);
+      if (stat.isDirectory()) {
+        fs.rmSync(target.fullPath, { recursive: true, force: true });
+      } else {
+        removeAudioFileFromIndex(target.fullPath);
+        fs.unlinkSync(target.fullPath);
+      }
+      cleanupEmptyParentDirs(parentDir, getMusicDir());
+      deletedCount++;
+    }
+
+    await runFullLibraryScan();
+    reconcilePlaylistsWithLibrary();
+    return res.json({ ok: true, deletedCount });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Failed to delete item(s).',
+    });
+  }
+});
+
+// POST /api/files/bulk-tag -> Bulk-edit metadata tags (Title, Artist, Album, Track #, Year, Genre, Cover Art) & optionally reorganize path
+app.post('/api/files/bulk-tag', async (req, res) => {
+  const items: Array<{
+    relativePath: string;
+    trackId?: string;
+    title?: string;
+    artist?: string;
+    album?: string;
+    trackNumber?: number;
+    discNumber?: number;
+    year?: number;
+    genre?: string;
+  }> = Array.isArray(req.body?.items) ? req.body.items : [];
+  const sharedTags = req.body?.sharedTags || {};
+  const organizeFiles = Boolean(req.body?.organizeFiles);
+
+  if (items.length === 0) {
+    return res.status(400).json({ ok: false, error: 'No files selected for tagging.' });
+  }
+
+  try {
+    let updatedCount = 0;
+    for (const item of items) {
+      const resolved = resolveSandboxedMusicPath(item.relativePath);
+      if (!resolved.ok || !fs.existsSync(resolved.fullPath)) continue;
+
+      const mergedMeta = {
+        title: item.title || sharedTags.title || undefined,
+        artist: item.artist || sharedTags.artist || undefined,
+        album: item.album || sharedTags.album || undefined,
+        trackNumber:
+          item.trackNumber !== undefined
+            ? Number(item.trackNumber)
+            : sharedTags.trackNumber !== undefined
+              ? Number(sharedTags.trackNumber)
+              : undefined,
+        discNumber:
+          item.discNumber !== undefined
+            ? Number(item.discNumber)
+            : sharedTags.discNumber !== undefined
+              ? Number(sharedTags.discNumber)
+              : undefined,
+        year:
+          item.year !== undefined
+            ? Number(item.year)
+            : sharedTags.year !== undefined
+              ? Number(sharedTags.year)
+              : undefined,
+        genre: item.genre || sharedTags.genre || undefined,
+      };
+
+      await embedMetadataAndArtworkIntoFile(resolved.fullPath, mergedMeta);
+
+      let finalPath = resolved.fullPath;
+      if (organizeFiles && (mergedMeta.artist || mergedMeta.album || mergedMeta.title)) {
+        const ext = path.extname(resolved.fullPath) || '.mp3';
+        const dest = buildOrganizedTrackDestination(getMusicDir(), {
+          artist: mergedMeta.artist || 'Unknown Artist',
+          album: mergedMeta.album || 'Singles',
+          year: mergedMeta.year,
+          trackNumber: mergedMeta.trackNumber || 1,
+          title: mergedMeta.title || path.basename(resolved.fullPath, ext),
+          ext,
+        });
+        if (path.resolve(dest) !== path.resolve(resolved.fullPath)) {
+          const oldDir = path.dirname(resolved.fullPath);
+          removeAudioFileFromIndex(resolved.fullPath);
+          fs.mkdirSync(path.dirname(dest), { recursive: true });
+          fs.renameSync(resolved.fullPath, dest);
+          cleanupEmptyParentDirs(oldDir, getMusicDir());
+          finalPath = dest;
+        }
+      }
+
+      const row = await indexAudioFile(finalPath);
+      if (row) {
+        updateTrackMetadataInDb(row.id, mergedMeta);
+      }
+      updatedCount++;
+    }
+
+    reconcilePlaylistsWithLibrary();
+    return res.json({
+      ok: true,
+      updatedCount,
+      message: `Updated tags on ${updatedCount} audio file(s).`,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : 'Bulk tag update failed.',
+    });
+  }
+});
+
+// POST /api/files/identify-folder -> 1-Click "Auto-Identify & Organize Folder" with Before/After Preview & Apply
+app.post('/api/files/identify-folder', async (req, res) => {
+  const folderRel = String(req.body?.relativePath || '');
+  const applyChanges = Boolean(req.body?.apply);
+  const cfg = readServerConfig();
+
+  const resolved = resolveSandboxedMusicPath(folderRel);
+  if (!resolved.ok || !fs.existsSync(resolved.fullPath)) {
+    return res.status(404).json({ ok: false, error: 'Target folder not found.' });
+  }
+
+  try {
+    const entries = fs.readdirSync(resolved.fullPath, { withFileTypes: true });
+    const audioFiles = entries
+      .filter(
+        (e) =>
+          e.isFile() &&
+          !e.name.startsWith('.') &&
+          AUDIO_FILE_EXTENSIONS.has(path.extname(e.name).toLowerCase())
+      )
+      .map((e) => path.join(resolved.fullPath, e.name));
+
+    const musicRoot = getMusicDir();
+    const previewItems: any[] = [];
+
+    for (const filePath of audioFiles) {
+      const relBefore = path.relative(musicRoot, filePath).replace(/\\/g, '/');
+      const ext = path.extname(filePath) || '.mp3';
+
+      if (applyChanges) {
+        removeAudioFileFromIndex(filePath);
+        const org = await fingerprintTagAndOrganizeFile(filePath, {
+          acoustidApiKey: cfg.integrations?.acoustidApiKey,
+          moveToLibraryRoot: true,
+        });
+        const relAfter = path
+          .relative(musicRoot, org.finalPath)
+          .replace(/\\/g, '/');
+        previewItems.push({
+          beforePath: relBefore,
+          afterPath: relAfter,
+          title: org.identified.title,
+          artist: org.identified.artist,
+          album: org.identified.album,
+          trackNumber: org.identified.trackNumber,
+          year: org.identified.year,
+          recordingMbid: org.identified.recordingMbid,
+          coverArtUrl: org.identified.coverArtUrl,
+          sourceMethod: org.identified.sourceMethod,
+          detectedVariantFlags: org.identified.detectedVariantFlags,
+          applied: true,
+        });
+      } else {
+        const identified = await identifyAudioFileWithAcoustIdAndMusicBrainz(
+          filePath,
+          {
+            acoustidApiKey: cfg.integrations?.acoustidApiKey,
+            downloadArtwork: true,
+          }
+        );
+        const targetDest = buildOrganizedTrackDestination(musicRoot, {
+          artist: identified.artist || 'Unknown Artist',
+          album: identified.album || 'Singles',
+          year: identified.year,
+          trackNumber: identified.trackNumber,
+          title: identified.title || path.basename(filePath, ext),
+          ext,
+        });
+        const relAfter = path
+          .relative(musicRoot, targetDest)
+          .replace(/\\/g, '/');
+        previewItems.push({
+          beforePath: relBefore,
+          afterPath: relAfter,
+          title: identified.title,
+          artist: identified.artist,
+          album: identified.album,
+          trackNumber: identified.trackNumber,
+          year: identified.year,
+          recordingMbid: identified.recordingMbid,
+          coverArtUrl: identified.coverArtUrl,
+          sourceMethod: identified.sourceMethod,
+          detectedVariantFlags: identified.detectedVariantFlags,
+          applied: false,
+        });
+      }
+    }
+
+    if (applyChanges && previewItems.length > 0) {
+      addPersistentNotification({
+        message: `Auto-Identify & Organize: Fingerprinted, tagged & organized ${previewItems.length} track(s) in "${folderRel || '/music'}".`,
+        category: 'library',
+        severity: 'success',
+        service: 'AcoustID + MusicBrainz',
+      });
+    }
+
+    return res.json({
+      ok: true,
+      applied: applyChanges,
+      folderPath: resolved.relativePath,
+      items: previewItems,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : 'Failed to identify and organize folder.',
+    });
+  }
+});
+
+// GET /api/library/organize/status -> Get real-time status of the background library organizer job
+app.get('/api/library/organize/status', (_req, res) => {
+  const job = getLibraryOrganizeJobState();
+  return res.json({ ok: true, job });
+});
+
+// POST /api/library/organize/start -> Start full or targeted library organization & tag cleanup
+app.post('/api/library/organize/start', async (req, res) => {
+  const cfg = readServerConfig();
+  const targetPath = String(req.body?.targetPath || '');
+  const recursive = req.body?.recursive !== false;
+  const dryRun = Boolean(req.body?.dryRun);
+  const skipOrganized = Boolean(req.body?.skipOrganized);
+  const includeInbox = Boolean(req.body?.includeInbox);
+
+  const job = await startLibraryOrganizeJob({
+    targetPath,
+    recursive,
+    dryRun,
+    skipOrganized,
+    includeInbox,
+    acoustidApiKey: cfg.integrations?.acoustidApiKey,
+  });
+
+  return res.json({ ok: true, job });
+});
+
+// POST /api/library/organize/cancel -> Cancel running organization job
+app.post('/api/library/organize/cancel', (_req, res) => {
+  const job = cancelLibraryOrganizeJob();
+  return res.json({ ok: true, job });
+});
+
+// POST /api/library/organize/apply -> Apply dry-run previewed items to library disk
+app.post('/api/library/organize/apply', async (_req, res) => {
+  const cfg = readServerConfig();
+  const job = await applyPreviewedLibraryOrganizeJob(
+    cfg.integrations?.acoustidApiKey
+  );
+  return res.json({ ok: true, job });
+});
+
+
+// POST /api/tracks/report-wrong -> "Report Wrong Track" Quarantine + Smart Re-Grab with Negative Keyword Filters
+app.post('/api/tracks/report-wrong', async (req, res) => {
+  try {
+    const trackId = String(req.body?.trackId || '').trim();
+    const playlistId = String(req.body?.playlistId || '').trim();
+    const reason = String(req.body?.reason || 'wrong_song').trim();
+    const rawTitle = String(req.body?.title || '').trim();
+    const rawArtist = String(req.body?.artist || '').trim();
+    const rawAlbum = String(req.body?.album || '').trim();
+
+    const reasonLabels: Record<string, string> = {
+      wrong_song: 'Wrong Song / Mismatch',
+      unwanted_remix: 'Unwanted Remix / Edit',
+      unwanted_live: 'Unwanted Live Version',
+      unwanted_acoustic: 'Unwanted Acoustic / Cover',
+    };
+    const reasonLabel = reasonLabels[reason] || 'Wrong Song / Mismatch';
+
+    // 1. Lookup track in SQLite if present, quarantine/remove the bad audio file, and mark Missing
+    const existingTrack = trackId ? getTrackWithArtistAlbum(trackId) : null;
+    const targetTitle = rawTitle || existingTrack?.title || 'Unknown Title';
+    const targetArtist = rawArtist || existingTrack?.artist || 'Unknown Artist';
+    const targetAlbum = rawAlbum || existingTrack?.album || '';
+
+    let quarantinedPath: string | null = null;
+    if (existingTrack?.filePath && fs.existsSync(existingTrack.filePath)) {
+      try {
+        fs.mkdirSync(QUARANTINE_DIR, { recursive: true });
+        const qFile = path.join(
+          QUARANTINE_DIR,
+          `${Date.now()}-${path.basename(existingTrack.filePath)}`
+        );
+        const parentDir = path.dirname(existingTrack.filePath);
+        fs.renameSync(existingTrack.filePath, qFile);
+        quarantinedPath = qFile;
+        cleanupEmptyParentDirs(parentDir, getMusicDir());
+      } catch {
+        try {
+          fs.unlinkSync(existingTrack.filePath);
+        } catch {}
+      }
+    }
+
+    if (trackId) {
+      deleteTrackFromDb(trackId);
+    }
+
+    // Mark matching tracks in all playlists as Missing (inLibrary: false)
+    const allPlaylists = queryPlaylists();
+    const normTargetT = normalizeText(targetTitle);
+    const normTargetA = normalizeText(targetArtist);
+    for (const pl of allPlaylists) {
+      if (!Array.isArray(pl.tracks)) continue;
+      let changed = false;
+      const updatedTracks = pl.tracks.map((pt: any) => {
+        const matchById =
+          trackId && (pt.id === trackId || pt.jellyfinId === trackId);
+        const matchByName =
+          normalizeText(pt.title) === normTargetT &&
+          (!normTargetA ||
+            normalizeText(pt.artist).includes(normTargetA) ||
+            normTargetA.includes(normalizeText(pt.artist)));
+        if (matchById || matchByName) {
+          changed = true;
+          return {
+            ...pt,
+            inLibrary: false,
+            jellyfinId: undefined,
+          };
+        }
+        return pt;
+      });
+      if (changed) {
+        upsertPlaylistWithTracks({
+          ...pl,
+          tracks: updatedTracks,
+        });
+      }
+    }
+
+    // 2. Build Negative Keyword Filters (excluding live, remix, acoustic, instrumental, karaoke, cover unless in official title)
+    const baseNegatives = [
+      'live',
+      'remix',
+      'acoustic',
+      'instrumental',
+      'karaoke',
+      'cover',
+      'tribute',
+      'bootleg',
+      'rework',
+    ];
+    const titleLower = targetTitle.toLowerCase();
+    const negativeKeywords = baseNegatives.filter(
+      (kw) => !titleLower.includes(kw)
+    );
+
+    // 3. Re-queue a smart replacement download with negative keyword filters & AcoustID verification
+    const cfg = readServerConfig();
+    const { slskdUrl, slskdApiKey } = getSlskdConfig();
+    const strictFilters = {
+      ...(cfg.discoveryFilters || {}),
+      excludeLive: !titleLower.includes('live'),
+      excludeRemix: !titleLower.includes('remix'),
+      excludeAcoustic: !titleLower.includes('acoustic'),
+      excludeInstrumental: !titleLower.includes('instrumental'),
+      customExcludedWords: Array.from(
+        new Set([
+          ...(cfg.discoveryFilters?.customExcludedWords || []),
+          ...negativeKeywords,
+        ])
+      ),
+    };
+
+    const replacementJob = createAndEnqueueTrackGrabJob({
+      artist: targetArtist,
+      title: targetTitle,
+      album: targetAlbum,
+      sourceMode: cfg.integrations?.preferredDownloader || 'auto',
+      slskdUrl,
+      slskdApiKey,
+      activeFilters: strictFilters,
+      ignoreFilters: false,
+      playlistId: playlistId || null,
+      ghostTrackId: trackId || null,
+    });
+
+    if (replacementJob) {
+      replacementJob.negativeKeywords = negativeKeywords;
+      replacementJob.verifyAcoustId = true;
+      replacementJob.reportedReason = reasonLabel;
+      replacementJob.message = `Re-queued clean replacement (${reasonLabel}) — filtering out [${negativeKeywords
+        .slice(0, 5)
+        .join(', ')}]`;
+    }
+
+    // 4. Log an alert in the Alerts Bell
+    const alertMsg = `Reported "${targetArtist} - ${targetTitle}" (${reasonLabel}): Quarantined bad audio file, marked Missing, and queued verified replacement download (excluding ${negativeKeywords
+      .slice(0, 5)
+      .join(', ')}).`;
+    addPersistentNotification({
+      message: alertMsg,
+      category: 'download',
+      severity: 'warn',
+      service: 'Wrong-Track Auto-Replacer',
+      trackId: trackId || undefined,
+    });
+
+    return res.json({
+      ok: true,
+      quarantinedPath,
+      negativeKeywords,
+      job: replacementJob,
+      playlists: queryPlaylists(),
+      message: alertMsg,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : 'Failed to process wrong-track report.',
+    });
+  }
+});
 
 // ============================================================================
 // 14. VERSION CHECKER

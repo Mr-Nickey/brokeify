@@ -24,9 +24,11 @@ services:
       - LIDARR_API_KEY=${LIDARR_API_KEY:-}
       - LISTENBRAINZ_USER=${LISTENBRAINZ_USER:-}
       - LISTENBRAINZ_TOKEN=${LISTENBRAINZ_TOKEN:-}
+      - ACOUSTID_API_KEY=${ACOUSTID_API_KEY:-}
+      - STAGING_DIR=${STAGING_DIR:-/music/_inbox}
     volumes:
       # Persistent SQLite database (/data/brokeify.db), JWT secret, and extracted album cover cache
       - ./data:/data
-      # Mount your local music collection (:ro for read-only safety, or :rw if using built-in downloaders/taggers)
-      - /path/to/your/music:/music:ro
+      # Mount your local music collection read-write so Brokeify can organize files, write tags, and embed cover art
+      - /path/to/your/music:/music
 

@@ -23,6 +23,7 @@ import {
   Radio,
   Mic2,
   Moon,
+  Flag,
 } from 'lucide-react';
 import { Track, EQPresetName, StabilizerStrength } from '../types/music';
 import { computeTrackStabilizationGain } from '../utils/musicLogic';
@@ -79,6 +80,7 @@ interface NowPlayingDrawerProps {
   likedTrackIds?: Set<string>;
   onToggleLikeTrack?: (track: Track) => void;
   onStartTrackRadio?: (track: Track) => void;
+  onReportWrongTrack?: (track: Track) => void;
   sleepTimerMinutes?: number | null;
   sleepTimerRemainingSec?: number | null;
   onSetSleepTimerMinutes?: (minutes: number | null) => void;
@@ -173,6 +175,7 @@ export const NowPlayingDrawer: React.FC<NowPlayingDrawerProps> = ({
   likedTrackIds,
   onToggleLikeTrack,
   onStartTrackRadio,
+  onReportWrongTrack,
   sleepTimerMinutes = null,
   sleepTimerRemainingSec = null,
   onSetSleepTimerMinutes,
@@ -523,6 +526,18 @@ export const NowPlayingDrawer: React.FC<NowPlayingDrawerProps> = ({
                     <Mic2 className="w-3.5 h-3.5" />
                     <span>Sing-Along Lyrics</span>
                   </button>
+
+                  {onReportWrongTrack && (
+                    <button
+                      type="button"
+                      onClick={() => onReportWrongTrack(currentTrack)}
+                      data-testid="drawer-report-wrong-track-btn"
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-amber-500/50 bg-amber-950/35 hover:bg-amber-900/50 px-3 py-1.5 text-xs font-mono font-bold text-amber-300 transition-colors"
+                    >
+                      <Flag className="w-3.5 h-3.5 text-amber-400" />
+                      <span>Report / Wrong Song</span>
+                    </button>
+                  )}
                 </div>
               </div>
             </div>

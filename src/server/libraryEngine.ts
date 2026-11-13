@@ -210,6 +210,18 @@ export interface ScrobbleRow {
   synced_listenbrainz: number;
 }
 
+export interface NotificationRow {
+  id: string;
+  message: string;
+  category: 'system' | 'download' | 'security' | 'library';
+  severity: 'info' | 'success' | 'warn' | 'error';
+  service?: string;
+  dedupKey?: string;
+  createdAt: string;
+  timestampMs: number;
+  read: boolean;
+}
+
 interface PersistedDatabaseSchema {
   engine: 'brokeify-embedded-db-v2';
   savedAt: string;
@@ -220,6 +232,7 @@ interface PersistedDatabaseSchema {
   playlistTracks: Record<string, string[]>;
   scrobbles: ScrobbleRow[];
   likedTrackIds?: string[];
+  notifications?: NotificationRow[];
 }
 
 class BrokeifyEmbeddedDatabase {
@@ -231,6 +244,7 @@ class BrokeifyEmbeddedDatabase {
   playlistTracks = new Map<string, string[]>(); // playlist_id -> ordered track_id[]
   scrobbles: ScrobbleRow[] = [];
   likedTrackIds = new Set<string>();
+  notifications: NotificationRow[] = [];
 
   constructor() {
     this.loadFromDisk();
@@ -299,6 +313,9 @@ class BrokeifyEmbeddedDatabase {
           if (tid) this.likedTrackIds.add(String(tid));
         }
       }
+      if (Array.isArray(parsed.notifications)) {
+        this.notifications = parsed.notifications.slice(0, 200);
+      }
       console.log(
         `[Brokeify][DB][INFO] Restored persistent database from ${DB_PATH}: ${this.tracks.size} tracks, ${this.albums.size} albums, ${this.artists.size} artists, ${this.playlists.size} playlists intact.`
       );
@@ -320,6 +337,7 @@ class BrokeifyEmbeddedDatabase {
         playlistTracks: Object.fromEntries(this.playlistTracks.entries()),
         scrobbles: this.scrobbles.slice(-2000),
         likedTrackIds: Array.from(this.likedTrackIds),
+        notifications: this.notifications.slice(0, 200),
       };
       const json = JSON.stringify(payload);
       const tmpPath = `${DB_PATH}.tmp`;
@@ -337,6 +355,7 @@ class BrokeifyEmbeddedDatabase {
           playlistTracks: Object.fromEntries(this.playlistTracks.entries()),
           scrobbles: this.scrobbles.slice(-2000),
           likedTrackIds: Array.from(this.likedTrackIds),
+          notifications: this.notifications.slice(0, 200),
         };
         fs.writeFileSync(DB_PATH, JSON.stringify(payload), 'utf-8');
       } catch {}
@@ -2671,4 +2690,131 @@ export function getRecentPlayHistory(limit = 50) {
       track,
     }));
 }
+
+// ============================================================================
+// PERSISTENT SQLITE NOTIFICATIONS & DEDUPLICATED ERROR ALERTS
+// ============================================================================
+
+function computeNotificationSummary() {
+  const notifications = db.notifications.slice(0, 200);
+  let unreadCount = 0;
+  let unreadErrorCount = 0;
+  for (const n of notifications) {
+    if (!n.read) {
+      unreadCount += 1;
+      if (n.severity === 'error' || n.severity === 'warn') {
+        unreadErrorCount += 1;
+      }
+    }
+  }
+  return {
+    notifications,
+    unreadCount,
+    unreadErrorCount,
+  };
+}
+
+export function getPersistentNotifications() {
+  return computeNotificationSummary();
+}
+
+export function addPersistentNotification(input: {
+  message: string;
+  category?: 'system' | 'download' | 'security' | 'library';
+  severity?: 'info' | 'success' | 'warn' | 'error';
+  service?: string;
+  dedupKey?: string;
+  cooldownMs?: number;
+}): NotificationRow {
+  const nowMs = Date.now();
+  const nowStr = new Date().toLocaleTimeString();
+  const cleanMsg = String(input.message || '').trim();
+  const category = input.category || 'system';
+  const severity = input.severity || 'info';
+  const dedupKey =
+    input.dedupKey ||
+    (input.service
+      ? `${input.service}:${severity}:${cleanMsg.slice(0, 80).toLowerCase()}`
+      : `${category}:${severity}:${cleanMsg.slice(0, 80).toLowerCase()}`);
+  const cooldownMs =
+    typeof input.cooldownMs === 'number'
+      ? input.cooldownMs
+      : severity === 'error' || severity === 'warn'
+        ? 10 * 60 * 1000 // 10-minute deduplication window per service outage
+        : 15 * 1000;
+
+  const existingIdx = db.notifications.findIndex(
+    (n) =>
+      n.dedupKey === dedupKey &&
+      (!n.read || nowMs - (n.timestampMs || 0) < cooldownMs)
+  );
+
+  if (existingIdx !== -1) {
+    const existing = db.notifications[existingIdx];
+    existing.message = cleanMsg;
+    existing.severity = severity;
+    existing.createdAt = nowStr;
+    existing.timestampMs = nowMs;
+    existing.read = false;
+    // Move to top of list
+    db.notifications.splice(existingIdx, 1);
+    db.notifications.unshift(existing);
+    syncDatabaseToPersistentDisk();
+    return existing;
+  }
+
+  const row: NotificationRow = {
+    id: `notif-${nowMs}-${Math.random().toString(36).slice(2, 6)}`,
+    message: cleanMsg,
+    category,
+    severity,
+    service: input.service,
+    dedupKey,
+    createdAt: nowStr,
+    timestampMs: nowMs,
+    read: false,
+  };
+
+  db.notifications.unshift(row);
+  if (db.notifications.length > 200) {
+    db.notifications.length = 200;
+  }
+  syncDatabaseToPersistentDisk();
+  return row;
+}
+
+export function markPersistentNotificationsRead(
+  ids?: string[],
+  markAll = false
+) {
+  if (markAll || !Array.isArray(ids) || ids.length === 0) {
+    for (const n of db.notifications) {
+      n.read = true;
+    }
+  } else {
+    const idSet = new Set(ids.map(String));
+    for (const n of db.notifications) {
+      if (idSet.has(n.id)) {
+        n.read = true;
+      }
+    }
+  }
+  syncDatabaseToPersistentDisk();
+  return computeNotificationSummary();
+}
+
+export function deletePersistentNotifications(
+  ids?: string[],
+  clearAll = false
+) {
+  if (clearAll) {
+    db.notifications = [];
+  } else if (Array.isArray(ids) && ids.length > 0) {
+    const idSet = new Set(ids.map(String));
+    db.notifications = db.notifications.filter((n) => !idSet.has(n.id));
+  }
+  syncDatabaseToPersistentDisk();
+  return computeNotificationSummary();
+}
+
 

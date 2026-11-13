@@ -18,9 +18,10 @@ RUN npm run build
 # ==============================================================================
 FROM node:22-alpine
 
-# Install ffmpeg (EBU R128 LUFS audio analyzer), yt-dlp, and ca-certificates
+# Install ffmpeg (EBU R128 LUFS audio analyzer + tag/artwork embedder), chromaprint (fpcalc acoustic fingerprinter / libchromaprint-tools), yt-dlp, and ca-certificates
 RUN apk add --no-cache \
     ffmpeg \
+    chromaprint \
     yt-dlp \
     ca-certificates \
     tzdata
@@ -33,14 +34,15 @@ COPY --from=builder /app/server.js ./server.js
 COPY --from=builder /app/package.json ./package.json
 
 # Create persistent directories for database (/data/brokeify.db), cover art (/data/covers),
-# and mounted music library (/music), owned by the non-root `node` user (UID 1000 / GID 1000)
-RUN mkdir -p /data/covers /music && \
-    chown -R node:node /app /data /music
+# mounted music library (/music), and staging inbox (/music/_inbox & /downloads), owned by non-root `node` user
+RUN mkdir -p /data/covers /music/_inbox /downloads && \
+    chown -R node:node /app /data /music /downloads
 
 ENV NODE_ENV=production
 ENV PORT=3487
 ENV DATA_DIR=/data
 ENV MUSIC_DIR=/music
+ENV STAGING_DIR=/music/_inbox
 ENV BROKEIFY_DATA_DIR=/data
 ENV BROKEIFY_MUSIC_DIR=/music
 ENV TRUST_PROXY=1

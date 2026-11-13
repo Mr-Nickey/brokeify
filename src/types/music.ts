@@ -279,6 +279,9 @@ export interface BrokeifyServerIntegrations {
   lidarrMetadataProfileId?: number;
   listenbrainzUsername: string;
   listenbrainzToken: string;
+  acoustidApiKey?: string;
+  stagingDir?: string;
+  autoOrganizeDownloads?: boolean;
   preferredDownloader?: DownloaderSourceMode;
   downloadDir?: string;
   youtubeAudioFormat?: 'mp3' | 'flac' | 'm4a';
@@ -458,3 +461,47 @@ export interface BrokeifyVersionStatus {
   error?: string;
 }
 
+export interface LibraryOrganizeItem {
+  beforePath: string;
+  afterPath: string;
+  title: string;
+  artist: string;
+  album: string;
+  trackNumber: number;
+  year: number;
+  recordingMbid?: string;
+  coverArtUrl?: string;
+  sourceMethod: string;
+  detectedVariantFlags: string[];
+  applied: boolean;
+  alreadyOrganized?: boolean;
+  error?: string;
+}
+
+export interface LibraryOrganizeJobState {
+  id: string;
+  status:
+    | 'idle'
+    | 'scanning'
+    | 'running'
+    | 'preview_ready'
+    | 'completed'
+    | 'cancelled'
+    | 'error';
+  startedAt: string | null;
+  finishedAt: string | null;
+  dryRun: boolean;
+  recursive: boolean;
+  targetPath: string;
+  skipOrganized: boolean;
+  totalFiles: number;
+  processedFiles: number;
+  currentFile: string;
+  currentTrackTitle: string;
+  currentTrackArtist: string;
+  organizedCount: number;
+  skippedCount: number;
+  errorCount: number;
+  items: LibraryOrganizeItem[];
+  error?: string;
+}
