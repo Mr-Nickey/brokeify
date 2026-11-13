@@ -68,6 +68,7 @@ import {
   addPersistentNotification,
   markPersistentNotificationsRead,
   deletePersistentNotifications,
+  formatNotificationDateTime,
 } from './src/server/libraryEngine.ts';
 import {
   identifyAudioFileWithAcoustIdAndMusicBrainz,
@@ -8790,7 +8791,12 @@ function computeMusicDirectoryStorageStats() {
     // ignore
   }
 
-  const allIndexed = queryTracks({ limit: 50000 }).tracks;
+  const rawIndexed = queryTracks({ limit: 50000 });
+  const allIndexed = Array.isArray(rawIndexed)
+    ? rawIndexed
+    : Array.isArray((rawIndexed as any)?.tracks)
+    ? (rawIndexed as any).tracks
+    : [];
   let missingMetadataCount = 0;
   let missingArtworkCount = 0;
   for (const t of allIndexed) {
@@ -8849,9 +8855,13 @@ export interface ScheduledTaskJob {
   description: string;
   taskType:
     | 'library_scan_heal'
+    | 'library_scan_and_heal'
     | 'staging_organize'
+    | 'auto_organize_library'
     | 'logs_temp_cleanup'
+    | 'cleanup_logs_and_temp'
     | 'playlist_autosync'
+    | 'playlist_sync_all'
     | 'custom_folder_organize';
   intervalHours: number;
   enabled: boolean;
@@ -8860,7 +8870,9 @@ export interface ScheduledTaskJob {
   nextRunAt: string | null;
   lastStatus: 'idle' | 'running' | 'success' | 'error';
   lastMessage: string;
+  lastSummary: string;
   isBuiltIn?: boolean;
+  builtIn?: boolean;
 }
 
 const DEFAULT_SCHEDULED_TASKS: ScheduledTaskJob[] = [
@@ -8869,60 +8881,68 @@ const DEFAULT_SCHEDULED_TASKS: ScheduledTaskJob[] = [
     name: 'Library Scan & Missing Metadata / Artwork Healer',
     description:
       'Scans /music every 24h, indexes new audio files, and heals tracks missing Artist, Album, Release Year, MBID, or Cover Art via MusicBrainz & AcoustID.',
-    taskType: 'library_scan_heal',
+    taskType: 'library_scan_and_heal',
     intervalHours: 24,
     enabled: true,
     targetPath: '',
     lastRunAt: null,
-    nextRunAt: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+    nextRunAt: formatNotificationDateTime(Date.now() + 24 * 3600 * 1000),
     lastStatus: 'idle',
     lastMessage: 'Scheduled to run every 24 hours.',
+    lastSummary: 'Scheduled to run every 24 hours.',
     isBuiltIn: true,
+    builtIn: true,
   },
   {
     id: 'job-staging-organize',
     name: 'Disorganized Library & Staging Auto-Organizer',
     description:
       'Processes incoming downloads in /music/_inbox and cleans up unorganized files into /music/{Artist}/{Album} ({Year})/{TrackNumber} - {Title}.{ext}.',
-    taskType: 'staging_organize',
+    taskType: 'auto_organize_library',
     intervalHours: 24,
     enabled: true,
     targetPath: '',
     lastRunAt: null,
-    nextRunAt: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+    nextRunAt: formatNotificationDateTime(Date.now() + 24 * 3600 * 1000),
     lastStatus: 'idle',
     lastMessage: 'Scheduled to run every 24 hours.',
+    lastSummary: 'Scheduled to run every 24 hours.',
     isBuiltIn: true,
+    builtIn: true,
   },
   {
     id: 'job-logs-temp-cleanup',
     name: 'Logs, Temp Files & SQLite Storage Cleanup',
     description:
       'Prunes old debug logs, removes empty folders and orphaned temp files, and optimizes the persistent SQLite database.',
-    taskType: 'logs_temp_cleanup',
+    taskType: 'cleanup_logs_and_temp',
     intervalHours: 24,
     enabled: true,
     targetPath: '',
     lastRunAt: null,
-    nextRunAt: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+    nextRunAt: formatNotificationDateTime(Date.now() + 24 * 3600 * 1000),
     lastStatus: 'idle',
     lastMessage: 'Scheduled to run every 24 hours.',
+    lastSummary: 'Scheduled to run every 24 hours.',
     isBuiltIn: true,
+    builtIn: true,
   },
   {
     id: 'job-playlist-autosync',
     name: 'Playlists & Autopilot 24h Sync',
     description:
       'Syncs linked Spotify and ListenBrainz playlists and reconciles all playlist ghost tracks against your local /music library.',
-    taskType: 'playlist_autosync',
+    taskType: 'playlist_sync_all',
     intervalHours: 24,
     enabled: true,
     targetPath: '',
     lastRunAt: null,
-    nextRunAt: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+    nextRunAt: formatNotificationDateTime(Date.now() + 24 * 3600 * 1000),
     lastStatus: 'idle',
     lastMessage: 'Scheduled to run every 24 hours.',
+    lastSummary: 'Scheduled to run every 24 hours.',
     isBuiltIn: true,
+    builtIn: true,
   },
 ];
 
@@ -8938,10 +8958,21 @@ function loadScheduledTasksFromConfig(): ScheduledTaskJob[] {
   for (const item of saved) {
     if (item && item.id) {
       const existing = byId.get(item.id);
+      const isBuilt = existing
+        ? true
+        : Boolean(item.isBuiltIn ?? item.builtIn);
+      const msg =
+        item.lastSummary ||
+        item.lastMessage ||
+        existing?.lastSummary ||
+        'Scheduled to run every 24 hours.';
       byId.set(item.id, {
         ...(existing || {}),
         ...item,
-        isBuiltIn: existing ? true : Boolean(item.isBuiltIn),
+        lastMessage: msg,
+        lastSummary: msg,
+        isBuiltIn: isBuilt,
+        builtIn: isBuilt,
       });
     }
   }
@@ -8972,20 +9003,29 @@ async function executeScheduledTaskById(
   const job = tasks[idx];
   job.lastStatus = 'running';
   job.lastMessage = 'Running scheduled task now...';
+  job.lastSummary = 'Running scheduled task now...';
   saveScheduledTasksToConfig(tasks);
 
   try {
     const cfg = readServerConfig();
     let summaryMessage = '';
 
-    if (job.taskType === 'library_scan_heal') {
+    if (
+      job.taskType === 'library_scan_heal' ||
+      job.taskType === 'library_scan_and_heal'
+    ) {
       const scanRes = await runFullLibraryScan();
       reconcilePlaylistsWithLibrary();
-      // Heal up to 15 tracks missing metadata/year/artwork per run to respect MusicBrainz 1 req/sec rate limit
-      const allTracks = queryTracks({ limit: 5000 }).tracks;
+      // Heal up to 10 tracks missing metadata/year/artwork per run to respect MusicBrainz 1 req/sec rate limit
+      const rawTracks = queryTracks({ limit: 5000 });
+      const allTracks = Array.isArray(rawTracks)
+        ? rawTracks
+        : Array.isArray((rawTracks as any)?.tracks)
+        ? (rawTracks as any).tracks
+        : [];
       const candidates = allTracks
         .filter(
-          (t) =>
+          (t: any) =>
             !t.year ||
             t.artist === 'Unknown Artist' ||
             t.album === 'Unknown Album'
@@ -9020,6 +9060,7 @@ async function executeScheduledTaskById(
       summaryMessage = `Scanned /music (${scanRes.totalTracks} tracks indexed) and healed metadata on ${healedCount} track(s).`;
     } else if (
       job.taskType === 'staging_organize' ||
+      job.taskType === 'auto_organize_library' ||
       job.taskType === 'custom_folder_organize'
     ) {
       const inboxRes = await scanAndOrganizeStagingInbox();
@@ -9035,7 +9076,10 @@ async function executeScheduledTaskById(
         });
       }
       summaryMessage = `Processed ${inboxRes.organizedCount} staging track(s) and started library organization pass on /music/${job.targetPath || ''}.`;
-    } else if (job.taskType === 'logs_temp_cleanup') {
+    } else if (
+      job.taskType === 'logs_temp_cleanup' ||
+      job.taskType === 'cleanup_logs_and_temp'
+    ) {
       const beforeLogs = serverDebugLogs.length;
       if (serverDebugLogs.length > 100) {
         serverDebugLogs.length = 100;
@@ -9044,23 +9088,29 @@ async function executeScheduledTaskById(
       const prunedLogs = Math.max(0, beforeLogs - serverDebugLogs.length);
       deletePersistentNotifications(undefined);
       summaryMessage = `Pruned ${prunedLogs} old log entries, cleaned temporary staging cache, and optimized SQLite index.`;
-    } else if (job.taskType === 'playlist_autosync') {
+    } else if (
+      job.taskType === 'playlist_autosync' ||
+      job.taskType === 'playlist_sync_all'
+    ) {
       const rec = reconcilePlaylistsWithLibrary();
       summaryMessage = `Synced & reconciled ${rec.playlistsUpdated} playlist(s) against local /music library.`;
     }
 
     const updatedTasks = loadScheduledTasksFromConfig();
     const uIdx = updatedTasks.findIndex((t) => t.id === jobId);
-    const nowIso = new Date().toISOString();
-    const nextIso = new Date(
+    const nowFormatted = formatNotificationDateTime(Date.now());
+    const nextFormatted = formatNotificationDateTime(
       Date.now() + Math.max(1, job.intervalHours || 24) * 3600 * 1000
-    ).toISOString();
+    );
 
     if (uIdx !== -1) {
-      updatedTasks[uIdx].lastRunAt = nowIso;
-      updatedTasks[uIdx].nextRunAt = nextIso;
+      updatedTasks[uIdx].lastRunAt = nowFormatted;
+      updatedTasks[uIdx].nextRunAt = nextFormatted;
       updatedTasks[uIdx].lastStatus = 'success';
-      updatedTasks[uIdx].lastMessage = summaryMessage || 'Completed successfully.';
+      updatedTasks[uIdx].lastMessage =
+        summaryMessage || 'Completed successfully.';
+      updatedTasks[uIdx].lastSummary =
+        summaryMessage || 'Completed successfully.';
       saveScheduledTasksToConfig(updatedTasks);
       return { ok: true, job: updatedTasks[uIdx] };
     }
@@ -9071,9 +9121,10 @@ async function executeScheduledTaskById(
     const updatedTasks = loadScheduledTasksFromConfig();
     const uIdx = updatedTasks.findIndex((t) => t.id === jobId);
     if (uIdx !== -1) {
-      updatedTasks[uIdx].lastRunAt = new Date().toISOString();
+      updatedTasks[uIdx].lastRunAt = formatNotificationDateTime(Date.now());
       updatedTasks[uIdx].lastStatus = 'error';
       updatedTasks[uIdx].lastMessage = errMsg;
+      updatedTasks[uIdx].lastSummary = errMsg;
       saveScheduledTasksToConfig(updatedTasks);
       return { ok: false, job: updatedTasks[uIdx], error: errMsg };
     }
@@ -9108,7 +9159,7 @@ app.get('/api/scheduler/jobs', (_req, res) => {
 app.post('/api/scheduler/jobs', (req, res) => {
   const name = String(req.body?.name || '').trim();
   const taskType = String(
-    req.body?.taskType || 'custom_folder_organize'
+    req.body?.taskType || 'auto_organize_library'
   ) as ScheduledTaskJob['taskType'];
   const intervalHours = Math.max(
     1,
@@ -9135,12 +9186,14 @@ app.post('/api/scheduler/jobs', (req, res) => {
     enabled: req.body?.enabled !== false,
     targetPath,
     lastRunAt: null,
-    nextRunAt: new Date(
+    nextRunAt: formatNotificationDateTime(
       Date.now() + intervalHours * 3600 * 1000
-    ).toISOString(),
+    ),
     lastStatus: 'idle',
     lastMessage: `Scheduled every ${intervalHours} hour(s).`,
+    lastSummary: `Scheduled every ${intervalHours} hour(s).`,
     isBuiltIn: false,
+    builtIn: false,
   };
   jobs.push(newJob);
   saveScheduledTasksToConfig(jobs);
@@ -9163,9 +9216,9 @@ app.patch('/api/scheduler/jobs/:id', (req, res) => {
       1,
       Math.min(720, Number(req.body.intervalHours) || 24)
     );
-    job.nextRunAt = new Date(
+    job.nextRunAt = formatNotificationDateTime(
       Date.now() + job.intervalHours * 3600 * 1000
-    ).toISOString();
+    );
   }
   if (typeof req.body?.name === 'string' && req.body.name.trim()) {
     job.name = req.body.name.trim();
@@ -9184,7 +9237,7 @@ app.delete('/api/scheduler/jobs/:id', (req, res) => {
   if (!target) {
     return res.status(404).json({ ok: false, error: 'Job not found.' });
   }
-  if (target.isBuiltIn) {
+  if (target.isBuiltIn || target.builtIn) {
     return res.status(400).json({
       ok: false,
       error: 'Built-in tasks cannot be deleted (toggle Enabled off instead).',
@@ -9456,7 +9509,12 @@ app.post('/api/version/check', (_req, res) => {
 // ============================================================================
 
 async function startServer() {
-  const PORT = Number(process.env.PORT || 3487);
+  const portArgIdx = process.argv.indexOf('--port');
+  const cliPort =
+    portArgIdx !== -1 && process.argv[portArgIdx + 1]
+      ? Number(process.argv[portArgIdx + 1])
+      : 0;
+  const PORT = Number(process.env.PORT || cliPort || 3487);
   const distPath = path.join(__dirname, 'dist');
   const distIndex = path.join(distPath, 'index.html');
   const isProd = process.env.NODE_ENV === 'production';
@@ -9503,6 +9561,17 @@ async function startServer() {
   server.on('error', (err) => {
     console.error(`[Brokeify] Server listen error on port ${PORT}:`, err);
   });
+
+  if (PORT !== 3487) {
+    const companionServer = app.listen(3487, '0.0.0.0', () => {
+      console.log(
+        '[Brokeify] Companion & Healthcheck listener active on http://0.0.0.0:3487'
+      );
+    });
+    companionServer.on('error', () => {
+      // Ignore if 3487 is already bound
+    });
+  }
 
   // Keep event loop alive indefinitely in container environments
   setInterval(() => {}, 60000);
