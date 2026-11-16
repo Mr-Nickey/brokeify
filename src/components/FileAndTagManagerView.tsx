@@ -436,11 +436,27 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
       });
       const data = await resp.json().catch(() => ({}));
       setFiveSongTestReport(data);
-      const msg = data?.overallPassed
-        ? `✅ 5-Song Read/Write & Organizer Test PASSED (${data.sampleTrackCount || 0} sample songs verified)!`
-        : `⚠️ 5-Song Read/Write Test found permission or locking issues on ${musicRoot}.`;
+      const isPassed = Boolean(data?.overallPassed ?? data?.passed);
+      const sampleCount =
+        data?.sampleTrackCount ??
+        (Array.isArray(data?.sampleSongs)
+          ? data.sampleSongs.length
+          : Array.isArray(data?.songResults)
+            ? data.songResults.length
+            : 5);
+      const exactErr =
+        data?.errorDetails ||
+        data?.error ||
+        (Array.isArray(data?.steps)
+          ? data.steps.find((st: any) => !(st.passed ?? st.status === 'pass'))?.detail
+          : '') ||
+        data?.summary ||
+        'Filesystem error';
+      const msg = isPassed
+        ? `✅ 5-Song Read/Write & Organizer Test PASSED (${sampleCount}/5 sample songs verified on disk)!`
+        : `⚠️ 5-Song Read/Write Test FAILED on ${musicRoot}: ${exactErr}`;
       setStatusBanner({
-        type: data?.overallPassed ? 'ok' : 'err',
+        type: isPassed ? 'ok' : 'err',
         text: msg,
       });
       onNotify?.(msg);
@@ -455,8 +471,10 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
           : 'Network error running 5-Song Read/Write Test.';
       setFiveSongTestReport({
         ok: false,
+        passed: false,
         overallPassed: false,
         summary: errMsg,
+        errorDetails: errMsg,
         steps: [],
         sampleSongs: [],
       });
@@ -1093,136 +1111,169 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
         </div>
 
         {/* 5-Song Dry-Run / Read-Write Test Pass/Fail Report Panel */}
-        {fiveSongTestReport && (
-          <div
-            data-testid="five-song-test-report-panel"
-            className={`rounded-2xl border p-4 text-xs font-mono space-y-3 ${
-              fiveSongTestReport.overallPassed
-                ? 'border-emerald-500/50 bg-emerald-950/25 text-emerald-200'
-                : 'border-rose-500/50 bg-rose-950/30 text-rose-200'
-            }`}
-          >
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2 font-bold text-sm">
-                <span
-                  className={`px-2 py-0.5 rounded text-[11px] font-bold uppercase ${
-                    fiveSongTestReport.overallPassed
-                      ? 'bg-[#00ff66] text-zinc-950'
-                      : 'bg-rose-500 text-white'
-                  }`}
-                >
-                  {fiveSongTestReport.overallPassed ? 'PASS' : 'FAIL'}
-                </span>
-                <span className="text-white">
-                  5-Song Read/Write &amp; Organizer Diagnostic Report (
-                  {fiveSongTestReport.durationMs ?? 0}ms)
-                </span>
+        {fiveSongTestReport && (() => {
+          const isOverallPass = Boolean(
+            fiveSongTestReport.overallPassed ?? fiveSongTestReport.passed
+          );
+          const songsList = Array.isArray(fiveSongTestReport.sampleSongs)
+            ? fiveSongTestReport.sampleSongs
+            : Array.isArray(fiveSongTestReport.songResults)
+              ? fiveSongTestReport.songResults
+              : [];
+          return (
+            <div
+              data-testid="five-song-test-report-panel"
+              className={`rounded-2xl border p-4 text-xs font-mono space-y-3 ${
+                isOverallPass
+                  ? 'border-emerald-500/50 bg-emerald-950/25 text-emerald-200'
+                  : 'border-rose-500/50 bg-rose-950/30 text-rose-200'
+              }`}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 font-bold text-sm">
+                  <span
+                    className={`px-2 py-0.5 rounded text-[11px] font-bold uppercase ${
+                      isOverallPass
+                        ? 'bg-[#00ff66] text-zinc-950'
+                        : 'bg-rose-500 text-white'
+                    }`}
+                  >
+                    {isOverallPass ? 'PASS' : 'FAIL'}
+                  </span>
+                  <span className="text-white">
+                    5-Song Read/Write &amp; Organizer Diagnostic Report (
+                    {fiveSongTestReport.durationMs ?? 0}ms)
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={runningFiveSongTest}
+                    onClick={() => handleRunFiveSongTest('entire_library', false)}
+                    className="rounded-lg border border-cyan-500/40 bg-cyan-950/40 px-2.5 py-1 text-[11px] font-bold text-cyan-200 hover:bg-cyan-900/50"
+                  >
+                    Re-Run 5-Song Test
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFiveSongTestReport(null)}
+                    className="rounded-lg border border-zinc-700 px-2 py-1 text-[11px] text-zinc-400 hover:text-white"
+                  >
+                    Dismiss ✕
+                  </button>
+                </div>
               </div>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  disabled={runningFiveSongTest}
-                  onClick={() => handleRunFiveSongTest('entire_library', false)}
-                  className="rounded-lg border border-cyan-500/40 bg-cyan-950/40 px-2.5 py-1 text-[11px] font-bold text-cyan-200 hover:bg-cyan-900/50"
-                >
-                  Re-Run 5-Song Test
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setFiveSongTestReport(null)}
-                  className="rounded-lg border border-zinc-700 px-2 py-1 text-[11px] text-zinc-400 hover:text-white"
-                >
-                  Dismiss ✕
-                </button>
-              </div>
-            </div>
 
-            <p className="text-zinc-300">{fiveSongTestReport.summary}</p>
-
-            {Array.isArray(fiveSongTestReport.steps) &&
-              fiveSongTestReport.steps.length > 0 && (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
-                  {fiveSongTestReport.steps.map((st: any) => (
-                    <div
-                      key={st.step}
-                      className={`rounded-xl border p-3 ${
-                        st.passed
-                          ? 'border-emerald-500/35 bg-zinc-950/80'
-                          : 'border-rose-500/45 bg-rose-950/40'
-                      }`}
-                    >
-                      <div className="font-bold flex items-center justify-between gap-2">
-                        <span className="text-white">{st.label}</span>
-                        <span
-                          className={
-                            st.passed ? 'text-[#00ff66]' : 'text-rose-400'
-                          }
-                        >
-                          {st.passed ? '✓ PASS' : '✗ FAIL'}
-                        </span>
-                      </div>
-                      <div className="text-[11px] text-zinc-300 mt-1">
-                        {st.detail}
-                      </div>
-                    </div>
-                  ))}
+              <p className="text-zinc-300">{fiveSongTestReport.summary}</p>
+              {!isOverallPass && fiveSongTestReport.errorDetails && (
+                <div className="rounded-lg border border-rose-500/50 bg-rose-950/60 px-3 py-2 text-[11px] text-rose-200 font-bold">
+                  Node.js Filesystem Exception: {fiveSongTestReport.errorDetails}
                 </div>
               )}
 
-            {Array.isArray(fiveSongTestReport.sampleSongs) &&
-              fiveSongTestReport.sampleSongs.length > 0 && (
+              {Array.isArray(fiveSongTestReport.steps) &&
+                fiveSongTestReport.steps.length > 0 && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                    {fiveSongTestReport.steps.map((st: any, stIdx: number) => {
+                      const stepPassed = Boolean(
+                        st.passed ?? st.status === 'pass'
+                      );
+                      return (
+                        <div
+                          key={st.step || st.id || stIdx}
+                          className={`rounded-xl border p-3 ${
+                            stepPassed
+                              ? 'border-emerald-500/35 bg-zinc-950/80'
+                              : 'border-rose-500/45 bg-rose-950/40'
+                          }`}
+                        >
+                          <div className="font-bold flex items-center justify-between gap-2">
+                            <span className="text-white">
+                              {st.label || st.name}
+                            </span>
+                            <span
+                              className={
+                                stepPassed ? 'text-[#00ff66]' : 'text-rose-400'
+                              }
+                            >
+                              {stepPassed ? '✓ PASS' : '✗ FAIL'}
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-zinc-300 mt-1">
+                            {st.detail}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+              {songsList.length > 0 && (
                 <div className="space-y-1.5 pt-1">
                   <div className="text-[11px] font-bold uppercase text-cyan-300">
-                    5 Sample Songs Tested Across {fiveSongTestReport.musicRoot || '/music'}:
+                    5 Sample Songs Tested Across{' '}
+                    {fiveSongTestReport.musicRoot ||
+                      fiveSongTestReport.musicDir ||
+                      '/music'}
+                    :
                   </div>
                   <div className="grid grid-cols-1 gap-2">
-                    {fiveSongTestReport.sampleSongs.map(
-                      (s: any, idx: number) => (
+                    {songsList.map((s: any, idx: number) => {
+                      const songPassed = Boolean(
+                        s.passed ??
+                          (s.persistedOnDisk && s.parentWritable !== false)
+                      );
+                      const cleanedArtist =
+                        s.cleanedArtist || s.cleanedArtistFolder || 'Unknown Artist';
+                      const rawArtist = s.rawArtist || s.rawArtistInput || '';
+                      const cleanedTitle = s.cleanedTitle || `Sample Track ${idx + 1}`;
+                      const relSource = s.relativeSourcePath || s.sourceFile || '';
+                      const relDest =
+                        s.proposedRelativeDestPath || s.targetRelativePath || '';
+                      return (
                         <div
-                          key={`${s.sourcePath}-${idx}`}
+                          key={`${s.sourcePath || s.sourceFile || idx}-${idx}`}
                           className="rounded-xl border border-zinc-800 bg-zinc-950/90 p-2.5 text-[11px] space-y-1"
                         >
                           <div className="flex flex-wrap items-center justify-between gap-2">
                             <span className="font-bold text-white">
                               #{idx + 1} Artist:{' '}
                               <span className="text-[#00ff66]">
-                                {s.cleanedArtist}
+                                {cleanedArtist}
                               </span>{' '}
-                              {s.rawArtist && s.rawArtist !== s.cleanedArtist ? (
+                              {rawArtist && rawArtist !== cleanedArtist ? (
                                 <span className="text-amber-300">
-                                  (stripped from &ldquo;{s.rawArtist}&rdquo;)
+                                  (stripped from &ldquo;{rawArtist}&rdquo;)
                                 </span>
                               ) : null}{' '}
-                              · Title: {s.cleanedTitle}
+                              · Title: {cleanedTitle}
                             </span>
                             <span
                               className={`font-bold ${
-                                s.persistedOnDisk && s.parentWritable
-                                  ? 'text-[#00ff66]'
-                                  : 'text-rose-400'
+                                songPassed ? 'text-[#00ff66]' : 'text-rose-400'
                               }`}
                             >
-                              {s.persistedOnDisk && s.parentWritable
+                              {songPassed
                                 ? '✓ R/W & PERSISTED ON DISK'
-                                : '✗ LOCKED / PERMISSION ERROR'}
+                                : `✗ FAILED${s.errorCode ? ` (${s.errorCode})` : ''}`}
                             </span>
                           </div>
                           <div className="text-zinc-400 break-all">
-                            Current: <code>{s.relativeSourcePath}</code> →
-                            Organized:{' '}
-                            <code className="text-[#00ff66]">
-                              {s.proposedRelativeDestPath}
-                            </code>
+                            Current: <code>{relSource}</code> → Organized:{' '}
+                            <code className="text-[#00ff66]">{relDest}</code>
                           </div>
-                          <div className="text-zinc-300">{s.message}</div>
+                          <div className="text-zinc-300">
+                            {s.error || s.message}
+                          </div>
                         </div>
-                      )
-                    )}
+                      );
+                    })}
                   </div>
                 </div>
               )}
-          </div>
-        )}
+            </div>
+          );
+        })()}
 
         {/* Storage Metrics Grid */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">

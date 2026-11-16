@@ -775,3 +775,40 @@ test('deletePersistentNotifications permanently clears notifications and suppres
   assert.equal(getPersistentNotifications().notifications.length, 0);
 });
 
+test('runFiveSongReadWriteTest returns overallPassed=true, step.passed=true, and sampleSongs on valid writable folder and exact Node.js err.code on failure', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { runFiveSongReadWriteTest } = await import(
+    '../server/fingerprintAndFileManager'
+  );
+
+  const tmpDir = await fs.promises.mkdtemp(
+    path.join(os.tmpdir(), 'brokeify-5song-unit-')
+  );
+  try {
+    const passReport = await runFiveSongReadWriteTest({ targetDir: tmpDir });
+    assert.equal(passReport.ok, true);
+    assert.equal(passReport.passed, true);
+    assert.equal(passReport.overallPassed, true);
+    assert.equal(passReport.sampleTrackCount, 5);
+    assert.equal(passReport.sampleSongs.length, 5);
+    assert.ok(passReport.steps.every((st) => st.passed === true && st.status === 'pass'));
+    assert.ok(
+      passReport.sampleSongs.every(
+        (s) => s.passed === true && s.persistedOnDisk === true && s.parentWritable === true
+      )
+    );
+  } finally {
+    await fs.promises.rm(tmpDir, { recursive: true, force: true });
+  }
+
+  const missingDir = path.join(os.tmpdir(), `nonexistent-brokeify-dir-${Date.now()}`);
+  const failReport = await runFiveSongReadWriteTest({ targetDir: missingDir });
+  assert.equal(failReport.passed, false);
+  assert.equal(failReport.overallPassed, false);
+  assert.ok(failReport.errorDetails && failReport.errorDetails.includes('ENOENT'));
+  assert.ok(failReport.summary.includes('ENOENT'));
+});
+
+

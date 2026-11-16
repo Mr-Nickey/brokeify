@@ -9400,14 +9400,22 @@ const handleFiveSongTestRequest = async (req: any, res: any) => {
       applyLiveMoveOnSample,
     });
     return res.json(report);
-  } catch (err) {
+  } catch (err: any) {
+    const errCode = typeof err?.code === 'string' && err.code.trim() ? err.code.trim() : '';
+    const rawMsg =
+      err instanceof Error ? err.message : String(err || 'Filesystem exception');
+    const exactError =
+      errCode && !rawMsg.includes(errCode) ? `${errCode}: ${rawMsg}` : rawMsg;
     return res.status(500).json({
       ok: false,
+      passed: false,
       overallPassed: false,
-      error:
-        err instanceof Error
-          ? err.message
-          : 'Failed to execute 5-Song Read/Write Test.',
+      error: exactError,
+      errorDetails: exactError,
+      summary: `FAIL — ${exactError}`,
+      steps: [],
+      songResults: [],
+      sampleSongs: [],
     });
   }
 };
