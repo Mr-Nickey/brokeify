@@ -1165,11 +1165,22 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
               </div>
 
               <p className="text-zinc-300">{fiveSongTestReport.summary}</p>
-              {!isOverallPass && fiveSongTestReport.errorDetails && (
-                <div className="rounded-lg border border-rose-500/50 bg-rose-950/60 px-3 py-2 text-[11px] text-rose-200 font-bold">
-                  Node.js Filesystem Exception: {fiveSongTestReport.errorDetails}
-                </div>
-              )}
+              {!isOverallPass &&
+                (fiveSongTestReport.errorDetails ||
+                  fiveSongTestReport.errorStack) && (
+                  <div className="rounded-lg border border-rose-500/50 bg-rose-950/60 px-3 py-2 text-[11px] text-rose-200 space-y-1.5">
+                    <div className="font-bold">
+                      Node.js Filesystem Exception:{' '}
+                      {fiveSongTestReport.errorDetails ||
+                        fiveSongTestReport.error}
+                    </div>
+                    {fiveSongTestReport.errorStack && (
+                      <pre className="max-h-44 overflow-auto rounded border border-rose-500/30 bg-black/80 p-2 text-[10px] text-rose-200/90 whitespace-pre-wrap break-all">
+                        {fiveSongTestReport.errorStack}
+                      </pre>
+                    )}
+                  </div>
+                )}
 
               {Array.isArray(fiveSongTestReport.steps) &&
                 fiveSongTestReport.steps.length > 0 && (
@@ -1202,6 +1213,11 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
                           <div className="text-[11px] text-zinc-300 mt-1">
                             {st.detail}
                           </div>
+                          {!stepPassed && st.errorStack && (
+                            <pre className="mt-2 max-h-36 overflow-auto rounded border border-rose-500/30 bg-black/80 p-2 text-[10px] text-rose-200/90 whitespace-pre-wrap break-all">
+                              {st.errorStack}
+                            </pre>
+                          )}
                         </div>
                       );
                     })}
@@ -1214,8 +1230,9 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
                     5 Sample Songs Tested Across{' '}
                     {fiveSongTestReport.musicRoot ||
                       fiveSongTestReport.musicDir ||
-                      '/music'}
-                    :
+                      '/music'}{' '}
+                    (Click &ldquo;Details&rdquo; on any song to inspect checks,
+                    errors &amp; stack traces):
                   </div>
                   <div className="grid grid-cols-1 gap-2">
                     {songsList.map((s: any, idx: number) => {
@@ -1224,16 +1241,58 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
                           (s.persistedOnDisk && s.parentWritable !== false)
                       );
                       const cleanedArtist =
-                        s.cleanedArtist || s.cleanedArtistFolder || 'Unknown Artist';
+                        s.cleanedArtist ||
+                        s.cleanedArtistFolder ||
+                        'Unknown Artist';
                       const rawArtist = s.rawArtist || s.rawArtistInput || '';
-                      const cleanedTitle = s.cleanedTitle || `Sample Track ${idx + 1}`;
-                      const relSource = s.relativeSourcePath || s.sourceFile || '';
+                      const cleanedTitle =
+                        s.cleanedTitle || `Sample Track ${idx + 1}`;
+                      const relSource =
+                        s.relativeSourcePath || s.sourceFile || '';
                       const relDest =
-                        s.proposedRelativeDestPath || s.targetRelativePath || '';
+                        s.proposedRelativeDestPath ||
+                        s.targetRelativePath ||
+                        '';
+                      const checkItems = [
+                        { label: 'Read Source', ok: Boolean(s.readOk) },
+                        { label: 'Write Staging', ok: Boolean(s.writeCopyOk) },
+                        { label: 'Create Folder', ok: Boolean(s.folderCreateOk) },
+                        { label: 'Atomic Rename', ok: Boolean(s.renameTrackOk) },
+                        {
+                          label: 'Artwork cover.jpg',
+                          ok: Boolean(s.artworkRenameOk),
+                        },
+                        {
+                          label: `Move (${s.moveMethod || 'rename'})`,
+                          ok: Boolean(s.crossFolderMoveOk),
+                        },
+                        {
+                          label: 'Unlink Source',
+                          ok: Boolean(s.sourceDeletedCleanly),
+                        },
+                        {
+                          label: 'Persisted on Disk',
+                          ok: Boolean(s.persistedOnDisk),
+                        },
+                      ];
+                      const passedChecksCount = checkItems.filter(
+                        (c) => c.ok
+                      ).length;
+                      const songErrorText =
+                        s.error ||
+                        (!songPassed ? fiveSongTestReport.errorDetails : '');
+                      const songStackText =
+                        s.errorStack ||
+                        (!songPassed ? fiveSongTestReport.errorStack : '');
+
                       return (
                         <div
                           key={`${s.sourcePath || s.sourceFile || idx}-${idx}`}
-                          className="rounded-xl border border-zinc-800 bg-zinc-950/90 p-2.5 text-[11px] space-y-1"
+                          className={`rounded-xl border p-2.5 text-[11px] space-y-1.5 ${
+                            songPassed
+                              ? 'border-zinc-800 bg-zinc-950/90'
+                              : 'border-rose-500/50 bg-rose-950/30'
+                          }`}
                         >
                           <div className="flex flex-wrap items-center justify-between gap-2">
                             <span className="font-bold text-white">
@@ -1265,6 +1324,157 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
                           <div className="text-zinc-300">
                             {s.error || s.message}
                           </div>
+
+                          {/* Collapsible Details Section per Test Song */}
+                          <details
+                            open={!songPassed}
+                            data-testid={`song-diagnostic-details-${idx + 1}`}
+                            className="group rounded-lg border border-zinc-800/90 bg-black/50 pt-1"
+                          >
+                            <summary className="cursor-pointer select-none list-none px-2.5 py-1.5 flex items-center justify-between gap-2 text-[11px] font-bold text-cyan-300 hover:text-cyan-200">
+                              <span className="flex items-center gap-1.5">
+                                <span className="transition-transform group-open:rotate-90 inline-block">
+                                  ▸
+                                </span>
+                                <span>
+                                  Details ({passedChecksCount}/
+                                  {checkItems.length} checks passed
+                                  {s.durationMs ? ` · ${s.durationMs}ms` : ''}
+                                  {!songPassed
+                                    ? ' · Error & Stack Trace Inside'
+                                    : ''}
+                                  )
+                                </span>
+                              </span>
+                              <span className="text-[10px] font-normal text-zinc-400">
+                                Click to toggle
+                              </span>
+                            </summary>
+
+                            <div className="border-t border-zinc-800/80 p-2.5 space-y-2.5 text-[11px]">
+                              {/* 8-Point Check Grid */}
+                              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                                {checkItems.map((chk) => (
+                                  <div
+                                    key={chk.label}
+                                    className={`rounded border px-2 py-1 flex items-center justify-between gap-1 ${
+                                      chk.ok
+                                        ? 'border-emerald-500/30 bg-emerald-950/25 text-emerald-200'
+                                        : 'border-rose-500/40 bg-rose-950/40 text-rose-200'
+                                    }`}
+                                  >
+                                    <span className="truncate">{chk.label}</span>
+                                    <span
+                                      className={
+                                        chk.ok
+                                          ? 'text-[#00ff66] font-bold'
+                                          : 'text-rose-400 font-bold'
+                                      }
+                                    >
+                                      {chk.ok ? 'PASS' : 'FAIL'}
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+
+                              {/* Path & Artist Metadata Breakdown */}
+                              <div className="rounded border border-zinc-800 bg-zinc-950/80 p-2 space-y-1 text-[10px] text-zinc-300">
+                                <div>
+                                  <span className="text-zinc-500">
+                                    Sample Mode:
+                                  </span>{' '}
+                                  <span className="text-white font-semibold">
+                                    {s.isSyntheticSample
+                                      ? 'Synthetic Probe (no existing track in slot)'
+                                      : 'Real Library Audio Track'}
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="text-zinc-500">
+                                    Artist Folder Parser:
+                                  </span>{' '}
+                                  <code>{rawArtist || cleanedArtist}</code> →{' '}
+                                  <code className="text-[#00ff66]">
+                                    {cleanedArtist}
+                                  </code>
+                                </div>
+                                <div className="break-all">
+                                  <span className="text-zinc-500">
+                                    Source File:
+                                  </span>{' '}
+                                  <code>{s.sourcePath || relSource}</code>
+                                </div>
+                                <div className="break-all">
+                                  <span className="text-zinc-500">
+                                    Organized Target:
+                                  </span>{' '}
+                                  <code className="text-[#00ff66]">
+                                    {relDest}
+                                  </code>
+                                </div>
+                              </div>
+
+                              {/* Operation Log */}
+                              {Array.isArray(s.operationLog) &&
+                                s.operationLog.length > 0 && (
+                                  <div className="space-y-1">
+                                    <div className="text-[10px] font-bold uppercase text-zinc-400">
+                                      Filesystem Operation Trace:
+                                    </div>
+                                    <div className="rounded border border-zinc-800 bg-black/70 p-2 space-y-0.5 text-[10px] font-mono">
+                                      {s.operationLog.map(
+                                        (line: string, lIdx: number) => (
+                                          <div
+                                            key={lIdx}
+                                            className={
+                                              line.startsWith('[FAIL]')
+                                                ? 'text-rose-400 font-bold'
+                                                : 'text-emerald-300'
+                                            }
+                                          >
+                                            {line}
+                                          </div>
+                                        )
+                                      )}
+                                    </div>
+                                  </div>
+                                )}
+
+                              {/* Specific Error & Stack Trace when Failed */}
+                              {(!songPassed || songErrorText || songStackText) && (
+                                <div className="rounded-lg border border-rose-500/50 bg-rose-950/60 p-2.5 space-y-1.5">
+                                  <div className="text-[10px] font-bold uppercase text-rose-300 flex flex-wrap items-center justify-between gap-2">
+                                    <span>
+                                      Filesystem Failure Diagnostic
+                                      {s.failedOperation
+                                        ? ` — ${s.failedOperation}`
+                                        : ''}
+                                    </span>
+                                    {s.errorCode && (
+                                      <span className="rounded bg-rose-500/30 px-1.5 py-0.5 text-rose-200">
+                                        Code: {s.errorCode}
+                                      </span>
+                                    )}
+                                  </div>
+                                  {songErrorText && (
+                                    <div className="text-[11px] font-bold text-white break-all">
+                                      {songErrorText}
+                                    </div>
+                                  )}
+                                  {songStackText && (
+                                    <div className="space-y-1">
+                                      <div className="text-[10px] text-rose-300/90">
+                                        Node.js Stack Trace:
+                                      </div>
+                                      <pre className="max-h-48 overflow-auto rounded border border-rose-500/30 bg-black/90 p-2 text-[10px] text-rose-200 whitespace-pre-wrap break-all">
+                                        {songStackText}
+                                      </pre>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          </details>
                         </div>
                       );
                     })}

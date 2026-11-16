@@ -284,13 +284,23 @@ export const NowPlayingDrawer: React.FC<NowPlayingDrawerProps> = ({
       data-testid="now-playing-drawer"
       className="fixed inset-0 z-50 bg-[#090d14]/98 backdrop-blur-2xl flex flex-col overflow-hidden animate-in fade-in duration-200"
     >
+      {/* Mobile Grab Handle Pill */}
+      <button
+        type="button"
+        onClick={onClose}
+        aria-label="Pull down to minimize player"
+        className="lg:hidden w-full pt-2 pb-0.5 flex items-center justify-center bg-zinc-950/90 shrink-0"
+      >
+        <span className="w-12 h-1.5 rounded-full bg-zinc-700 hover:bg-[#00ff66] transition-colors" />
+      </button>
+
       {/* Top Bar */}
-      <div className="winamp-titlebar flex items-center justify-between px-3 sm:px-6 py-2.5 sm:py-3 border-b border-zinc-700/80 shrink-0">
+      <div className="winamp-titlebar flex items-center justify-between px-3 sm:px-6 py-2 sm:py-3 border-b border-zinc-700/80 shrink-0">
         <button
           type="button"
           onClick={onClose}
           data-testid="close-drawer-btn"
-          className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-900/90 px-3 py-2 text-xs font-mono font-bold text-zinc-200 hover:text-[#00ff66] transition-colors min-h-[40px]"
+          className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-900/90 px-3 py-2 text-xs font-mono font-bold text-zinc-200 hover:text-[#00ff66] transition-colors min-h-[44px]"
         >
           <ChevronDown className="w-4 h-4 text-[#00ff66]" />
           <span>Minimize</span>
@@ -300,7 +310,7 @@ export const NowPlayingDrawer: React.FC<NowPlayingDrawerProps> = ({
           <span className="text-[11px] font-mono uppercase tracking-widest text-[#00ff66] font-bold hidden sm:inline">
             WINAMP MOBILE &amp; DOCKER DECK //
           </span>
-          <span className="rounded-lg bg-emerald-500/15 border border-emerald-500/40 px-2.5 py-1 text-[11px] font-mono font-bold text-[#00ff66] truncate max-w-[140px] sm:max-w-none">
+          <span className="rounded-lg bg-emerald-500/15 border border-emerald-500/40 px-2.5 py-1 text-[11px] font-mono font-bold text-[#00ff66] truncate max-w-[130px] sm:max-w-none">
             {currentTrack.sourceName}
           </span>
           {sleepTimerMinutes !== null && (
@@ -321,7 +331,7 @@ export const NowPlayingDrawer: React.FC<NowPlayingDrawerProps> = ({
               data-testid="drawer-like-track-btn"
               aria-label={isCurrentLiked ? 'Remove from Liked Songs' : 'Add to Liked Songs'}
               title={isCurrentLiked ? 'Liked — tap to remove' : 'Save to Liked Songs'}
-              className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-mono font-bold transition-colors min-h-[40px] ${
+              className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-mono font-bold transition-colors min-h-[44px] min-w-[44px] justify-center ${
                 isCurrentLiked
                   ? 'border-rose-500/60 bg-rose-500/20 text-rose-400'
                   : 'border-zinc-700 bg-zinc-900/90 text-zinc-300 hover:text-rose-400'
@@ -345,71 +355,12 @@ export const NowPlayingDrawer: React.FC<NowPlayingDrawerProps> = ({
               onOpenCarMode();
             }}
             data-testid="drawer-car-mode-btn"
-            className="inline-flex items-center gap-1.5 rounded-xl bg-amber-400 hover:bg-amber-300 px-3 py-2 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[40px]"
+            className="inline-flex items-center gap-1.5 rounded-xl bg-amber-400 hover:bg-amber-300 px-3 py-2 text-xs font-mono font-bold text-zinc-950 transition-colors min-h-[44px]"
           >
             <Car className="w-4 h-4" />
             <span>Car Mode</span>
           </button>
         </div>
-      </div>
-
-      {/* Mobile Segmented Switcher (Player / Lyrics / Up Next Queue / Sound & EQ) */}
-      <div className="lg:hidden grid grid-cols-4 gap-1 p-2 bg-zinc-950/90 border-b border-zinc-800 shrink-0">
-        <button
-          type="button"
-          onClick={() => setMobileSection('player')}
-          data-testid="drawer-tab-player"
-          className={`flex items-center justify-center gap-1 rounded-xl py-2 text-[11px] font-mono font-bold transition-colors min-h-[38px] ${
-            mobileSection === 'player'
-              ? 'bg-[#00ff66] text-zinc-950'
-              : 'bg-zinc-900 text-zinc-300 hover:text-white'
-          }`}
-        >
-          <Play className="w-3.5 h-3.5 fill-current" />
-          <span>Player</span>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setMobileSection('lyrics')}
-          data-testid="drawer-tab-lyrics"
-          className={`flex items-center justify-center gap-1 rounded-xl py-2 text-[11px] font-mono font-bold transition-colors min-h-[38px] ${
-            mobileSection === 'lyrics'
-              ? 'bg-[#00ff66] text-zinc-950'
-              : 'bg-zinc-900 text-zinc-300 hover:text-white'
-          }`}
-        >
-          <Mic2 className="w-3.5 h-3.5" />
-          <span>Lyrics</span>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setMobileSection('queue')}
-          data-testid="drawer-tab-queue"
-          className={`flex items-center justify-center gap-1 rounded-xl py-2 text-[11px] font-mono font-bold transition-colors min-h-[38px] ${
-            mobileSection === 'queue'
-              ? 'bg-[#00ff66] text-zinc-950'
-              : 'bg-zinc-900 text-zinc-300 hover:text-white'
-          }`}
-        >
-          <ListMusic className="w-3.5 h-3.5" />
-          <span>Queue ({queue.length})</span>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setMobileSection('dsp')}
-          data-testid="drawer-tab-dsp"
-          className={`flex items-center justify-center gap-1 rounded-xl py-2 text-[11px] font-mono font-bold transition-colors min-h-[38px] ${
-            mobileSection === 'dsp'
-              ? 'bg-[#00ff66] text-zinc-950'
-              : 'bg-zinc-900 text-zinc-300 hover:text-white'
-          }`}
-        >
-          <Sliders className="w-3.5 h-3.5" />
-          <span>Sound &amp; EQ</span>
-        </button>
       </div>
 
       {/* Main Content Grid */}
@@ -1079,6 +1030,111 @@ export const NowPlayingDrawer: React.FC<NowPlayingDrawerProps> = ({
               })}
             </div>
           </div>
+        </div>
+      </div>
+
+      {/* Bottom One-Handed Thumb Dock on Mobile: Mini Transport (when not on Player tab) + 4-Tab Switcher */}
+      <div className="lg:hidden border-t border-zinc-800 bg-zinc-950/95 backdrop-blur-xl shrink-0 pb-[env(safe-area-inset-bottom)]">
+        {mobileSection !== 'player' && (
+          <div className="px-3 py-2 border-b border-zinc-800/80 flex items-center justify-between gap-2">
+            <div className="min-w-0 flex-1">
+              <div className="text-xs font-bold text-white truncate">
+                {currentTrack.title}
+              </div>
+              <div className="text-[11px] text-[#00ff66] font-mono truncate">
+                {currentTrack.artist} · {formatDuration(currentTime)} /{' '}
+                {formatDuration(duration)}
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={onPrevious}
+                aria-label="Previous Track"
+                className="p-2.5 rounded-xl border border-zinc-700 bg-zinc-900 text-white min-h-[44px] min-w-[44px] flex items-center justify-center"
+              >
+                <SkipBack className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={onTogglePlayPause}
+                aria-label={isPlaying ? 'Pause' : 'Play'}
+                className="w-11 h-11 rounded-xl bg-[#00ff66] text-zinc-950 flex items-center justify-center shadow-md"
+              >
+                {isPlaying ? (
+                  <Pause className="w-5 h-5 fill-current" />
+                ) : (
+                  <Play className="w-5 h-5 fill-current ml-0.5" />
+                )}
+              </button>
+              <button
+                type="button"
+                onClick={onNext}
+                aria-label="Next Track"
+                className="p-2.5 rounded-xl border border-zinc-700 bg-zinc-900 text-white min-h-[44px] min-w-[44px] flex items-center justify-center"
+              >
+                <SkipForward className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div className="grid grid-cols-4 gap-1.5 p-2">
+          <button
+            type="button"
+            onClick={() => setMobileSection('player')}
+            data-testid="drawer-tab-player"
+            className={`flex flex-col items-center justify-center gap-0.5 rounded-xl py-2 text-[11px] font-mono font-bold transition-colors min-h-[46px] ${
+              mobileSection === 'player'
+                ? 'bg-[#00ff66] text-zinc-950'
+                : 'bg-zinc-900 text-zinc-300 hover:text-white'
+            }`}
+          >
+            <Play className="w-4 h-4 fill-current" />
+            <span>Player</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setMobileSection('lyrics')}
+            data-testid="drawer-tab-lyrics"
+            className={`flex flex-col items-center justify-center gap-0.5 rounded-xl py-2 text-[11px] font-mono font-bold transition-colors min-h-[46px] ${
+              mobileSection === 'lyrics'
+                ? 'bg-[#00ff66] text-zinc-950'
+                : 'bg-zinc-900 text-zinc-300 hover:text-white'
+            }`}
+          >
+            <Mic2 className="w-4 h-4" />
+            <span>Lyrics</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setMobileSection('queue')}
+            data-testid="drawer-tab-queue"
+            className={`flex flex-col items-center justify-center gap-0.5 rounded-xl py-2 text-[11px] font-mono font-bold transition-colors min-h-[46px] ${
+              mobileSection === 'queue'
+                ? 'bg-[#00ff66] text-zinc-950'
+                : 'bg-zinc-900 text-zinc-300 hover:text-white'
+            }`}
+          >
+            <ListMusic className="w-4 h-4" />
+            <span>Queue ({queue.length})</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setMobileSection('dsp')}
+            data-testid="drawer-tab-dsp"
+            className={`flex flex-col items-center justify-center gap-0.5 rounded-xl py-2 text-[11px] font-mono font-bold transition-colors min-h-[46px] ${
+              mobileSection === 'dsp'
+                ? 'bg-[#00ff66] text-zinc-950'
+                : 'bg-zinc-900 text-zinc-300 hover:text-white'
+            }`}
+          >
+            <Sliders className="w-4 h-4" />
+            <span>Sound &amp; EQ</span>
+          </button>
         </div>
       </div>
     </div>

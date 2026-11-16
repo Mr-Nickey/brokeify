@@ -646,11 +646,21 @@ export const BrokeifyOnboardingModal: React.FC<BrokeifyOnboardingModalProps> = (
                     </button>
                   </div>
                   <p className="text-zinc-300">{fiveSongReport.summary}</p>
-                  {!isOverallPass && fiveSongReport.errorDetails && (
-                    <div className="rounded-lg border border-rose-500/50 bg-rose-950/60 px-3 py-2 text-[11px] text-rose-200 font-bold">
-                      Node.js Filesystem Exception: {fiveSongReport.errorDetails}
-                    </div>
-                  )}
+                  {!isOverallPass &&
+                    (fiveSongReport.errorDetails ||
+                      fiveSongReport.errorStack) && (
+                      <div className="rounded-lg border border-rose-500/50 bg-rose-950/60 px-3 py-2 text-[11px] text-rose-200 space-y-1.5">
+                        <div className="font-bold">
+                          Node.js Filesystem Exception:{' '}
+                          {fiveSongReport.errorDetails || fiveSongReport.error}
+                        </div>
+                        {fiveSongReport.errorStack && (
+                          <pre className="max-h-44 overflow-auto rounded border border-rose-500/30 bg-black/80 p-2 text-[10px] text-rose-200/90 whitespace-pre-wrap break-all">
+                            {fiveSongReport.errorStack}
+                          </pre>
+                        )}
+                      </div>
+                    )}
                   {Array.isArray(fiveSongReport.steps) &&
                     fiveSongReport.steps.length > 0 && (
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
@@ -680,6 +690,11 @@ export const BrokeifyOnboardingModal: React.FC<BrokeifyOnboardingModalProps> = (
                               <div className="text-[11px] text-zinc-300 mt-1">
                                 {st.detail}
                               </div>
+                              {!stepPassed && st.errorStack && (
+                                <pre className="mt-2 max-h-36 overflow-auto rounded border border-rose-500/30 bg-black/80 p-2 text-[10px] text-rose-200/90 whitespace-pre-wrap break-all">
+                                  {st.errorStack}
+                                </pre>
+                              )}
                             </div>
                           );
                         })}
@@ -688,7 +703,9 @@ export const BrokeifyOnboardingModal: React.FC<BrokeifyOnboardingModalProps> = (
                   {songsList.length > 0 && (
                     <div className="space-y-1.5 pt-1">
                       <div className="text-[11px] font-bold uppercase text-cyan-300">
-                        Sample Tracks Verified ({songsList.length}):
+                        Sample Tracks Verified ({songsList.length}) — Click
+                        &ldquo;Details&rdquo; to inspect checks &amp; stack
+                        traces:
                       </div>
                       {songsList.map((s: any, idx: number) => {
                         const songPassed = Boolean(
@@ -696,15 +713,64 @@ export const BrokeifyOnboardingModal: React.FC<BrokeifyOnboardingModalProps> = (
                             (s.persistedOnDisk && s.parentWritable !== false)
                         );
                         const cleanedArtist =
-                          s.cleanedArtist || s.cleanedArtistFolder || 'Unknown Artist';
-                        const cleanedTitle = s.cleanedTitle || `Sample Track ${idx + 1}`;
-                        const relSource = s.relativeSourcePath || s.sourceFile || '';
+                          s.cleanedArtist ||
+                          s.cleanedArtistFolder ||
+                          'Unknown Artist';
+                        const rawArtist = s.rawArtist || s.rawArtistInput || '';
+                        const cleanedTitle =
+                          s.cleanedTitle || `Sample Track ${idx + 1}`;
+                        const relSource =
+                          s.relativeSourcePath || s.sourceFile || '';
                         const relDest =
-                          s.proposedRelativeDestPath || s.targetRelativePath || '';
+                          s.proposedRelativeDestPath ||
+                          s.targetRelativePath ||
+                          '';
+                        const checkItems = [
+                          { label: 'Read Source', ok: Boolean(s.readOk) },
+                          { label: 'Write Staging', ok: Boolean(s.writeCopyOk) },
+                          {
+                            label: 'Create Folder',
+                            ok: Boolean(s.folderCreateOk),
+                          },
+                          {
+                            label: 'Atomic Rename',
+                            ok: Boolean(s.renameTrackOk),
+                          },
+                          {
+                            label: 'Artwork cover.jpg',
+                            ok: Boolean(s.artworkRenameOk),
+                          },
+                          {
+                            label: `Move (${s.moveMethod || 'rename'})`,
+                            ok: Boolean(s.crossFolderMoveOk),
+                          },
+                          {
+                            label: 'Unlink Source',
+                            ok: Boolean(s.sourceDeletedCleanly),
+                          },
+                          {
+                            label: 'Persisted on Disk',
+                            ok: Boolean(s.persistedOnDisk),
+                          },
+                        ];
+                        const passedChecksCount = checkItems.filter(
+                          (c) => c.ok
+                        ).length;
+                        const songErrorText =
+                          s.error ||
+                          (!songPassed ? fiveSongReport.errorDetails : '');
+                        const songStackText =
+                          s.errorStack ||
+                          (!songPassed ? fiveSongReport.errorStack : '');
+
                         return (
                           <div
                             key={`${s.sourcePath || s.sourceFile || idx}-${idx}`}
-                            className="rounded-lg border border-zinc-800 bg-zinc-950/80 p-2 text-[11px] space-y-0.5"
+                            className={`rounded-lg border p-2.5 text-[11px] space-y-1.5 ${
+                              songPassed
+                                ? 'border-zinc-800 bg-zinc-950/80'
+                                : 'border-rose-500/50 bg-rose-950/30'
+                            }`}
                           >
                             <div className="flex items-center justify-between gap-2">
                               <span className="font-bold text-white truncate">
@@ -727,6 +793,136 @@ export const BrokeifyOnboardingModal: React.FC<BrokeifyOnboardingModalProps> = (
                             <div className="text-zinc-300">
                               {s.error || s.message}
                             </div>
+
+                            <details
+                              open={!songPassed}
+                              data-testid={`onboarding-song-details-${idx + 1}`}
+                              className="group rounded-lg border border-zinc-800/90 bg-black/50 pt-1"
+                            >
+                              <summary className="cursor-pointer select-none list-none px-2.5 py-1.5 flex items-center justify-between gap-2 text-[11px] font-bold text-cyan-300 hover:text-cyan-200">
+                                <span className="flex items-center gap-1.5">
+                                  <span className="transition-transform group-open:rotate-90 inline-block">
+                                    ▸
+                                  </span>
+                                  <span>
+                                    Details ({passedChecksCount}/
+                                    {checkItems.length} checks passed
+                                    {s.durationMs ? ` · ${s.durationMs}ms` : ''}
+                                    {!songPassed
+                                      ? ' · Error & Stack Trace Inside'
+                                      : ''}
+                                    )
+                                  </span>
+                                </span>
+                                <span className="text-[10px] font-normal text-zinc-400">
+                                  Click to toggle
+                                </span>
+                              </summary>
+
+                              <div className="border-t border-zinc-800/80 p-2.5 space-y-2 text-[11px]">
+                                <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                                  {checkItems.map((chk) => (
+                                    <div
+                                      key={chk.label}
+                                      className={`rounded border px-2 py-1 flex items-center justify-between gap-1 ${
+                                        chk.ok
+                                          ? 'border-emerald-500/30 bg-emerald-950/25 text-emerald-200'
+                                          : 'border-rose-500/40 bg-rose-950/40 text-rose-200'
+                                      }`}
+                                    >
+                                      <span className="truncate">
+                                        {chk.label}
+                                      </span>
+                                      <span
+                                        className={
+                                          chk.ok
+                                            ? 'text-[#00ff66] font-bold'
+                                            : 'text-rose-400 font-bold'
+                                        }
+                                      >
+                                        {chk.ok ? 'PASS' : 'FAIL'}
+                                      </span>
+                                    </div>
+                                  ))}
+                                </div>
+
+                                <div className="rounded border border-zinc-800 bg-zinc-950/80 p-2 space-y-0.5 text-[10px] text-zinc-300">
+                                  <div>
+                                    <span className="text-zinc-500">
+                                      Artist Folder Parser:
+                                    </span>{' '}
+                                    <code>{rawArtist || cleanedArtist}</code> →{' '}
+                                    <code className="text-[#00ff66]">
+                                      {cleanedArtist}
+                                    </code>
+                                  </div>
+                                  <div className="break-all">
+                                    <span className="text-zinc-500">
+                                      Source File:
+                                    </span>{' '}
+                                    <code>{s.sourcePath || relSource}</code>
+                                  </div>
+                                  <div className="break-all">
+                                    <span className="text-zinc-500">
+                                      Organized Target:
+                                    </span>{' '}
+                                    <code className="text-[#00ff66]">
+                                      {relDest}
+                                    </code>
+                                  </div>
+                                </div>
+
+                                {Array.isArray(s.operationLog) &&
+                                  s.operationLog.length > 0 && (
+                                    <div className="rounded border border-zinc-800 bg-black/70 p-2 space-y-0.5 text-[10px] font-mono">
+                                      {s.operationLog.map(
+                                        (line: string, lIdx: number) => (
+                                          <div
+                                            key={lIdx}
+                                            className={
+                                              line.startsWith('[FAIL]')
+                                                ? 'text-rose-400 font-bold'
+                                                : 'text-emerald-300'
+                                            }
+                                          >
+                                            {line}
+                                          </div>
+                                        )
+                                      )}
+                                    </div>
+                                  )}
+
+                                {(!songPassed ||
+                                  songErrorText ||
+                                  songStackText) && (
+                                  <div className="rounded-lg border border-rose-500/50 bg-rose-950/60 p-2.5 space-y-1.5">
+                                    <div className="text-[10px] font-bold uppercase text-rose-300 flex flex-wrap items-center justify-between gap-2">
+                                      <span>
+                                        Filesystem Failure Diagnostic
+                                        {s.failedOperation
+                                          ? ` — ${s.failedOperation}`
+                                          : ''}
+                                      </span>
+                                      {s.errorCode && (
+                                        <span className="rounded bg-rose-500/30 px-1.5 py-0.5 text-rose-200">
+                                          Code: {s.errorCode}
+                                        </span>
+                                      )}
+                                    </div>
+                                    {songErrorText && (
+                                      <div className="text-[11px] font-bold text-white break-all">
+                                        {songErrorText}
+                                      </div>
+                                    )}
+                                    {songStackText && (
+                                      <pre className="max-h-48 overflow-auto rounded border border-rose-500/30 bg-black/90 p-2 text-[10px] text-rose-200 whitespace-pre-wrap break-all">
+                                        {songStackText}
+                                      </pre>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            </details>
                           </div>
                         );
                       })}

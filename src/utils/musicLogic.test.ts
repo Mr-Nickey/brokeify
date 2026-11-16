@@ -796,7 +796,12 @@ test('runFiveSongReadWriteTest returns overallPassed=true, step.passed=true, and
     assert.ok(passReport.steps.every((st) => st.passed === true && st.status === 'pass'));
     assert.ok(
       passReport.sampleSongs.every(
-        (s) => s.passed === true && s.persistedOnDisk === true && s.parentWritable === true
+        (s) =>
+          s.passed === true &&
+          s.persistedOnDisk === true &&
+          s.parentWritable === true &&
+          Array.isArray(s.operationLog) &&
+          s.operationLog.length >= 7
       )
     );
   } finally {
@@ -808,6 +813,17 @@ test('runFiveSongReadWriteTest returns overallPassed=true, step.passed=true, and
   assert.equal(failReport.passed, false);
   assert.equal(failReport.overallPassed, false);
   assert.ok(failReport.errorDetails && failReport.errorDetails.includes('ENOENT'));
+  assert.ok(failReport.errorStack && failReport.errorStack.includes('ENOENT'));
+  assert.equal(failReport.sampleSongs.length, 5);
+  assert.ok(
+    failReport.sampleSongs.every(
+      (s) =>
+        s.passed === false &&
+        s.errorCode === 'ENOENT' &&
+        Boolean(s.error && s.error.includes('ENOENT')) &&
+        Boolean(s.errorStack && s.errorStack.includes('ENOENT'))
+    )
+  );
   assert.ok(failReport.summary.includes('ENOENT'));
 });
 

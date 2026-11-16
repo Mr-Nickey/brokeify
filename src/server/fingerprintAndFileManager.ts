@@ -1724,6 +1724,7 @@ export interface FiveSongTestStepResult {
   detail: string;
   durationMs: number;
   errorCode?: string;
+  errorStack?: string;
 }
 
 export interface FiveSongSampleTrackResult {
@@ -1745,13 +1746,18 @@ export interface FiveSongSampleTrackResult {
   renameTrackOk: boolean;
   artworkRenameOk: boolean;
   crossFolderMoveOk: boolean;
+  moveMethod?: 'rename' | 'copy+unlink' | 'noop';
   sourceDeletedCleanly: boolean;
   persistedOnDisk: boolean;
   parentWritable: boolean;
   passed: boolean;
+  durationMs: number;
   message: string;
+  failedOperation?: string;
   error?: string;
   errorCode?: string;
+  errorStack?: string;
+  operationLog: string[];
 }
 
 export interface FiveSongTestReport {
@@ -1767,26 +1773,36 @@ export interface FiveSongTestReport {
   syntheticTracksTested: number;
   summary: string;
   errorDetails?: string;
+  errorStack?: string;
   steps: FiveSongTestStepResult[];
   songResults: FiveSongSampleTrackResult[];
   sampleSongs: FiveSongSampleTrackResult[];
 }
 
-function formatNodeFsError(err: any): { code?: string; message: string } {
+function formatNodeFsError(err: any): {
+  code?: string;
+  message: string;
+  stack?: string;
+} {
   if (!err) {
     return { message: 'Unknown filesystem error' };
   }
-  const code = typeof err.code === 'string' && err.code.trim() ? err.code.trim() : undefined;
+  const code =
+    typeof err.code === 'string' && err.code.trim() ? err.code.trim() : undefined;
   const rawMessage =
     err instanceof Error
       ? err.message
       : typeof err?.message === 'string'
         ? err.message
         : String(err);
+  const stack =
+    typeof err?.stack === 'string' && err.stack.trim()
+      ? err.stack.trim()
+      : undefined;
   if (code && !rawMessage.includes(code)) {
-    return { code, message: `${code}: ${rawMessage}` };
+    return { code, message: `${code}: ${rawMessage}`, stack };
   }
-  return { code, message: rawMessage };
+  return { code, message: rawMessage, stack };
 }
 
 export async function runFiveSongReadWriteTest(options?: {
@@ -1806,6 +1822,40 @@ export async function runFiveSongReadWriteTest(options?: {
   const steps: FiveSongTestStepResult[] = [];
   const songResults: FiveSongSampleTrackResult[] = [];
   const encounteredErrors: string[] = [];
+  const encounteredStacks: string[] = [];
+
+  const syntheticCatalog = [
+    {
+      rawName: "128. Darius Rucker-Don't Think I Don't Think About It.mp3",
+      rawArtist: '128. Darius Rucker',
+      album: 'Learn to Live',
+      year: 2008,
+    },
+    {
+      rawName: '010.John Denver - Take Me Home, Country Roads.mp3',
+      rawArtist: '010.John Denver',
+      album: 'Poems, Prayers & Promises',
+      year: 1971,
+    },
+    {
+      rawName: "{1-035} Trisha Yearwood - She's In Love With The Boy.mp3",
+      rawArtist: '{1-035} Trisha Yearwood',
+      album: 'Trisha Yearwood',
+      year: 1991,
+    },
+    {
+      rawName: '029 Darius Rucker-Alright.mp3',
+      rawArtist: '029 Darius Rucker',
+      album: 'Learn to Live',
+      year: 2008,
+    },
+    {
+      rawName: '13_87 - Brantley Gilbert - Read Me My Rights.mp3',
+      rawArtist: '13_87 - Brantley Gilbert',
+      album: 'Just As I Am',
+      year: 2014,
+    },
+  ];
 
   setOrganizerActiveState(true);
   const testWorkspaceName = `.brokeify-5song-test-${Date.now()}`;
@@ -1820,6 +1870,7 @@ export async function runFiveSongReadWriteTest(options?: {
     let mountWritable = false;
     let step1Err = '';
     let step1ErrCode: string | undefined;
+    let step1ErrStack: string | undefined;
 
     try {
       const st = await fs.promises.stat(musicRoot);
@@ -1832,6 +1883,7 @@ export async function runFiveSongReadWriteTest(options?: {
       const formatted = formatNodeFsError(err);
       step1Err = formatted.message;
       step1ErrCode = formatted.code;
+      step1ErrStack = formatted.stack;
     }
 
     if (mountExists) {
@@ -1842,6 +1894,7 @@ export async function runFiveSongReadWriteTest(options?: {
         const formatted = formatNodeFsError(err);
         step1Err = formatted.message;
         step1ErrCode = formatted.code;
+        step1ErrStack = formatted.stack;
       }
       try {
         await fs.promises.access(musicRoot, fs.constants.W_OK);
@@ -1850,12 +1903,14 @@ export async function runFiveSongReadWriteTest(options?: {
         const formatted = formatNodeFsError(err);
         step1Err = formatted.message;
         step1ErrCode = formatted.code;
+        step1ErrStack = formatted.stack;
       }
     }
 
     const step1Passed = mountExists && mountReadable && mountWritable && !step1Err;
     if (!step1Passed && step1Err) {
       encounteredErrors.push(step1Err);
+      if (step1ErrStack) encounteredStacks.push(step1ErrStack);
     }
 
     steps.push({
@@ -1870,10 +1925,56 @@ export async function runFiveSongReadWriteTest(options?: {
         : `Failed on "${musicRoot}": ${step1Err}`,
       durationMs: Math.max(1, Date.now() - tStep1),
       errorCode: step1ErrCode,
+      errorStack: step1ErrStack,
     });
 
     if (!step1Passed) {
       const errSummary = step1Err || `EACCES: permission denied on "${musicRoot}"`;
+      for (let slot = 1; slot <= 5; slot++) {
+        const synthSpec = syntheticCatalog[slot - 1];
+        const stemInfo = cleanTrackNumberPrefixFromFilename(
+          path.basename(synthSpec.rawName, '.mp3'),
+          slot
+        );
+        const split = splitArtistAndTitleFromStem(stemInfo.stem);
+        const cleanedArtist = cleanArtistName(synthSpec.rawArtist);
+        const cleanedTitle = split?.title || stemInfo.stem;
+        const proposedDest = `${cleanedArtist}/${synthSpec.album} (${synthSpec.year})/0${slot} - ${cleanedTitle}.mp3`;
+        songResults.push({
+          slot,
+          sourceFile: `[Synthetic Sample] ${synthSpec.rawName}`,
+          sourcePath: path.join(musicRoot, synthSpec.rawName),
+          relativeSourcePath: `[Synthetic Sample] ${synthSpec.rawName}`,
+          isSyntheticSample: true,
+          rawArtistInput: synthSpec.rawArtist,
+          rawArtist: synthSpec.rawArtist,
+          cleanedArtistFolder: cleanedArtist,
+          cleanedArtist,
+          cleanedTitle,
+          targetRelativePath: proposedDest,
+          proposedRelativeDestPath: proposedDest,
+          readOk: false,
+          folderCreateOk: false,
+          writeCopyOk: false,
+          renameTrackOk: false,
+          artworkRenameOk: false,
+          crossFolderMoveOk: false,
+          sourceDeletedCleanly: false,
+          persistedOnDisk: false,
+          parentWritable: false,
+          passed: false,
+          durationMs: 1,
+          message: `Skipped — mount check failed on "${musicRoot}": ${errSummary}`,
+          failedOperation: '1. Mounted Drive Read/Write Access',
+          error: errSummary,
+          errorCode: step1ErrCode,
+          errorStack: step1ErrStack,
+          operationLog: [
+            `[FAIL] fs.stat / fs.access("${musicRoot}", R_OK | W_OK) -> ${errSummary}`,
+          ],
+        });
+      }
+
       return {
         ok: true,
         passed: false,
@@ -1882,11 +1983,12 @@ export async function runFiveSongReadWriteTest(options?: {
         durationMs: Math.max(1, Date.now() - startedAt),
         musicDir: musicRoot,
         musicRoot,
-        sampleTrackCount: 0,
+        sampleTrackCount: songResults.length,
         realTracksTested: 0,
-        syntheticTracksTested: 0,
+        syntheticTracksTested: 5,
         summary: `FAIL — "${musicRoot}" failed read/write check (${errSummary}).`,
         errorDetails: errSummary,
+        errorStack: step1ErrStack,
         steps,
         songResults,
         sampleSongs: songResults,
@@ -1897,6 +1999,7 @@ export async function runFiveSongReadWriteTest(options?: {
     const tStep2 = Date.now();
     let step2Err = '';
     let step2ErrCode: string | undefined;
+    let step2ErrStack: string | undefined;
     const compilationSamples = [
       { raw: '128. Darius Rucker', expected: 'Darius Rucker' },
       { raw: '010.John Denver', expected: 'John Denver' },
@@ -1915,7 +2018,9 @@ export async function runFiveSongReadWriteTest(options?: {
       const formatted = formatNodeFsError(err);
       step2Err = formatted.message;
       step2ErrCode = formatted.code;
+      step2ErrStack = formatted.stack;
       encounteredErrors.push(step2Err);
+      if (step2ErrStack) encounteredStacks.push(step2ErrStack);
     }
 
     const step2Passed = parseFailures.length === 0 && !step2Err;
@@ -1933,6 +2038,7 @@ export async function runFiveSongReadWriteTest(options?: {
           : `Parser mismatch on: ${parseFailures.map((f) => `${f.raw} -> ${cleanArtistName(f.raw)}`).join(', ')}`,
       durationMs: Math.max(1, Date.now() - tStep2),
       errorCode: step2ErrCode,
+      errorStack: step2ErrStack,
     });
 
     // Step 3: Collect up to 5 sample audio files across different folders in /music
@@ -1961,39 +2067,6 @@ export async function runFiveSongReadWriteTest(options?: {
       }
     }
 
-    const syntheticCatalog = [
-      {
-        rawName: "128. Darius Rucker-Don't Think I Don't Think About It.mp3",
-        rawArtist: '128. Darius Rucker',
-        album: 'Learn to Live',
-        year: 2008,
-      },
-      {
-        rawName: '010.John Denver - Take Me Home, Country Roads.mp3',
-        rawArtist: '010.John Denver',
-        album: 'Poems, Prayers & Promises',
-        year: 1971,
-      },
-      {
-        rawName: "{1-035} Trisha Yearwood - She's In Love With The Boy.mp3",
-        rawArtist: '{1-035} Trisha Yearwood',
-        album: 'Trisha Yearwood',
-        year: 1991,
-      },
-      {
-        rawName: '029 Darius Rucker-Alright.mp3',
-        rawArtist: '029 Darius Rucker',
-        album: 'Learn to Live',
-        year: 2008,
-      },
-      {
-        rawName: '13_87 - Brantley Gilbert - Read Me My Rights.mp3',
-        rawArtist: '13_87 - Brantley Gilbert',
-        album: 'Just As I Am',
-        year: 2014,
-      },
-    ];
-
     const tStep3 = Date.now();
     let realTracksTested = 0;
     let syntheticTracksTested = 0;
@@ -2005,6 +2078,7 @@ export async function runFiveSongReadWriteTest(options?: {
     ]);
 
     for (let slot = 1; slot <= 5; slot++) {
+      const slotStart = Date.now();
       const realFile = pickedRealFiles[slot - 1];
       const synthSpec = syntheticCatalog[slot - 1];
       const isSynthetic = !realFile;
@@ -2038,9 +2112,12 @@ export async function runFiveSongReadWriteTest(options?: {
         persistedOnDisk: false,
         parentWritable: false,
         passed: false,
+        durationMs: 0,
         message: '',
+        operationLog: [],
       };
 
+      let currentOperation = '1. Read Source Audio';
       try {
         // 1. Read test (read up to 64 KB of real track or synthesize sample payload)
         let samplePayload: Buffer;
@@ -2073,6 +2150,9 @@ export async function runFiveSongReadWriteTest(options?: {
           const split = splitArtistAndTitleFromStem(stemInfo.stem);
           rawArtistForDest = split?.artist || synthSpec.rawArtist;
           titleForDest = split?.title || stemInfo.stem;
+          resultRow.operationLog.push(
+            `[PASS] Read ${samplePayload.length} bytes from "${relSourceLabel}"`
+          );
         } else {
           samplePayload = Buffer.from(
             `ID3-BROKEIFY-5SONG-TEST-SLOT-${slot}-${synthSpec.rawName}-${Date.now()}`
@@ -2085,6 +2165,9 @@ export async function runFiveSongReadWriteTest(options?: {
           const split = splitArtistAndTitleFromStem(stemInfo.stem);
           rawArtistForDest = synthSpec.rawArtist;
           titleForDest = split?.title || stemInfo.stem;
+          resultRow.operationLog.push(
+            `[PASS] Generated ${samplePayload.length}-byte synthetic audio probe for "${synthSpec.rawName}"`
+          );
         }
 
         const cleanedArtist = cleanArtistName(rawArtistForDest);
@@ -2094,8 +2177,14 @@ export async function runFiveSongReadWriteTest(options?: {
         resultRow.cleanedArtist = cleanedArtist;
         resultRow.cleanedTitle = titleForDest;
         resultRow.readOk = samplePayload.length > 0;
+        if (rawArtistForDest !== cleanedArtist) {
+          resultRow.operationLog.push(
+            `[PASS] Stripped leading number prefix: "${rawArtistForDest}" → "${cleanedArtist}"`
+          );
+        }
 
         // 2. Write staging file in _staging folder
+        currentOperation = '2. Write Staging File';
         const stagingFilePath = path.join(
           stagingSubDir,
           `slot-${slot}-staging${ext}`
@@ -2103,8 +2192,12 @@ export async function runFiveSongReadWriteTest(options?: {
         await fs.promises.writeFile(stagingFilePath, samplePayload);
         const stagingStat = await fs.promises.stat(stagingFilePath);
         resultRow.writeCopyOk = stagingStat.size === samplePayload.length;
+        resultRow.operationLog.push(
+          `[PASS] Wrote staging file (${stagingStat.size} bytes) to _staging/slot-${slot}-staging${ext}`
+        );
 
         // 3. Build organized target path inside testWorkspaceDir and create nested Artist/Album folder
+        currentOperation = '3. Create Artist/Album Directory';
         const fullDestPath = buildOrganizedTrackDestination(testWorkspaceDir, {
           artist: rawArtistForDest,
           album: albumForDest,
@@ -2124,14 +2217,22 @@ export async function runFiveSongReadWriteTest(options?: {
         const albumDirStat = await fs.promises.stat(targetAlbumDir);
         resultRow.folderCreateOk = albumDirStat.isDirectory();
         resultRow.parentWritable = resultRow.folderCreateOk;
+        resultRow.operationLog.push(
+          `[PASS] Created directory "${path.dirname(relDest).replace(/\\/g, '/')}"`
+        );
 
         // 4. Test in-folder file rename (.tmp -> final name)
+        currentOperation = '4. In-Folder Atomic File Rename';
         const tempRenamePath = `${stagingFilePath}.renametest`;
         await fs.promises.rename(stagingFilePath, tempRenamePath);
         await fs.promises.rename(tempRenamePath, stagingFilePath);
         resultRow.renameTrackOk = await pathExistsAsync(stagingFilePath);
+        resultRow.operationLog.push(
+          `[PASS] Verified atomic in-folder rename (.renametest → final)`
+        );
 
         // 5. Test Artwork write & rename inside the newly created Album folder
+        currentOperation = '5. Cover Artwork Write & Rename (cover.jpg)';
         const coverTmpPath = path.join(targetAlbumDir, `cover-${slot}.tmp.jpg`);
         const coverFinalPath = path.join(targetAlbumDir, 'cover.jpg');
         await fs.promises.writeFile(coverTmpPath, sampleJpegBytes);
@@ -2140,28 +2241,44 @@ export async function runFiveSongReadWriteTest(options?: {
         resultRow.artworkRenameOk =
           coverStat.size === sampleJpegBytes.length &&
           !(await pathExistsAsync(coverTmpPath));
+        resultRow.operationLog.push(
+          `[PASS] Wrote & renamed cover-${slot}.tmp.jpg → cover.jpg (${coverStat.size} bytes)`
+        );
 
         // 6. Test cross-folder move from _staging -> Artist/Album/NN - Title.ext and verify source is deleted cleanly (zero duplicates)
+        currentOperation = '6. Cross-Folder Move & Source Unlink';
         const moveRes = await moveFileCleanlyWithVerify(
           stagingFilePath,
           fullDestPath
         );
         resultRow.crossFolderMoveOk = moveRes.moved;
+        resultRow.moveMethod = moveRes.method;
         resultRow.sourceDeletedCleanly = !(await pathExistsAsync(
           stagingFilePath
         ));
+        resultRow.operationLog.push(
+          `[PASS] Moved staging track → "${relDest}" via ${moveRes.method} (source unlinked: ${resultRow.sourceDeletedCleanly ? 'YES' : 'NO'})`
+        );
 
         // 7. Verify bytes persisted on disk at final destination
+        currentOperation = '7. Verify Disk Persistence';
         const finalStat = await fs.promises.stat(fullDestPath);
         resultRow.persistedOnDisk =
           finalStat.isFile() && finalStat.size === samplePayload.length;
+        resultRow.operationLog.push(
+          `[PASS] Verified destination file persisted on disk (${finalStat.size} bytes)`
+        );
 
         // 8. Clean up slot files and test empty directory cleanup
+        currentOperation = '8. Cleanup Temporary Files & Empty Folders';
         await fs.promises.unlink(fullDestPath);
         if (await pathExistsAsync(coverFinalPath)) {
           await fs.promises.unlink(coverFinalPath);
         }
         await cleanupEmptyParentDirs(targetAlbumDir, testWorkspaceDir);
+        resultRow.operationLog.push(
+          `[PASS] Unlinked temporary track & cover.jpg and pruned empty parent directories`
+        );
 
         resultRow.passed =
           resultRow.readOk &&
@@ -2172,16 +2289,28 @@ export async function runFiveSongReadWriteTest(options?: {
           resultRow.crossFolderMoveOk &&
           resultRow.sourceDeletedCleanly &&
           resultRow.persistedOnDisk;
+        resultRow.durationMs = Math.max(1, Date.now() - slotStart);
         resultRow.message = resultRow.passed
-          ? `Read (${samplePayload.length}B), folder mkdir, atomic rename, cover.jpg rename, cross-folder move, and unlink all succeeded.`
+          ? `Read (${samplePayload.length}B), folder mkdir, atomic rename, cover.jpg rename, cross-folder move (${moveRes.method}), and unlink all succeeded.`
           : 'One or more file verification assertions returned false.';
       } catch (slotErr: any) {
         const formatted = formatNodeFsError(slotErr);
+        resultRow.durationMs = Math.max(1, Date.now() - slotStart);
+        resultRow.failedOperation = currentOperation;
         resultRow.error = formatted.message;
         resultRow.errorCode = formatted.code;
-        resultRow.message = `Filesystem error: ${formatted.message}`;
+        resultRow.errorStack = formatted.stack;
+        resultRow.message = `Failed at [${currentOperation}]: ${formatted.message}`;
+        resultRow.operationLog.push(
+          `[FAIL] ${currentOperation} -> ${formatted.message}`
+        );
         resultRow.passed = false;
-        encounteredErrors.push(`Track #${slot} (${relSourceLabel}): ${formatted.message}`);
+        encounteredErrors.push(
+          `Track #${slot} (${relSourceLabel}) [${currentOperation}]: ${formatted.message}`
+        );
+        if (formatted.stack) {
+          encounteredStacks.push(formatted.stack);
+        }
       }
 
       songResults.push(resultRow);
@@ -2202,6 +2331,7 @@ export async function runFiveSongReadWriteTest(options?: {
         : `${passedSongs}/5 sample tracks passed.${firstSongErr ? ` Error: ${firstSongErr.error}` : ''}`,
       durationMs: Math.max(1, Date.now() - tStep3),
       errorCode: firstSongErr?.errorCode,
+      errorStack: firstSongErr?.errorStack,
     });
 
     // Step 4: Final Cleanup & Zero-Leftover Verification
@@ -2209,6 +2339,7 @@ export async function runFiveSongReadWriteTest(options?: {
     let cleanupOk = true;
     let step4Err = '';
     let step4ErrCode: string | undefined;
+    let step4ErrStack: string | undefined;
     try {
       await fs.promises.rm(testWorkspaceDir, { recursive: true, force: true });
     } catch (err: any) {
@@ -2216,7 +2347,9 @@ export async function runFiveSongReadWriteTest(options?: {
       cleanupOk = false;
       step4Err = formatted.message;
       step4ErrCode = formatted.code;
+      step4ErrStack = formatted.stack;
       encounteredErrors.push(`Cleanup failed: ${formatted.message}`);
+      if (formatted.stack) encounteredStacks.push(formatted.stack);
     }
 
     steps.push({
@@ -2231,6 +2364,7 @@ export async function runFiveSongReadWriteTest(options?: {
         : `Failed to delete temporary test folder: ${step4Err}`,
       durationMs: Math.max(1, Date.now() - tStep4),
       errorCode: step4ErrCode,
+      errorStack: step4ErrStack,
     });
 
     const overallPassed =
@@ -2240,6 +2374,8 @@ export async function runFiveSongReadWriteTest(options?: {
 
     const combinedErrorDetails =
       encounteredErrors.length > 0 ? encounteredErrors.join(' | ') : undefined;
+    const combinedErrorStack =
+      encounteredStacks.length > 0 ? encounteredStacks.join('\n\n') : undefined;
 
     return {
       ok: true,
@@ -2256,6 +2392,7 @@ export async function runFiveSongReadWriteTest(options?: {
         ? `PASS (5/5 Songs Verified in ${Math.max(1, Date.now() - startedAt)}ms) — Read, Write, Folder Creation, Artist Number-Stripping, Artwork Rename, and Clean File Moves all persisted on "${musicRoot}".`
         : `FAIL on "${musicRoot}" — ${combinedErrorDetails || 'One or more filesystem checks failed.'}`,
       errorDetails: combinedErrorDetails,
+      errorStack: combinedErrorStack,
       steps,
       songResults,
       sampleSongs: songResults,

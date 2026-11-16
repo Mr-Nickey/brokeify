@@ -1,11 +1,14 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import QRCode from 'qrcode';
 import {
   Camera,
   Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Code2,
   Copy,
+  Download,
   ExternalLink,
   Globe,
   Hash,
@@ -13,13 +16,106 @@ import {
   Link2,
   Loader2,
   Maximize2,
+  MoreVertical,
   QrCode,
   RefreshCw,
+  Share,
   ShieldCheck,
   Smartphone,
+  Sparkles,
   Wifi,
   X,
 } from 'lucide-react';
+
+export function usePWAInstall() {
+  const [deferredPrompt, setDeferredPrompt] = useState<any>(() =>
+    typeof window !== 'undefined' ? window.__brokeifyDeferredPwaPrompt || null : null
+  );
+  const [isInstalled, setIsInstalled] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return (
+      window.matchMedia('(display-mode: standalone)').matches ||
+      (window.navigator as any).standalone === true
+    );
+  });
+
+  const isAndroid = useMemo(() => {
+    if (typeof navigator === 'undefined') return false;
+    return /Android/i.test(navigator.userAgent);
+  }, []);
+
+  const isIOS = useMemo(() => {
+    if (typeof navigator === 'undefined') return false;
+    return /iPhone|iPad|iPod/i.test(navigator.userAgent);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const syncPrompt = () => {
+      if (window.__brokeifyDeferredPwaPrompt) {
+        setDeferredPrompt(window.__brokeifyDeferredPwaPrompt);
+      }
+    };
+
+    const handleBeforeInstallPrompt = (e: Event) => {
+      e.preventDefault();
+      window.__brokeifyDeferredPwaPrompt = e;
+      setDeferredPrompt(e);
+    };
+
+    const handleInstalled = () => {
+      window.__brokeifyDeferredPwaPrompt = null;
+      setDeferredPrompt(null);
+      setIsInstalled(true);
+    };
+
+    syncPrompt();
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+    window.addEventListener('brokeify-pwa-prompt-ready', syncPrompt);
+    window.addEventListener('appinstalled', handleInstalled);
+    window.addEventListener('brokeify-pwa-installed', handleInstalled);
+
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+      window.removeEventListener('brokeify-pwa-prompt-ready', syncPrompt);
+      window.removeEventListener('appinstalled', handleInstalled);
+      window.removeEventListener('brokeify-pwa-installed', handleInstalled);
+    };
+  }, []);
+
+  const triggerNativeInstall = useCallback(async (): Promise<
+    'accepted' | 'dismissed' | 'unavailable'
+  > => {
+    const promptEvent =
+      deferredPrompt ||
+      (typeof window !== 'undefined' ? window.__brokeifyDeferredPwaPrompt : null);
+    if (!promptEvent || typeof promptEvent.prompt !== 'function') {
+      return 'unavailable';
+    }
+    try {
+      await promptEvent.prompt();
+      const choiceResult = await promptEvent.userChoice;
+      window.__brokeifyDeferredPwaPrompt = null;
+      setDeferredPrompt(null);
+      if (choiceResult?.outcome === 'accepted') {
+        setIsInstalled(true);
+        return 'accepted';
+      }
+      return 'dismissed';
+    } catch {
+      return 'unavailable';
+    }
+  }, [deferredPrompt]);
+
+  return {
+    canInstallPrompt: Boolean(deferredPrompt),
+    isInstalled,
+    isAndroid,
+    isIOS,
+    triggerNativeInstall,
+  };
+}
 
 export interface PairedAndroidDevice {
   id: string;
@@ -972,6 +1068,309 @@ const AndroidQrPairingPanel: React.FC<AndroidQrContentProps> = ({
   );
 };
 
+export const AndroidPwaInstallCard: React.FC<{ compact?: boolean }> = ({
+  compact = false,
+}) => {
+  const {
+    canInstallPrompt,
+    isInstalled,
+    isAndroid,
+    isIOS,
+    triggerNativeInstall,
+  } = usePWAInstall();
+  const [showManualSteps, setShowManualSteps] = useState<boolean>(false);
+  const [showLanHttpTip, setShowLanHttpTip] = useState<boolean>(false);
+  const [installFeedback, setInstallFeedback] = useState<string | null>(null);
+  const [copiedFlag, setCopiedFlag] = useState<boolean>(false);
+  const [copiedOrigin, setCopiedOrigin] = useState<boolean>(false);
+
+  const currentOrigin =
+    typeof window !== 'undefined'
+      ? window.location.origin.replace(/\/+$/, '')
+      : 'http://localhost:3487';
+
+  const isInsecureLanIp = useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    return (
+      window.location.protocol === 'http:' &&
+      window.location.hostname !== 'localhost' &&
+      window.location.hostname !== '127.0.0.1'
+    );
+  }, []);
+
+  const handleInstallClick = async () => {
+    if (canInstallPrompt) {
+      const outcome = await triggerNativeInstall();
+      if (outcome === 'accepted') {
+        setInstallFeedback(
+          '✅ Brokeify is installing to your Android Home Screen & App Drawer!'
+        );
+        return;
+      }
+      if (outcome === 'dismissed') {
+        setInstallFeedback(
+          'Install prompt dismissed — you can tap Install again anytime or use Chrome’s ⋮ menu → Install app.'
+        );
+        return;
+      }
+    }
+    setShowManualSteps((prev) => !prev);
+  };
+
+  const handleCopyOrigin = async () => {
+    try {
+      await navigator.clipboard.writeText(currentOrigin);
+      setCopiedOrigin(true);
+      setTimeout(() => setCopiedOrigin(false), 2000);
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleCopyChromeFlag = async () => {
+    try {
+      await navigator.clipboard.writeText(
+        'chrome://flags/#unsafely-treat-insecure-origin-as-secure'
+      );
+      setCopiedFlag(true);
+      setTimeout(() => setCopiedFlag(false), 2500);
+    } catch {
+      // ignore
+    }
+  };
+
+  return (
+    <div
+      data-testid="android-pwa-install-card"
+      className={`rounded-2xl border-2 ${
+        isInstalled
+          ? 'border-emerald-500/60 bg-emerald-950/25'
+          : 'border-[#00ff66]/70 bg-gradient-to-br from-emerald-950/40 via-zinc-950 to-zinc-900'
+      } ${compact ? 'p-3.5 space-y-3' : 'p-4 sm:p-5 space-y-4'} shadow-xl`}
+    >
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="space-y-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="inline-flex items-center gap-1.5 rounded-lg bg-[#00ff66] px-2.5 py-0.5 text-[10px] font-mono font-extrabold uppercase text-zinc-950">
+              <Smartphone className="w-3.5 h-3.5" />
+              <span>Android Phone PWA</span>
+            </span>
+            {isInstalled ? (
+              <span className="inline-flex items-center gap-1 rounded-lg bg-emerald-500/20 border border-emerald-500/40 px-2 py-0.5 text-[10px] font-mono font-bold text-[#00ff66]">
+                <CheckCircle2 className="w-3 h-3" />
+                <span>Installed Full-Screen App</span>
+              </span>
+            ) : canInstallPrompt ? (
+              <span className="inline-flex items-center gap-1 rounded-lg bg-emerald-500/20 border border-emerald-500/40 px-2 py-0.5 text-[10px] font-mono font-bold text-[#00ff66] animate-pulse">
+                <Sparkles className="w-3 h-3" />
+                <span>Ready for 1-Tap Install</span>
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 rounded-lg bg-zinc-800 border border-zinc-700 px-2 py-0.5 text-[10px] font-mono text-zinc-300">
+                <span>One-Handed Mobile Player + Lock-Screen Controls</span>
+              </span>
+            )}
+          </div>
+          <h4 className="text-sm sm:text-base font-bold text-white font-mono">
+            {isInstalled
+              ? 'Brokeify is running as an Installed Android App'
+              : 'Install Brokeify Directly on Your Android Phone (No Store Needed)'}
+          </h4>
+          <p className="text-xs text-zinc-300 leading-relaxed">
+            Install the Web App (PWA) for a native full-screen Android music player with{' '}
+            <strong className="text-[#00ff66]">one-handed bottom thumb navigation</strong>,{' '}
+            <strong className="text-white">Bluetooth / lock-screen controls</strong>, and{' '}
+            <strong className="text-white">Offline Road-Trip Vault</strong>.
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          {!isInstalled && (
+            <button
+              type="button"
+              onClick={handleInstallClick}
+              data-testid="pwa-native-install-btn"
+              className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-4 py-3 text-xs sm:text-sm font-mono font-extrabold text-zinc-950 shadow-[0_0_20px_rgba(0,255,102,0.35)] transition-all active:scale-95 min-h-[46px]"
+            >
+              <Download className="w-4 h-4 stroke-[2.5]" />
+              <span>
+                {canInstallPrompt
+                  ? '1-Tap Install on Android'
+                  : isAndroid
+                    ? 'Install on This Android Phone'
+                    : isIOS
+                      ? 'How to Add to iPhone Home Screen'
+                      : 'Android Phone Install Steps'}
+              </span>
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={() => setShowManualSteps((prev) => !prev)}
+            data-testid="pwa-toggle-manual-guide-btn"
+            className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-900/90 hover:bg-zinc-800 px-3 py-2.5 text-xs font-mono font-semibold text-zinc-200 transition-colors min-h-[44px]"
+          >
+            <span>{showManualSteps ? 'Hide Guide' : 'Chrome Install Guide'}</span>
+            {showManualSteps ? (
+              <ChevronUp className="w-4 h-4 text-[#00ff66]" />
+            ) : (
+              <ChevronDown className="w-4 h-4 text-[#00ff66]" />
+            )}
+          </button>
+        </div>
+      </div>
+
+      {installFeedback && (
+        <div className="rounded-xl border border-[#00ff66]/50 bg-emerald-950/40 px-3.5 py-2.5 text-xs font-mono text-[#00ff66]">
+          {installFeedback}
+        </div>
+      )}
+
+      {(showManualSteps || (!canInstallPrompt && isAndroid && !isInstalled)) && (
+        <div
+          data-testid="pwa-android-manual-steps"
+          className="rounded-xl border border-zinc-800 bg-zinc-950/90 p-3.5 sm:p-4 space-y-3"
+        >
+          {isIOS ? (
+            <div className="space-y-2 text-xs font-mono text-zinc-200">
+              <div className="text-[#00ff66] font-bold uppercase tracking-wider">
+                iPhone / iPad Safari Home Screen Install:
+              </div>
+              <ol className="list-decimal list-inside space-y-1.5 text-zinc-300">
+                <li>
+                  Open <strong className="text-white">{currentOrigin}</strong> in{' '}
+                  <strong>Safari</strong>.
+                </li>
+                <li>
+                  Tap the <Share className="w-3.5 h-3.5 inline text-sky-400 mx-0.5" />{' '}
+                  <strong>Share</strong> button on the bottom bar.
+                </li>
+                <li>
+                  Scroll down and tap <strong>&ldquo;Add to Home Screen&rdquo;</strong>.
+                </li>
+              </ol>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-xs font-mono font-bold uppercase tracking-wider text-[#00ff66]">
+                  3-Step Android Chrome Install (Works on Pixel, Samsung, OnePlus, etc.)
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCopyOrigin}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 px-2.5 py-1 text-[11px] font-mono text-[#00ff66]"
+                >
+                  {copiedOrigin ? (
+                    <>
+                      <Check className="w-3.5 h-3.5" />
+                      <span>Copied URL!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Copy Server URL</span>
+                    </>
+                  )}
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs font-mono">
+                <div className="rounded-xl border border-zinc-800/90 bg-zinc-900/70 p-3 space-y-1">
+                  <div className="text-[10px] font-bold uppercase text-[#00ff66]">
+                    Step 1 · Open in Chrome
+                  </div>
+                  <p className="text-zinc-200 leading-snug">
+                    Open <strong className="text-white break-all">{currentOrigin}</strong> in{' '}
+                    <strong>Google Chrome</strong> on your Android phone.
+                  </p>
+                </div>
+
+                <div className="rounded-xl border border-zinc-800/90 bg-zinc-900/70 p-3 space-y-1">
+                  <div className="text-[10px] font-bold uppercase text-[#00ff66]">
+                    Step 2 · Tap Chrome ⋮ Menu
+                  </div>
+                  <p className="text-zinc-200 leading-snug">
+                    Tap the{' '}
+                    <span className="inline-flex items-center px-1 py-0.5 rounded bg-zinc-800 text-white">
+                      <MoreVertical className="w-3 h-3" />
+                    </span>{' '}
+                    <strong>3-dots menu</strong> in Chrome&rsquo;s top-right corner.
+                  </p>
+                </div>
+
+                <div className="rounded-xl border border-zinc-800/90 bg-zinc-900/70 p-3 space-y-1">
+                  <div className="text-[10px] font-bold uppercase text-[#00ff66]">
+                    Step 3 · Tap &ldquo;Install App&rdquo;
+                  </div>
+                  <p className="text-zinc-200 leading-snug">
+                    Tap <strong className="text-[#00ff66]">&ldquo;Install app&rdquo;</strong> or{' '}
+                    <strong className="text-white">&ldquo;Add to Home screen&rdquo;</strong> to pin Brokeify to your app drawer.
+                  </p>
+                </div>
+              </div>
+
+              {/* Helpful Self-Hosted HTTP LAN IP Tip for Android Chrome */}
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={() => setShowLanHttpTip((prev) => !prev)}
+                  className="text-[11px] font-mono text-amber-300 hover:text-amber-200 inline-flex items-center gap-1"
+                >
+                  <span>
+                    💡 Using a local HTTP LAN IP (e.g. http://192.168.1.x:3487) without HTTPS?
+                  </span>
+                  {showLanHttpTip ? (
+                    <ChevronUp className="w-3.5 h-3.5" />
+                  ) : (
+                    <ChevronDown className="w-3.5 h-3.5" />
+                  )}
+                </button>
+
+                {(showLanHttpTip || isInsecureLanIp) && (
+                  <div className="mt-2 rounded-xl border border-amber-500/40 bg-amber-950/25 p-3 text-[11px] font-mono text-amber-100 space-y-2">
+                    <p>
+                      Android Chrome normally requires HTTPS for full PWA installation, or you can whitelist your local server URL in 10 seconds:
+                    </p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <code className="rounded bg-black/70 px-2 py-1 text-amber-300 break-all">
+                        chrome://flags/#unsafely-treat-insecure-origin-as-secure
+                      </code>
+                      <button
+                        type="button"
+                        onClick={handleCopyChromeFlag}
+                        className="inline-flex items-center gap-1 rounded-lg bg-amber-400 hover:bg-amber-300 px-2.5 py-1 text-[11px] font-bold text-zinc-950"
+                      >
+                        {copiedFlag ? (
+                          <>
+                            <Check className="w-3 h-3" />
+                            <span>Copied Flag URL</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3 h-3" />
+                            <span>Copy Chrome Flag</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                    <p className="text-zinc-300">
+                      Paste that into Android Chrome, add{' '}
+                      <strong className="text-white">{currentOrigin}</strong>, set to{' '}
+                      <strong>Enabled</strong>, and tap <strong>Relaunch</strong> — Android Chrome will then offer 1-tap native PWA install!
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 interface AndroidQrPairingModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -994,12 +1393,12 @@ export const AndroidQrPairingModal: React.FC<AndroidQrPairingModalProps> = ({
       <div className="w-full max-w-4xl winamp-bezel rounded-3xl border-2 border-[#00ff66]/50 bg-zinc-950 overflow-hidden shadow-2xl my-auto text-left">
         <div className="winamp-titlebar px-5 py-3.5 flex items-center justify-between border-b border-zinc-700/80">
           <div className="flex items-center gap-2.5">
-            <QrCode className="w-5 h-5 text-[#00ff66]" />
+            <Smartphone className="w-5 h-5 text-[#00ff66]" />
             <h3
               id="android-qr-modal-title"
               className="text-xs sm:text-sm font-mono font-bold uppercase tracking-wider text-white"
             >
-              CONNECT ANDROID APP // 6-DIGIT QUICK CONNECT &amp; QR PAIRING
+              INSTALL ANDROID PHONE APP (PWA) // 6-DIGIT QUICK CONNECT &amp; QR PAIRING
             </h3>
           </div>
           <button
@@ -1007,13 +1406,14 @@ export const AndroidQrPairingModal: React.FC<AndroidQrPairingModalProps> = ({
             onClick={onClose}
             aria-label="Close Connect Android App Modal"
             data-testid="close-android-qr-modal-btn"
-            className="rounded-lg p-1.5 text-zinc-300 hover:bg-zinc-800 hover:text-white transition-colors"
+            className="rounded-lg p-1.5 text-zinc-300 hover:bg-zinc-800 hover:text-white transition-colors min-h-[40px] min-w-[40px] flex items-center justify-center"
           >
             <X className="w-4 h-4" />
           </button>
         </div>
 
-        <div className="p-5 sm:p-6 max-h-[85vh] overflow-y-auto">
+        <div className="p-4 sm:p-6 max-h-[85vh] overflow-y-auto space-y-5">
+          <AndroidPwaInstallCard />
           <AndroidQrPairingPanel isModal={true} onClose={onClose} />
         </div>
       </div>
@@ -1038,8 +1438,11 @@ export const ConnectAndroidAppSection: React.FC = () => {
               id="connect-android-app-heading"
               className="text-lg sm:text-xl font-bold text-white tracking-tight font-mono"
             >
-              Connect Android App
+              Install &amp; Connect Android App
             </h2>
+            <span className="rounded-full bg-[#00ff66]/20 border border-[#00ff66]/50 px-2.5 py-0.5 text-[10px] font-mono font-bold uppercase text-[#00ff66]">
+              1-Tap Android PWA
+            </span>
             <span className="rounded-full bg-purple-500/20 border border-purple-500/40 px-2.5 py-0.5 text-[10px] font-mono font-bold uppercase text-purple-300">
               6-Digit Quick Connect
             </span>
@@ -1048,10 +1451,8 @@ export const ConnectAndroidAppSection: React.FC = () => {
             </span>
           </div>
           <p className="text-xs sm:text-sm text-zinc-300 max-w-3xl">
-            Link your phone using the <strong>6-digit Quick Connect code</strong>{' '}
-            or scan the high-contrast QR code. The active URL
-            you are using right now is auto-detected below for instant copy &amp;
-            pasting.
+            Install Brokeify directly as a full-screen Android PWA or link your phone using the{' '}
+            <strong>6-digit Quick Connect code</strong> and high-contrast QR code.
           </p>
         </div>
 
@@ -1080,6 +1481,8 @@ export const ConnectAndroidAppSection: React.FC = () => {
         </div>
       </div>
 
+      <AndroidPwaInstallCard />
+
       <AndroidQrPairingPanel
         isModal={false}
         onOpenPopupModal={() => setShowPopup(true)}
@@ -1095,6 +1498,7 @@ export const ConnectAndroidAppSection: React.FC = () => {
 
 export const PWAInstallButton: React.FC = () => {
   const [showQrModal, setShowQrModal] = useState(false);
+  const { canInstallPrompt, isInstalled } = usePWAInstall();
 
   return (
     <>
@@ -1103,13 +1507,30 @@ export const PWAInstallButton: React.FC = () => {
         onClick={() => setShowQrModal(true)}
         data-testid="navbar-android-qr-btn"
         aria-label="Connect Android App"
-        className="inline-flex items-center justify-center gap-1 rounded-xl border border-[#00ff66]/50 bg-[#00ff66]/15 hover:bg-[#00ff66]/25 px-2.5 py-1.5 text-sm font-mono font-bold text-[#00ff66] transition-colors whitespace-nowrap shrink-0 min-h-[36px] min-w-[36px]"
-        title="Connect Android App (6-Digit Quick Connect & QR Code)"
+        className={`inline-flex items-center justify-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-mono font-bold transition-colors whitespace-nowrap shrink-0 min-h-[38px] min-w-[38px] ${
+          canInstallPrompt && !isInstalled
+            ? 'border-[#00ff66] bg-[#00ff66] text-zinc-950 shadow-[0_0_12px_rgba(0,255,102,0.4)]'
+            : 'border-[#00ff66]/50 bg-[#00ff66]/15 hover:bg-[#00ff66]/25 text-[#00ff66]'
+        }`}
+        title={
+          canInstallPrompt
+            ? '1-Tap Install Android App (PWA) or Pair via QR Code'
+            : 'Install Android App (PWA) & 6-Digit Quick Connect'
+        }
       >
-        <QrCode className="w-4 h-4 text-[#00ff66] shrink-0" />
-        <span aria-hidden="true" className="text-sm leading-none">
-          📲
-        </span>
+        {canInstallPrompt && !isInstalled ? (
+          <>
+            <Download className="w-4 h-4 stroke-[2.4] shrink-0" />
+            <span className="hidden sm:inline">Install App</span>
+          </>
+        ) : (
+          <>
+            <QrCode className="w-4 h-4 text-[#00ff66] shrink-0" />
+            <span aria-hidden="true" className="text-sm leading-none">
+              📲
+            </span>
+          </>
+        )}
       </button>
 
       <AndroidQrPairingModal
@@ -1121,5 +1542,78 @@ export const PWAInstallButton: React.FC = () => {
 };
 
 export const MobilePixelInstallBanner: React.FC = () => {
-  return null;
+  const { canInstallPrompt, isInstalled, isAndroid, triggerNativeInstall } =
+    usePWAInstall();
+  const [dismissed, setDismissed] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem('brokeify_pwa_banner_dismissed_v1') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const [showModal, setShowModal] = useState<boolean>(false);
+
+  if (isInstalled || dismissed) return null;
+  if (!canInstallPrompt && !isAndroid) return null;
+
+  const handleInstallNow = async () => {
+    if (canInstallPrompt) {
+      const res = await triggerNativeInstall();
+      if (res === 'accepted') return;
+    }
+    setShowModal(true);
+  };
+
+  return (
+    <>
+      <div
+        data-testid="mobile-pwa-install-banner"
+        className="md:hidden rounded-2xl border border-[#00ff66]/50 bg-gradient-to-r from-emerald-950/80 via-zinc-900 to-zinc-950 px-3.5 py-2.5 flex items-center justify-between gap-2.5 shadow-lg"
+      >
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className="w-9 h-9 rounded-xl bg-[#00ff66]/15 border border-[#00ff66]/40 flex items-center justify-center shrink-0">
+            <Smartphone className="w-4 h-4 text-[#00ff66]" />
+          </div>
+          <div className="min-w-0">
+            <div className="text-xs font-mono font-bold text-white truncate">
+              Install Brokeify on Android
+            </div>
+            <div className="text-[10px] font-mono text-zinc-400 truncate">
+              Full-screen player · Lock-screen controls
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-1.5 shrink-0">
+          <button
+            type="button"
+            onClick={handleInstallNow}
+            className="rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-3 py-2 text-xs font-mono font-extrabold text-zinc-950 transition-transform active:scale-95 min-h-[38px]"
+          >
+            Install
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setDismissed(true);
+              try {
+                sessionStorage.setItem('brokeify_pwa_banner_dismissed_v1', '1');
+              } catch {
+                // ignore
+              }
+            }}
+            aria-label="Dismiss Android Install Banner"
+            className="p-2 rounded-lg text-zinc-400 hover:text-white min-h-[38px] min-w-[38px] flex items-center justify-center"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+
+      <AndroidQrPairingModal
+        isOpen={showModal}
+        onClose={() => setShowModal(false)}
+      />
+    </>
+  );
 };

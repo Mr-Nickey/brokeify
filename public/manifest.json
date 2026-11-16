@@ -36,5 +36,28 @@
       "type": "image/png",
       "purpose": "maskable"
     }
+  ],
+  "shortcuts": [
+    {
+      "name": "Play Songs",
+      "short_name": "Songs",
+      "description": "Jump straight to all songs in your library",
+      "url": "/?view=songs",
+      "icons": [{ "src": "/pwa-192x192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Liked Songs",
+      "short_name": "Liked",
+      "description": "Play your favorited songs",
+      "url": "/?view=liked",
+      "icons": [{ "src": "/pwa-192x192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Car Driving Mode",
+      "short_name": "Car Mode",
+      "description": "Launch high-contrast 1-tap Car Driving Mode",
+      "url": "/?view=carmode",
+      "icons": [{ "src": "/pwa-192x192.png", "sizes": "192x192", "type": "image/png" }]
+    }
   ]
 }

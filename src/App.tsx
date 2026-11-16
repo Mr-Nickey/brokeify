@@ -102,6 +102,7 @@ import {
 import {
   PWAInstallButton,
   MobilePixelInstallBanner,
+  AndroidPwaInstallCard,
 } from './components/PWAInstallButton';
 import {
   BrokeifyLoginGateScreen,
@@ -289,6 +290,8 @@ export default function App() {
   const [mutePopupBanners, setMutePopupBanners] = useState<boolean>(true);
   const [isMobileSettingsMenuOpen, setIsMobileSettingsMenuOpen] =
     useState<boolean>(false);
+  const [isMobileMoreSheetOpen, setIsMobileMoreSheetOpen] =
+    useState<boolean>(false);
   const [appNotifications, setAppNotifications] = useState<
     AppNotificationItem[]
   >(() => {
@@ -332,11 +335,33 @@ export default function App() {
   const [dismissedJellyfinAlert, setDismissedJellyfinAlert] =
     useState<boolean>(false);
 
+  // Support Android PWA Home-Screen Shortcuts (?view=songs | liked | carmode)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const viewParam = params.get('view');
+    if (viewParam === 'songs') {
+      setActiveTab('library');
+      setLibrarySubTab('songs');
+    } else if (viewParam === 'liked') {
+      setActiveTab('library');
+      setLibrarySubTab('liked');
+    } else if (viewParam === 'carmode') {
+      setIsCarModeOpen(true);
+    }
+  }, []);
+
   // Collapsible Quick Launch + 3-Pane Workspace (Left Playlists Sidebar + Right Resizable Now Playing Dock)
   const [isQuickLaunchCollapsed, setIsQuickLaunchCollapsed] = useState<boolean>(
     () => {
       try {
-        return localStorage.getItem('brokeify_quick_launch_collapsed_v1') === '1';
+        const saved = localStorage.getItem('brokeify_quick_launch_collapsed_v1');
+        if (saved === '1') return true;
+        if (saved === '0') return false;
+        if (typeof window !== 'undefined' && window.innerWidth < 768) {
+          return true;
+        }
+        return false;
       } catch {
         return false;
       }
@@ -3008,7 +3033,51 @@ export default function App() {
       </header>
 
       {/* Main Content Container */}
-      <main className="relative z-10 flex-1 w-full max-w-[1920px] mx-auto px-3 sm:px-6 xl:px-8 pt-4 space-y-5">
+      <main className="relative z-10 flex-1 w-full max-w-[1920px] mx-auto px-3 sm:px-6 xl:px-8 pt-3 sm:pt-4 space-y-4 sm:space-y-5">
+        {/* Android Phone 1-Tap PWA Install Banner (Mobile Only when not yet installed) */}
+        <MobilePixelInstallBanner />
+
+        {/* Mobile Return-to-Music Bar when viewing a Tucked-Away PC / Server Tool */}
+        {activeTab !== 'library' && (
+          <div
+            data-testid="mobile-pc-tool-return-bar"
+            className="md:hidden winamp-bezel rounded-2xl border border-[#00ff66]/50 bg-zinc-950/95 px-3.5 py-2.5 flex items-center justify-between gap-2 shadow-lg"
+          >
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab('library');
+                setIsMobileMoreSheetOpen(false);
+              }}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-[#00ff66] hover:bg-emerald-400 px-3 py-2 text-xs font-mono font-extrabold text-zinc-950 transition-transform active:scale-95 min-h-[40px]"
+            >
+              <ArrowLeft className="w-4 h-4 stroke-[2.5]" />
+              <span>Back to Music</span>
+            </button>
+
+            <div className="min-w-0 flex-1 text-center px-1">
+              <div className="text-[10px] font-mono uppercase tracking-wider text-zinc-400 truncate">
+                PC / Server Tool
+              </div>
+              <div className="text-xs font-mono font-bold text-white truncate">
+                {activeTab === 'discover' && 'Request & Discover'}
+                {activeTab === 'files' && 'Files & Organizer'}
+                {activeTab === 'settings' && 'Settings & Sources'}
+                {activeTab === 'nowplaying' && 'Stereo Deck'}
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setIsMobileMoreSheetOpen(true)}
+              className="inline-flex items-center gap-1 rounded-xl border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 px-3 py-2 text-xs font-mono font-bold text-[#00ff66] min-h-[40px]"
+            >
+              <Menu className="w-4 h-4" />
+              <span>Tools</span>
+            </button>
+          </div>
+        )}
+
         {/* Cross-Device Playback Handoff Banner */}
         {remotePlaybackSession?.track &&
           remotePlaybackSession.deviceId !== deviceIdentity.deviceId && (
@@ -3056,11 +3125,11 @@ export default function App() {
           )}
 
         {/* =====================================================================
-            TAB 1: LIBRARY (ALWAYS SIDE-BY-SIDE FLEX-ROW: AUTO-COLLAPSING LEFT SIDEBAR + CENTER STAGE)
+            TAB 1: LIBRARY (DESKTOP SIDE-BY-SIDE FLEX-ROW; FULL-WIDTH ONE-HANDED VIEW ON MOBILE)
            ===================================================================== */}
         {activeTab === 'library' && (
           <div className="flex flex-row items-start gap-2.5 sm:gap-3">
-            {/* LEFT SIDEBAR: AUTO-COLLAPSES ON SMALLER WINDOWS, NEVER PUSHES LIBRARY DOWN BELOW */}
+            {/* LEFT SIDEBAR: HIDDEN ON MOBILE (< md) SO PHONE GETS 100% WIDTH FOR MUSIC */}
             <aside
               data-testid="left-playlists-sidebar"
               style={
@@ -3073,7 +3142,7 @@ export default function App() {
                       )}px`,
                     }
               }
-              className="flex shrink-0 items-stretch relative transition-[width] duration-150 ease-out"
+              className="hidden md:flex shrink-0 items-stretch relative transition-[width] duration-150 ease-out"
             >
               <div className="flex-1 min-w-0 winamp-bezel rounded-2xl border border-zinc-700/80 overflow-hidden flex flex-col">
                 <div className="winamp-titlebar px-2.5 py-2.5 border-b border-zinc-800 flex items-center justify-between gap-2">
@@ -7316,10 +7385,10 @@ export default function App() {
         )}
       </main>
 
-      {/* Persistent Bottom Player Bar + Mobile 4-Tab Navigation */}
-      <div className="fixed bottom-0 inset-x-0 z-40 border-t border-zinc-700/80 winamp-titlebar backdrop-blur-lg">
+      {/* Persistent Bottom Player Bar + One-Handed Mobile 5-Tab Music Navigation */}
+      <div className="fixed bottom-0 inset-x-0 z-40 border-t border-zinc-700/80 winamp-titlebar backdrop-blur-xl pb-[env(safe-area-inset-bottom)]">
         {/* Interactive Mobile + Desktop Touch Scrubber Bar at Top of Dock */}
-        <div className="relative w-full h-1.5 sm:h-1 bg-zinc-950 group">
+        <div className="relative w-full h-2 sm:h-1 bg-zinc-950 group">
           <div
             className="h-full bg-[#00ff66] transition-all duration-150"
             style={{
@@ -7340,13 +7409,13 @@ export default function App() {
           />
         </div>
 
-        <div className="w-full max-w-[1920px] mx-auto px-3 sm:px-6 xl:px-10 py-1.5 sm:py-2.5 flex items-center justify-between gap-2 sm:gap-3">
-          {/* Current Track Info */}
+        <div className="w-full max-w-[1920px] mx-auto px-2.5 sm:px-6 xl:px-10 py-1.5 sm:py-2.5 flex items-center justify-between gap-2 sm:gap-3">
+          {/* Current Track Info (Tap to open Full-Screen Thumb-Friendly Now Playing Deck) */}
           <button
             type="button"
             onClick={() => setIsDrawerOpen(true)}
             data-testid="bottombar-open-drawer-btn"
-            className="flex items-center gap-2.5 sm:gap-3 min-w-0 flex-1 sm:flex-initial sm:w-80 text-left group"
+            className="flex items-center gap-2.5 sm:gap-3 min-w-0 flex-1 sm:flex-initial sm:w-80 text-left group min-h-[46px]"
           >
             {audio.currentTrack && (
               <CachedArtworkImage
@@ -7355,7 +7424,7 @@ export default function App() {
                 fallbackTitle={audio.currentTrack?.title || 'Brokeify'}
                 fallbackArtist={audio.currentTrack?.artist || 'Brokeify'}
                 fallbackAccent={audio.currentTrack?.accentColor || '#10b981'}
-                className="w-10 h-10 sm:w-11 sm:h-11 rounded-xl border border-zinc-700 object-cover shrink-0"
+                className="w-11 h-11 rounded-xl border border-zinc-700 object-cover shrink-0 shadow-md"
               />
             )}
             <div className="min-w-0 flex-1 overflow-hidden">
@@ -7386,21 +7455,23 @@ export default function App() {
               </div>
               {/* Mobile Elapsed / Duration Readout */}
               {audio.currentTrack && (
-                <div className="lg:hidden text-[10px] font-mono tabular-nums text-[#00ff66]/90 mt-0.5 flex items-center gap-1.5">
+                <div className="lg:hidden text-[10px] font-mono tabular-nums text-[#00ff66]/90 mt-0.5 flex items-center gap-1">
                   <span>
                     {formatDuration(audio.currentTime)} /{' '}
                     {formatDuration(audio.duration)}
                   </span>
-                  <span className="text-zinc-500">· Tap for Full Player</span>
+                  <span className="text-zinc-500 hidden xs:inline">
+                    · Full Player
+                  </span>
                 </div>
               )}
             </div>
-            <ChevronUp className="w-4 h-4 text-zinc-400 group-hover:text-white shrink-0" />
+            <ChevronUp className="w-4 h-4 text-zinc-400 group-hover:text-white shrink-0 hidden sm:block" />
           </button>
 
           {/* 1-Tap Heart Like + Report Wrong Track Flag Button in Persistent Bottom Bar */}
           {audio.currentTrack && (
-            <div className="flex items-center gap-1.5 shrink-0">
+            <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
               <button
                 type="button"
                 onClick={() =>
@@ -7417,7 +7488,7 @@ export default function App() {
                     ? 'Liked — tap to remove'
                     : 'Save to Liked Songs'
                 }
-                className={`p-2 rounded-xl border transition-colors min-h-[40px] min-w-[40px] flex items-center justify-center shrink-0 ${
+                className={`p-2.5 rounded-xl border transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center shrink-0 ${
                   likedTrackIds.has(audio.currentTrack.id)
                     ? 'border-rose-500/50 bg-rose-500/15 text-rose-400'
                     : 'border-zinc-800 bg-zinc-900/80 text-zinc-400 hover:text-rose-400'
@@ -7444,20 +7515,20 @@ export default function App() {
                 data-testid="bottombar-report-wrong-track-btn"
                 aria-label="Report Wrong Track and Auto-Replace"
                 title="Report Wrong Song / Live / Remix (Quarantine & Auto-Replace)"
-                className="p-2 rounded-xl border border-amber-500/40 bg-amber-950/30 hover:bg-amber-900/50 text-amber-300 transition-colors min-h-[40px] min-w-[40px] flex items-center justify-center shrink-0"
+                className="hidden sm:flex p-2 rounded-xl border border-amber-500/40 bg-amber-950/30 hover:bg-amber-900/50 text-amber-300 transition-colors min-h-[40px] min-w-[40px] items-center justify-center shrink-0"
               >
                 <Flag className="w-4 h-4 text-amber-400" />
               </button>
             </div>
           )}
 
-          {/* Center Transport Controls: Prev, Play/Pause, Prominent Skip Song, and Shuffle */}
-          <div className="flex items-center gap-1.5 sm:gap-2">
+          {/* One-Handed Transport Controls: Prev, Giant Play/Pause, Next/Skip, and Shuffle */}
+          <div className="flex items-center gap-1 sm:gap-2 shrink-0">
             <button
               type="button"
               onClick={audio.playPrevious}
               aria-label="Previous track"
-              className="p-2 rounded-xl text-zinc-300 hover:bg-zinc-900 hover:text-white min-h-[40px] min-w-[40px] flex items-center justify-center"
+              className="p-2.5 rounded-xl border border-zinc-800/80 bg-zinc-900/80 text-zinc-200 hover:bg-zinc-800 hover:text-white min-h-[44px] min-w-[44px] flex items-center justify-center"
             >
               <SkipBack className="w-4 h-4 sm:w-5 sm:h-5" />
             </button>
@@ -7466,12 +7537,12 @@ export default function App() {
               type="button"
               onClick={audio.togglePlayPause}
               aria-label={audio.isPlaying ? 'Pause' : 'Play'}
-              className="w-10 h-10 sm:w-11 sm:h-11 rounded-xl bg-[#00ff66] hover:bg-emerald-400 text-zinc-950 flex items-center justify-center shadow-md"
+              className="w-11 h-11 sm:w-12 sm:h-12 rounded-xl bg-[#00ff66] hover:bg-emerald-400 text-zinc-950 flex items-center justify-center shadow-[0_0_14px_rgba(0,255,102,0.35)] active:scale-95 transition-transform"
             >
               {audio.isPlaying ? (
-                <Pause className="w-4 h-4 sm:w-5 sm:h-5 fill-current" />
+                <Pause className="w-5 h-5 fill-current" />
               ) : (
-                <Play className="w-4 h-4 sm:w-5 sm:h-5 fill-current" />
+                <Play className="w-5 h-5 fill-current ml-0.5" />
               )}
             </button>
 
@@ -7481,10 +7552,10 @@ export default function App() {
               aria-label="Skip Song"
               title="Skip Song"
               data-testid="bottombar-skip-song-btn"
-              className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-2 rounded-xl border border-emerald-500/50 bg-zinc-900/90 hover:bg-zinc-800 text-[#00ff66] font-mono text-xs font-bold min-h-[40px]"
+              className="inline-flex items-center justify-center gap-1.5 px-3 py-2.5 rounded-xl border border-emerald-500/50 bg-zinc-900/90 hover:bg-zinc-800 text-[#00ff66] font-mono text-xs font-bold min-h-[44px] min-w-[44px]"
             >
               <SkipForward className="w-4 h-4 sm:w-5 sm:h-5" />
-              <span className="hidden xs:inline sm:inline">Skip</span>
+              <span className="hidden sm:inline">Skip</span>
             </button>
 
             <button
@@ -7500,14 +7571,14 @@ export default function App() {
               aria-label="Toggle Shuffle Queue"
               title="Mix / Shuffle Queue"
               data-testid="bottombar-shuffle-btn"
-              className={`inline-flex items-center gap-1 px-2.5 py-2 rounded-xl border font-mono text-xs font-bold min-h-[40px] transition-colors ${
+              className={`hidden sm:inline-flex items-center gap-1 px-2.5 py-2 rounded-xl border font-mono text-xs font-bold min-h-[40px] transition-colors ${
                 audio.shuffleEnabled
                   ? 'border-purple-500/70 bg-purple-500/20 text-purple-300'
                   : 'border-zinc-800 bg-zinc-900/80 text-zinc-300 hover:text-white'
               }`}
             >
               <Shuffle className="w-4 h-4" />
-              <span className="hidden sm:inline">Shuffle</span>
+              <span className="hidden md:inline">Shuffle</span>
             </button>
 
             <button
@@ -7572,61 +7643,372 @@ export default function App() {
           </div>
         </div>
 
-        {/* Responsive Mobile 4-Tab Bottom Navigation Bar */}
+        {/* One-Handed Mobile 5-Tab Music Navigation Bar (Playlists | Songs | Liked | Car Mode | More/PC Tools) */}
         <nav
           aria-label="Mobile Bottom Navigation"
-          className="md:hidden grid grid-cols-4 border-t border-zinc-800/80 bg-[#070a0f] h-12"
+          data-testid="mobile-bottom-nav"
+          className="md:hidden grid grid-cols-5 border-t border-zinc-800/90 bg-[#070a0f] h-14 px-1"
         >
           <button
             type="button"
-            onClick={handleReturnToMainLibrary}
-            className={`flex flex-col items-center justify-center min-h-[44px] ${
-              activeTab === 'library' ? 'text-[#00ff66]' : 'text-zinc-400'
+            data-testid="mobile-nav-playlists"
+            onClick={() => {
+              setActiveTab('library');
+              setLibrarySubTab('playlists');
+              setSelectedPlaylistId(null);
+              setIsMobileMoreSheetOpen(false);
+            }}
+            className={`flex flex-col items-center justify-center min-h-[48px] rounded-xl transition-colors ${
+              activeTab === 'library' &&
+              librarySubTab === 'playlists' &&
+              !isMobileMoreSheetOpen
+                ? 'text-[#00ff66] font-bold'
+                : 'text-zinc-400 hover:text-zinc-200'
             }`}
           >
-            <ListMusic className="w-4 h-4" />
-            <span className="text-[10px] font-mono font-semibold mt-0.5">
-              Library
+            <ListMusic className="w-5 h-5" />
+            <span className="text-[10px] font-mono tracking-tight mt-0.5">
+              Playlists
             </span>
           </button>
+
           <button
             type="button"
-            onClick={() => setActiveTab('discover')}
-            className={`flex flex-col items-center justify-center min-h-[44px] ${
-              activeTab === 'discover' ? 'text-[#00ff66]' : 'text-zinc-400'
+            data-testid="mobile-nav-songs"
+            onClick={() => {
+              setActiveTab('library');
+              setLibrarySubTab('songs');
+              setSelectedPlaylistId(null);
+              setIsMobileMoreSheetOpen(false);
+            }}
+            className={`flex flex-col items-center justify-center min-h-[48px] rounded-xl transition-colors ${
+              activeTab === 'library' &&
+              (librarySubTab === 'songs' ||
+                librarySubTab === 'albums' ||
+                librarySubTab === 'artists') &&
+              !isMobileMoreSheetOpen
+                ? 'text-[#00ff66] font-bold'
+                : 'text-zinc-400 hover:text-zinc-200'
             }`}
           >
-            <Compass className="w-4 h-4" />
-            <span className="text-[10px] font-mono font-semibold mt-0.5">
-              Discover
+            <Music className="w-5 h-5" />
+            <span className="text-[10px] font-mono tracking-tight mt-0.5">
+              Songs
             </span>
           </button>
+
           <button
             type="button"
-            onClick={() => setActiveTab('files')}
-            className={`flex flex-col items-center justify-center min-h-[44px] ${
-              activeTab === 'files' ? 'text-[#00ff66]' : 'text-zinc-400'
+            data-testid="mobile-nav-liked"
+            onClick={() => {
+              setActiveTab('library');
+              setLibrarySubTab('liked');
+              setSelectedPlaylistId(null);
+              setIsMobileMoreSheetOpen(false);
+            }}
+            className={`flex flex-col items-center justify-center min-h-[48px] rounded-xl transition-colors ${
+              activeTab === 'library' &&
+              librarySubTab === 'liked' &&
+              !isMobileMoreSheetOpen
+                ? 'text-rose-400 font-bold'
+                : 'text-zinc-400 hover:text-rose-300'
             }`}
           >
-            <Folder className="w-4 h-4" />
-            <span className="text-[10px] font-mono font-semibold mt-0.5">
-              Files
+            <Heart
+              className={`w-5 h-5 ${
+                activeTab === 'library' && librarySubTab === 'liked'
+                  ? 'fill-rose-500 text-rose-400'
+                  : ''
+              }`}
+            />
+            <span className="text-[10px] font-mono tracking-tight mt-0.5">
+              Liked ({likedTracks.length})
             </span>
           </button>
+
           <button
             type="button"
-            onClick={() => setActiveTab('settings')}
-            className={`flex flex-col items-center justify-center min-h-[44px] ${
-              activeTab === 'settings' ? 'text-[#00ff66]' : 'text-zinc-400'
+            data-testid="mobile-nav-carmode"
+            onClick={() => {
+              setIsMobileMoreSheetOpen(false);
+              setIsCarModeOpen(true);
+            }}
+            className="flex flex-col items-center justify-center min-h-[48px] rounded-xl text-amber-400 hover:text-amber-300 transition-colors"
+          >
+            <Car className="w-5 h-5" />
+            <span className="text-[10px] font-mono font-bold tracking-tight mt-0.5">
+              Car Mode
+            </span>
+          </button>
+
+          <button
+            type="button"
+            data-testid="mobile-nav-more"
+            aria-expanded={isMobileMoreSheetOpen}
+            onClick={() => setIsMobileMoreSheetOpen((prev) => !prev)}
+            className={`relative flex flex-col items-center justify-center min-h-[48px] rounded-xl transition-colors ${
+              isMobileMoreSheetOpen || activeTab !== 'library'
+                ? 'text-[#00ff66] font-bold'
+                : 'text-zinc-400 hover:text-zinc-200'
             }`}
           >
-            <Settings className="w-4 h-4" />
-            <span className="text-[10px] font-mono font-semibold mt-0.5">
-              Settings
+            <Menu className="w-5 h-5" />
+            <span className="text-[10px] font-mono tracking-tight mt-0.5">
+              More
             </span>
+            {slskdJobs.some(
+              (j) => j.status === 'searching' || j.status === 'downloading'
+            ) && (
+              <span className="absolute top-1.5 right-3 w-2 h-2 rounded-full bg-purple-400 animate-pulse" />
+            )}
           </button>
         </nav>
       </div>
+
+      {/* Mobile One-Handed "More & PC Tools" Bottom Sheet Drawer (Tucks away Discover, Files/Organizer, and Server Settings on Mobile) */}
+      {isMobileMoreSheetOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="More Music Controls and PC Tools"
+          data-testid="mobile-more-sheet"
+          className="md:hidden fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex flex-col justify-end animate-in fade-in duration-150"
+          onClick={() => setIsMobileMoreSheetOpen(false)}
+        >
+          <div
+            className="winamp-bezel rounded-t-3xl border-t-2 border-[#00ff66]/60 bg-zinc-950 max-h-[85vh] overflow-y-auto p-4 pb-8 space-y-5 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Grab Handle + Header */}
+            <div className="space-y-2">
+              <div className="w-12 h-1.5 rounded-full bg-zinc-700 mx-auto" />
+              <div className="flex items-center justify-between pt-1">
+                <div>
+                  <h3 className="text-sm font-mono font-bold uppercase tracking-wider text-[#00ff66]">
+                    Mobile Quick Access &amp; PC Tools
+                  </h3>
+                  <p className="text-[11px] text-zinc-400 font-mono">
+                    One-handed phone controls + tucked-away PC management
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsMobileMoreSheetOpen(false)}
+                  aria-label="Close More Menu"
+                  className="p-2 rounded-xl border border-zinc-800 bg-zinc-900 text-zinc-300 hover:text-white min-h-[44px] min-w-[44px] flex items-center justify-center"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Section 1: Quick Music & Phone Controls */}
+            <div className="space-y-2">
+              <div className="text-[10px] font-mono font-bold uppercase tracking-wider text-zinc-400 px-1">
+                Phone Music &amp; Playback Controls
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsMobileMoreSheetOpen(false);
+                    setIsDrawerOpen(true);
+                  }}
+                  className="rounded-2xl border border-[#00ff66]/50 bg-emerald-950/30 p-3 text-left flex items-center gap-3 min-h-[54px]"
+                >
+                  <Sliders className="w-5 h-5 text-[#00ff66] shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-xs font-mono font-bold text-white truncate">
+                      Full Player &amp; EQ
+                    </div>
+                    <div className="text-[10px] font-mono text-zinc-400 truncate">
+                      Lyrics, Queue &amp; Sleep Timer
+                    </div>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsMobileMoreSheetOpen(false);
+                    setIsCarModeOpen(true);
+                  }}
+                  className="rounded-2xl border border-amber-500/50 bg-amber-950/30 p-3 text-left flex items-center gap-3 min-h-[54px]"
+                >
+                  <Car className="w-5 h-5 text-amber-400 shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-xs font-mono font-bold text-white truncate">
+                      Car Driving Mode
+                    </div>
+                    <div className="text-[10px] font-mono text-amber-300 truncate">
+                      Giant 1-tap dash buttons
+                    </div>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTab('library');
+                    setLibrarySubTab('albums');
+                    setIsMobileMoreSheetOpen(false);
+                  }}
+                  className="rounded-2xl border border-zinc-800 bg-zinc-900/90 p-3 text-left flex items-center gap-3 min-h-[52px]"
+                >
+                  <Disc className="w-5 h-5 text-purple-400 shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-xs font-mono font-bold text-white truncate">
+                      Albums ({albumGroups.length})
+                    </div>
+                    <div className="text-[10px] font-mono text-zinc-400 truncate">
+                      Browse full records
+                    </div>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTab('library');
+                    setLibrarySubTab('artists');
+                    setIsMobileMoreSheetOpen(false);
+                  }}
+                  className="rounded-2xl border border-zinc-800 bg-zinc-900/90 p-3 text-left flex items-center gap-3 min-h-[52px]"
+                >
+                  <Users className="w-5 h-5 text-sky-400 shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-xs font-mono font-bold text-white truncate">
+                      Artists ({artistGroups.length})
+                    </div>
+                    <div className="text-[10px] font-mono text-zinc-400 truncate">
+                      Browse by performer
+                    </div>
+                  </div>
+                </button>
+              </div>
+
+              {/* Road-Trip Offline Only Toggle */}
+              <div className="rounded-2xl border border-zinc-800 bg-zinc-900/80 px-3.5 py-3 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-xs font-mono font-bold text-white">
+                    Offline Road-Trip Mode ({audio.cachedTrackIds.size} cached)
+                  </div>
+                  <div className="text-[10px] font-mono text-zinc-400">
+                    Only play tracks stored in your phone&rsquo;s Offline Vault
+                  </div>
+                </div>
+                <SlidingToggle
+                  checked={offlineOnlyMode}
+                  onChange={setOfflineOnlyMode}
+                  label=""
+                  ariaLabel="Toggle Offline Only Mode"
+                  size="sm"
+                />
+              </div>
+            </div>
+
+            {/* Section 2: Install Android App (PWA) Card */}
+            <AndroidPwaInstallCard compact={true} />
+
+            {/* Section 3: Tucked-Away PC & Server Management Tools */}
+            <div className="space-y-2 pt-1 border-t border-zinc-800/80">
+              <div className="text-[10px] font-mono font-bold uppercase tracking-wider text-zinc-400 px-1">
+                PC &amp; Server Management (Tucked Away for Mobile)
+              </div>
+
+              <div className="grid grid-cols-1 gap-2">
+                <button
+                  type="button"
+                  data-testid="mobile-sheet-discover-btn"
+                  onClick={() => {
+                    setActiveTab('discover');
+                    setIsMobileMoreSheetOpen(false);
+                  }}
+                  className={`w-full rounded-2xl border p-3.5 text-left flex items-center justify-between gap-3 min-h-[54px] transition-colors ${
+                    activeTab === 'discover'
+                      ? 'border-[#00ff66] bg-emerald-950/30 text-[#00ff66]'
+                      : 'border-zinc-800 bg-zinc-900/90 text-zinc-200 hover:bg-zinc-800'
+                  }`}
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <Compass className="w-5 h-5 text-purple-400 shrink-0" />
+                    <div className="min-w-0">
+                      <div className="text-xs font-mono font-bold text-white truncate">
+                        Request &amp; Discover Music
+                      </div>
+                      <div className="text-[10px] font-mono text-zinc-400 truncate">
+                        Download songs, import Spotify &amp; manage transfer queue
+                      </div>
+                    </div>
+                  </div>
+                  <span className="rounded-lg bg-zinc-950 border border-zinc-800 px-2 py-1 text-[10px] font-mono text-zinc-300 shrink-0">
+                    Open →
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="mobile-sheet-files-btn"
+                  onClick={() => {
+                    setActiveTab('files');
+                    setIsMobileMoreSheetOpen(false);
+                  }}
+                  className={`w-full rounded-2xl border p-3.5 text-left flex items-center justify-between gap-3 min-h-[54px] transition-colors ${
+                    activeTab === 'files'
+                      ? 'border-[#00ff66] bg-emerald-950/30 text-[#00ff66]'
+                      : 'border-zinc-800 bg-zinc-900/90 text-zinc-200 hover:bg-zinc-800'
+                  }`}
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <Folder className="w-5 h-5 text-amber-400 shrink-0" />
+                    <div className="min-w-0">
+                      <div className="text-xs font-mono font-bold text-white truncate">
+                        Files, Tags &amp; Library Organizer
+                      </div>
+                      <div className="text-[10px] font-mono text-zinc-400 truncate">
+                        5-Song Read/Write Test, Picard folder rename &amp; stats
+                      </div>
+                    </div>
+                  </div>
+                  <span className="rounded-lg bg-zinc-950 border border-zinc-800 px-2 py-1 text-[10px] font-mono text-zinc-300 shrink-0">
+                    Open →
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="mobile-sheet-settings-btn"
+                  onClick={() => {
+                    setActiveTab('settings');
+                    setSettingsSubTab('sources');
+                    setIsMobileMoreSheetOpen(false);
+                  }}
+                  className={`w-full rounded-2xl border p-3.5 text-left flex items-center justify-between gap-3 min-h-[54px] transition-colors ${
+                    activeTab === 'settings'
+                      ? 'border-[#00ff66] bg-emerald-950/30 text-[#00ff66]'
+                      : 'border-zinc-800 bg-zinc-900/90 text-zinc-200 hover:bg-zinc-800'
+                  }`}
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <Settings className="w-5 h-5 text-[#00ff66] shrink-0" />
+                    <div className="min-w-0">
+                      <div className="text-xs font-mono font-bold text-white truncate">
+                        Server Settings, Audio Lab &amp; Themes
+                      </div>
+                      <div className="text-[10px] font-mono text-zinc-400 truncate">
+                        /music drive, slskd, EQ, custom CSS, security &amp; logs
+                      </div>
+                    </div>
+                  </div>
+                  <span className="rounded-lg bg-zinc-950 border border-zinc-800 px-2 py-1 text-[10px] font-mono text-zinc-300 shrink-0">
+                    Open →
+                  </span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Slide-Up Now Playing Drawer */}
       <NowPlayingDrawer

@@ -9406,12 +9406,15 @@ const handleFiveSongTestRequest = async (req: any, res: any) => {
       err instanceof Error ? err.message : String(err || 'Filesystem exception');
     const exactError =
       errCode && !rawMsg.includes(errCode) ? `${errCode}: ${rawMsg}` : rawMsg;
+    const errorStack =
+      typeof err?.stack === 'string' && err.stack.trim() ? err.stack.trim() : undefined;
     return res.status(500).json({
       ok: false,
       passed: false,
       overallPassed: false,
       error: exactError,
       errorDetails: exactError,
+      errorStack,
       summary: `FAIL — ${exactError}`,
       steps: [],
       songResults: [],
