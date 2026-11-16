@@ -704,3 +704,74 @@ test('brokeify-artwork-cache IndexedDB store constants and cache methods exist a
   assert.ok(typeof cleared === 'boolean');
 });
 
+test('cleanArtistName and buildOrganizedTrackDestination strip compilation track numbers while preserving numeric band names', async () => {
+  const { cleanArtistName, splitArtistAndTitleFromStem } = await import(
+    '../server/libraryEngine'
+  );
+  const { buildOrganizedTrackDestination } = await import(
+    '../server/fingerprintAndFileManager'
+  );
+
+  assert.equal(cleanArtistName('128. Darius Rucker'), 'Darius Rucker');
+  assert.equal(cleanArtistName('010.John Denver'), 'John Denver');
+  assert.equal(cleanArtistName('029 Darius Rucker'), 'Darius Rucker');
+  assert.equal(cleanArtistName('{1-035} Trisha Yearwood'), 'Trisha Yearwood');
+  assert.equal(cleanArtistName('13_87 - Brantley Gilbert'), 'Brantley Gilbert');
+  assert.equal(cleanArtistName('38 Special'), '38 Special');
+  assert.equal(cleanArtistName('3 Doors Down'), '3 Doors Down');
+  assert.equal(cleanArtistName('50 Cent'), '50 Cent');
+  assert.equal(cleanArtistName('blink-182'), 'blink-182');
+
+  const split = splitArtistAndTitleFromStem('029 Darius Rucker-Alright');
+  assert.ok(split);
+  assert.equal(split.artist, 'Darius Rucker');
+  assert.equal(split.title, 'Alright');
+
+  const dest = buildOrganizedTrackDestination('/music', {
+    title: '128. Wagon Wheel',
+    artist: '128. Darius Rucker',
+    album: 'True Believers',
+    trackNumber: 3,
+    year: 2013,
+    ext: '.mp3',
+  });
+  assert.ok(dest.includes('/music/Darius Rucker/True Believers (2013)/03 - Wagon Wheel.mp3'));
+  assert.ok(!dest.includes('128. Darius Rucker'));
+});
+
+test('deletePersistentNotifications permanently clears notifications and suppresses recurring background alerts', async () => {
+  const {
+    addPersistentNotification,
+    getPersistentNotifications,
+    deletePersistentNotifications,
+  } = await import('../server/libraryEngine');
+
+  const testDedupKey = `system:warn:slskd soulseek p2p: authentication required:${Date.now()}`;
+
+  addPersistentNotification({
+    message: 'slskd Soulseek P2P: Authentication required',
+    category: 'system',
+    severity: 'warn',
+    service: 'slskd Soulseek P2P',
+    dedupKey: testDedupKey,
+  });
+
+  const before = getPersistentNotifications();
+  assert.ok(before.notifications.length >= 1);
+
+  // Calling deletePersistentNotifications() with no arguments or clearAll=true clears all notifications
+  const afterClear = deletePersistentNotifications();
+  assert.equal(afterClear.notifications.length, 0);
+  assert.equal(getPersistentNotifications().notifications.length, 0);
+
+  // Immediately re-firing the same background warning is suppressed during the dismissal cooldown window
+  addPersistentNotification({
+    message: 'slskd Soulseek P2P: Authentication required',
+    category: 'system',
+    severity: 'warn',
+    service: 'slskd Soulseek P2P',
+    dedupKey: testDedupKey,
+  });
+  assert.equal(getPersistentNotifications().notifications.length, 0);
+});
+

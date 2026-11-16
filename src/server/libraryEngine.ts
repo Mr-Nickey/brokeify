@@ -282,6 +282,7 @@ interface PersistedDatabaseSchema {
   scrobbles: ScrobbleRow[];
   likedTrackIds?: string[];
   notifications?: NotificationRow[];
+  dismissedDedupKeys?: Record<string, number>;
 }
 
 class BrokeifyEmbeddedDatabase {
@@ -294,6 +295,7 @@ class BrokeifyEmbeddedDatabase {
   scrobbles: ScrobbleRow[] = [];
   likedTrackIds = new Set<string>();
   notifications: NotificationRow[] = [];
+  dismissedDedupKeys = new Map<string, number>();
 
   constructor() {
     this.loadFromDisk();
@@ -397,6 +399,14 @@ class BrokeifyEmbeddedDatabase {
           })
           .slice(0, 200);
       }
+      if (parsed.dismissedDedupKeys && typeof parsed.dismissedDedupKeys === 'object') {
+        const now = Date.now();
+        for (const [k, ts] of Object.entries(parsed.dismissedDedupKeys)) {
+          if (k && typeof ts === 'number' && now - ts < 24 * 60 * 60 * 1000) {
+            this.dismissedDedupKeys.set(k, ts);
+          }
+        }
+      }
       console.log(
         `[Brokeify][DB][INFO] Restored persistent database from ${DB_PATH}: ${this.tracks.size} tracks, ${this.albums.size} albums, ${this.artists.size} artists, ${this.playlists.size} playlists intact.`
       );
@@ -419,6 +429,7 @@ class BrokeifyEmbeddedDatabase {
       scrobbles: this.scrobbles.slice(-2000),
       likedTrackIds: Array.from(this.likedTrackIds),
       notifications: this.notifications.slice(0, 200),
+      dismissedDedupKeys: Object.fromEntries(this.dismissedDedupKeys.entries()),
     };
   }
 
@@ -822,18 +833,32 @@ let isProcessingLufs = false;
 
 export const scannerState = {
   isScanning: false,
+  isOrganizing: false,
   lastScanAt: null as string | null,
   scannedFilesCount: 0,
   lufsQueueLength: 0,
   currentLufsTrack: null as string | null,
 };
 
+export function setOrganizerActiveState(active: boolean): void {
+  scannerState.isOrganizing = active;
+  if (!active && lufsQueue.length > 0 && !isProcessingLufs) {
+    void processNextLufsJob();
+  }
+}
+
+export function isOrganizerActive(): boolean {
+  return scannerState.isOrganizing;
+}
+
 export function enqueueTrackForLufsAnalysis(trackId: string, filePath: string) {
   if (queuedTrackIds.has(trackId)) return;
   queuedTrackIds.add(trackId);
   lufsQueue.push({ trackId, filePath });
   scannerState.lufsQueueLength = lufsQueue.length;
-  processNextLufsJob();
+  if (!scannerState.isOrganizing) {
+    void processNextLufsJob();
+  }
 }
 
 function analyzeFileEbuR128(
@@ -874,10 +899,10 @@ function analyzeFileEbuR128(
 }
 
 async function processNextLufsJob() {
-  if (isProcessingLufs || lufsQueue.length === 0) return;
+  if (isProcessingLufs || scannerState.isOrganizing || lufsQueue.length === 0) return;
   isProcessingLufs = true;
 
-  while (lufsQueue.length > 0) {
+  while (lufsQueue.length > 0 && !scannerState.isOrganizing) {
     const job = lufsQueue.shift()!;
     queuedTrackIds.delete(job.trackId);
     scannerState.lufsQueueLength = lufsQueue.length;
@@ -901,13 +926,130 @@ async function processNextLufsJob() {
   }
 
   scannerState.currentLufsTrack = null;
-  scannerState.lufsQueueLength = 0;
+  scannerState.lufsQueueLength = lufsQueue.length;
   isProcessingLufs = false;
 }
 
 // ============================================================================
 // 4. MUSIC SCANNER, TAG PARSER & AUTOMATIC M3U PLAYLIST IMPORTER
 // ============================================================================
+
+const PRESERVED_NUMERIC_ARTIST_REGEX =
+  /^(?:2\s*Chainz|2\s*Pac|2Pac|21\s*Savage|2NE1|3\s*Doors\s*Down|3OH!3|38\s*Special|311|4\s*Non\s*Blondes|5\s*Seconds\s*of\s*Summer|50\s*Cent|6lack|702|88rising|98\s*Degrees|10cc|10,000\s*Maniacs|100\s*gecs|112|1975)\b/i;
+
+/**
+ * Strips leading compilation/track numbers from artist names (e.g. "128. Darius Rucker",
+ * "010.John Denver", "029 Darius Rucker", "{1-035} Trisha Yearwood", "13_87 - Brantley Gilbert",
+ * "#51-Old Dominion") while preserving legitimate numeric band/artist names.
+ */
+export function cleanArtistName(rawArtist: string): string {
+  let cleaned = String(rawArtist || '')
+    .replace(/[\x00\r\n]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return 'Unknown Artist';
+
+  for (let pass = 0; pass < 3; pass++) {
+    if (PRESERVED_NUMERIC_ARTIST_REGEX.test(cleaned)) {
+      break;
+    }
+    const prev = cleaned;
+    // Strip bracketed/braced compilation prefixes: "{1-035} ", "[012] ", "(128) "
+    cleaned = cleaned.replace(
+      /^(?:\{\d+(?:[-._]\d+)?\}|\[\d{1,4}\]|\(\d{1,4}\))\s*[-._:\s]*\s*/,
+      ''
+    );
+    // Strip explicit punctuated track/chart prefixes: "128. ", "010.", "13_87 - ", "#51-", "1-04. "
+    cleaned = cleaned.replace(
+      /^(?:#\d{1,4}|\d{1,2}[-._]\d{1,4}|\d{1,4})\s*[-._)\]:]+\s*/,
+      ''
+    );
+    // Strip zero-padded space-separated prefixes: "029 Darius Rucker", "089 George Strait"
+    if (!PRESERVED_NUMERIC_ARTIST_REGEX.test(cleaned)) {
+      cleaned = cleaned.replace(/^0\d{1,3}\s+(?=[A-Za-z])/, '');
+    }
+    // Strip 3-to-4 digit compilation rank followed by space and a multi-letter artist name (e.g. "128 Darius Rucker")
+    if (!PRESERVED_NUMERIC_ARTIST_REGEX.test(cleaned)) {
+      cleaned = cleaned.replace(/^\d{3,4}\s+(?=[A-Z][a-z]{2,}\s+[A-Z])/, '');
+    }
+    cleaned = cleaned.trim();
+    if (!cleaned || cleaned === prev) break;
+  }
+
+  return cleaned || 'Unknown Artist';
+}
+
+/**
+ * Strips leading compilation/track prefixes from a track title or filename stem.
+ */
+export function cleanTrackNumberPrefixFromFilename(
+  rawStem: string,
+  defaultTrackNumber = 1
+): { stem: string; trackNumber: number } {
+  let stem = String(rawStem || '').trim();
+  let trackNumber = defaultTrackNumber;
+
+  // Match "{1-035} ..." or "13_87 - ..."
+  const braceMatch = stem.match(
+    /^(?:\{(\d+)[-._](\d+)\}|(\d{1,2})[-_](\d{1,3}))\s*[-._:\s]*\s*(.+)$/
+  );
+  if (braceMatch) {
+    const parsedNum = parseInt(braceMatch[2] || braceMatch[4], 10);
+    if (Number.isFinite(parsedNum) && parsedNum > 0) trackNumber = parsedNum;
+    stem = braceMatch[5].trim();
+  }
+
+  // Match "#51-...", "128. ...", "029 ...", "010.John..."
+  const numPrefix = stem.match(/^#?(\d{1,4})(?:\s*[-._)\]:]+\s*|\s+)(.+)$/);
+  if (numPrefix && !PRESERVED_NUMERIC_ARTIST_REGEX.test(stem)) {
+    const parsedNum = parseInt(numPrefix[1], 10);
+    if (Number.isFinite(parsedNum) && parsedNum > 0) trackNumber = parsedNum;
+    stem = numPrefix[2].trim();
+  }
+
+  return { stem: stem || rawStem.trim(), trackNumber };
+}
+
+export function splitArtistAndTitleFromStem(stem: string): {
+  artist: string;
+  title: string;
+} | null {
+  const rawTrimmed = String(stem || '').trim();
+  if (!rawTrimmed) return null;
+
+  const trimmed = cleanTrackNumberPrefixFromFilename(rawTrimmed, 1).stem;
+
+  // Standard "Artist - Title" with spaces
+  if (trimmed.includes(' - ')) {
+    const parts = trimmed.split(/\s+-\s+/);
+    if (parts.length >= 2) {
+      const candidateArtist = cleanArtistName(parts[0]);
+      const candidateTitle = parts.slice(1).join(' - ').trim();
+      if (candidateArtist && candidateTitle) {
+        return { artist: candidateArtist, title: candidateTitle };
+      }
+    }
+  }
+
+  // Compact hyphen "128. Darius Rucker-Don't Think I Don't Think About It" or "029 Darius Rucker-Alright"
+  // Avoid splitting hyphenated single-token names like "Jay-Z", "Ne-Yo", "A-ha", "blink-182"
+  const compactMatch = trimmed.match(/^([A-Za-z0-9][^-]{2,45}?)-([A-Za-z0-9'"(].+)$/);
+  if (compactMatch) {
+    const left = cleanArtistName(compactMatch[1].trim());
+    const right = compactMatch[2].trim();
+    const isKnownHyphenArtist = /^(?:jay|ne|a|blink|sum|alt|run|wu|k|t|b|c|g|x|z)$/i.test(
+      left
+    );
+    if (!isKnownHyphenArtist && (left.includes(' ') || right.includes(' '))) {
+      return {
+        artist: left,
+        title: right,
+      };
+    }
+  }
+
+  return null;
+}
 
 function parseFallbackFromFilePath(filePath: string): {
   artist: string;
@@ -944,16 +1086,16 @@ function parseFallbackFromFilePath(filePath: string): {
       discNumber = parseInt(discMatch[1], 10) || 1;
       album = folderSegments[folderSegments.length - 2];
       if (folderSegments.length >= 3) {
-        artist = folderSegments[folderSegments.length - 3];
+        artist = cleanArtistName(folderSegments[folderSegments.length - 3]);
       }
     } else if (folderSegments.length === 1) {
       // /music/Artist/01 - Track.flac OR /music/Album/01 - Track.flac
-      artist = folderSegments[0];
+      artist = cleanArtistName(folderSegments[0]);
       album = folderSegments[0];
     } else {
       // /music/Artist/Album/01.flac or /music/Genre/Artist/Album/01.flac
       album = lastFolder;
-      artist = folderSegments[folderSegments.length - 2];
+      artist = cleanArtistName(folderSegments[folderSegments.length - 2]);
     }
   }
 
@@ -964,21 +1106,25 @@ function parseFallbackFromFilePath(filePath: string): {
       album.replace(/\s*(?:\(\d{4}\)|\[\d{4}\])\s*/, '').trim() || album;
   }
 
-  const numPrefix = base.match(/^(\d{1,3})\s*[-._\s]\s*(.+)$/);
-  if (numPrefix) {
-    trackNumber = parseInt(numPrefix[1], 10);
-    title = numPrefix[2].trim();
+  const stripped = cleanTrackNumberPrefixFromFilename(base, trackNumber);
+  trackNumber = stripped.trackNumber;
+  title = stripped.stem;
+
+  const splitPair = splitArtistAndTitleFromStem(title);
+  if (splitPair) {
+    const isCompilationFolder =
+      artist === 'Unknown Artist' ||
+      folderSegments.length <= 1 ||
+      /\b(?:top\s*\d+|greatest\s*hits|various|compilation|billboard|sirius|now\s*that)/i.test(
+        album
+      );
+    if (isCompilationFolder) {
+      artist = splitPair.artist;
+    }
+    title = splitPair.title;
   }
 
-  if (title.includes(' - ')) {
-    const parts = title.split(' - ');
-    if (parts.length >= 2) {
-      if (artist === 'Unknown Artist') {
-        artist = parts[0].trim();
-      }
-      title = parts.slice(1).join(' - ').trim();
-    }
-  }
+  artist = cleanArtistName(artist);
 
   return { artist, album, title, trackNumber, discNumber, year };
 }
@@ -1049,7 +1195,9 @@ export async function indexAudioFile(
 
       if (c.title?.trim()) title = c.title.trim();
       if (c.artist?.trim() || c.albumartist?.trim()) {
-        artist = (c.artist || c.albumartist || fallback.artist).trim();
+        artist = cleanArtistName(
+          (c.artist || c.albumartist || fallback.artist).trim()
+        );
       }
       if (c.album?.trim()) album = c.album.trim();
       if (c.year) year = c.year;
@@ -1104,6 +1252,8 @@ export async function indexAudioFile(
     } catch {
       // Fallback metadata from path already populated
     }
+
+    artist = cleanArtistName(artist);
 
     const artistId = sha1Id('art', artist);
     const albumId = sha1Id('alb', `${artist}::${album}`);
@@ -1428,6 +1578,7 @@ export async function inspectMusicDrive(
  * Recursively traverses `/music/**` across all nested Artist / Album / Disc subfolders
  * using async `fs.promises.stat` rather than relying on `Dirent.isDirectory()` so Windows
  * NTFS bind mounts, WSL2 9P, SMB/CIFS, NFS, and symlinks are always traversed deeply without blocking.
+ * Per-track logs are gated behind `DEBUG_SCANNER=true` to prevent log flooding on large libraries.
  */
 export async function walkMusicDirectory(
   dir: string,
@@ -1442,7 +1593,9 @@ export async function walkMusicDirectory(
   const visitedDirs = new Set<string>();
   let directoriesScanned = 0;
   let statOps = 0;
-  const shouldLog = options?.logDiscovery !== false;
+  const shouldLogSummary = options?.logDiscovery !== false;
+  const debugPerTrack =
+    shouldLogSummary && process.env.DEBUG_SCANNER === 'true';
 
   async function walk(currentDir: string): Promise<void> {
     let resolvedCurrent: string;
@@ -1460,7 +1613,7 @@ export async function walkMusicDirectory(
     try {
       itemNames = await fs.promises.readdir(currentDir);
     } catch (err) {
-      if (shouldLog) {
+      if (shouldLogSummary) {
         console.warn(`[Scanner] Could not read directory ${currentDir}:`, err);
       }
       return;
@@ -1495,12 +1648,12 @@ export async function walkMusicDirectory(
       } else if (stat.isFile()) {
         if (isSupportedAudioFile(fullPath)) {
           audioFiles.push(fullPath);
-          if (shouldLog) {
+          if (debugPerTrack) {
             console.log(`[Scanner] Found track: ${fullPath}`);
           }
         } else if (isSupportedPlaylistFile(fullPath)) {
           m3uFiles.push(fullPath);
-          if (shouldLog) {
+          if (debugPerTrack) {
             console.log(`[Scanner] Found playlist: ${fullPath}`);
           }
         }
@@ -1512,7 +1665,7 @@ export async function walkMusicDirectory(
     await walk(dir);
   }
 
-  if (shouldLog) {
+  if (shouldLogSummary) {
     console.log(
       `[Scanner] Scanned ${directoriesScanned} directory(s) in ${dir} — discovered ${audioFiles.length} audio file(s) and ${m3uFiles.length} playlist(s)`
     );
@@ -1581,6 +1734,67 @@ export async function runFullLibraryScan(): Promise<{
 }
 
 let activeWatcher: FSWatcher | null = null;
+const pendingWatcherAddOrChange = new Set<string>();
+const pendingWatcherUnlink = new Set<string>();
+let watcherBatchTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function flushWatcherEventsBatch(): Promise<void> {
+  watcherBatchTimer = null;
+  if (scannerState.isOrganizing) {
+    // Discard intermediate watcher events while Library Organizer is actively moving files;
+    // the Organizer updates the DB in-place and runs a final reconciliation pass at job completion.
+    pendingWatcherAddOrChange.clear();
+    pendingWatcherUnlink.clear();
+    return;
+  }
+
+  const toUnlink = Array.from(pendingWatcherUnlink);
+  const toAddOrChange = Array.from(pendingWatcherAddOrChange);
+  pendingWatcherUnlink.clear();
+  pendingWatcherAddOrChange.clear();
+
+  let removedCount = 0;
+  for (const filePath of toUnlink) {
+    if (isSupportedAudioFile(filePath)) {
+      removeAudioFileFromIndex(filePath);
+      removedCount++;
+    }
+  }
+
+  let indexedTracks = 0;
+  let importedPlaylists = 0;
+  const debugPerTrack = process.env.DEBUG_SCANNER === 'true';
+
+  for (const filePath of toAddOrChange) {
+    if (isSupportedAudioFile(filePath)) {
+      if (debugPerTrack) {
+        console.log(`[Scanner] Found track: ${filePath}`);
+      }
+      const id = await indexAudioFile(filePath);
+      if (id) indexedTracks++;
+    } else if (isSupportedPlaylistFile(filePath)) {
+      if (debugPerTrack) {
+        console.log(`[Scanner] Found playlist: ${filePath}`);
+      }
+      const pid = await importM3uPlaylistFile(filePath);
+      if (pid) importedPlaylists++;
+    }
+  }
+
+  if (indexedTracks > 0 || importedPlaylists > 0 || removedCount > 0) {
+    syncDatabaseToPersistentDisk();
+    console.log(
+      `[Scanner] Watcher batch summary: indexed ${indexedTracks} audio track(s), ${importedPlaylists} playlist(s), removed ${removedCount} file(s).`
+    );
+  }
+}
+
+function scheduleWatcherBatchFlush(): void {
+  if (watcherBatchTimer) clearTimeout(watcherBatchTimer);
+  watcherBatchTimer = setTimeout(() => {
+    void flushWatcherEventsBatch();
+  }, 2000);
+}
 
 export async function setMusicDirectory(newDir: string): Promise<MusicDriveStatus> {
   const cleaned = String(newDir || '').trim();
@@ -1627,30 +1841,33 @@ export function startChokidarMusicWatcher() {
         });
 
         activeWatcher
-          .on('add', async (filePath) => {
-            if (isSupportedAudioFile(filePath)) {
-              console.log(`[Scanner] Found track: ${filePath}`);
-              await indexAudioFile(filePath);
-              syncDatabaseToPersistentDisk();
-            } else if (isSupportedPlaylistFile(filePath)) {
-              console.log(`[Scanner] Found playlist: ${filePath}`);
-              await importM3uPlaylistFile(filePath);
-              syncDatabaseToPersistentDisk();
+          .on('add', (filePath) => {
+            if (scannerState.isOrganizing) return;
+            if (
+              isSupportedAudioFile(filePath) ||
+              isSupportedPlaylistFile(filePath)
+            ) {
+              pendingWatcherUnlink.delete(filePath);
+              pendingWatcherAddOrChange.add(filePath);
+              scheduleWatcherBatchFlush();
             }
           })
-          .on('change', async (filePath) => {
-            if (isSupportedAudioFile(filePath)) {
-              await indexAudioFile(filePath);
-              syncDatabaseToPersistentDisk();
-            } else if (isSupportedPlaylistFile(filePath)) {
-              await importM3uPlaylistFile(filePath);
-              syncDatabaseToPersistentDisk();
+          .on('change', (filePath) => {
+            if (scannerState.isOrganizing) return;
+            if (
+              isSupportedAudioFile(filePath) ||
+              isSupportedPlaylistFile(filePath)
+            ) {
+              pendingWatcherAddOrChange.add(filePath);
+              scheduleWatcherBatchFlush();
             }
           })
           .on('unlink', (filePath) => {
+            if (scannerState.isOrganizing) return;
             if (isSupportedAudioFile(filePath)) {
-              removeAudioFileFromIndex(filePath);
-              syncDatabaseToPersistentDisk();
+              pendingWatcherAddOrChange.delete(filePath);
+              pendingWatcherUnlink.add(filePath);
+              scheduleWatcherBatchFlush();
             }
           })
           .on('error', (err) => {
@@ -2539,35 +2756,71 @@ export async function updateTrackMetadataInDb(params: {
       : null;
   }
 
-  const artistRow = trackRow.artist_id
+  const currentArtistRow = trackRow.artist_id
     ? db.artists.get(trackRow.artist_id)
     : undefined;
-  if (artistRow) {
-    if (params.artist && params.artist.trim()) {
-      artistRow.name = params.artist.trim();
-      artistRow.sort_name = toSortName(artistRow.name);
-    }
-    if (params.artistMusicbrainzId !== undefined) {
-      artistRow.musicbrainz_id = params.artistMusicbrainzId
-        ? String(params.artistMusicbrainzId).trim()
-        : null;
-    }
-  }
-
-  const albumRow = trackRow.album_id
+  const currentAlbumRow = trackRow.album_id
     ? db.albums.get(trackRow.album_id)
     : undefined;
-  if (albumRow) {
-    if (params.album && params.album.trim()) {
-      albumRow.title = params.album.trim();
-    }
-    if (params.year !== undefined) {
-      albumRow.year = params.year ? Number(params.year) : null;
-    }
-    if (params.genre && params.genre.trim()) {
-      albumRow.genre = params.genre.trim();
-    }
 
+  const targetArtistName =
+    params.artist && params.artist.trim()
+      ? cleanArtistName(params.artist.trim())
+      : cleanArtistName(currentArtistRow?.name || 'Unknown Artist');
+  const targetAlbumTitle =
+    params.album && params.album.trim()
+      ? params.album.trim()
+      : currentAlbumRow?.title || 'Singles';
+
+  const newArtistId = sha1Id('art', targetArtistName);
+  const existingTargetArtist = db.artists.get(newArtistId);
+  db.artists.set(newArtistId, {
+    id: newArtistId,
+    name: targetArtistName,
+    sort_name: toSortName(targetArtistName),
+    musicbrainz_id:
+      params.artistMusicbrainzId !== undefined
+        ? params.artistMusicbrainzId
+          ? String(params.artistMusicbrainzId).trim()
+          : null
+        : existingTargetArtist?.musicbrainz_id ||
+          currentArtistRow?.musicbrainz_id ||
+          null,
+    image_url: `/api/cover/artist/${newArtistId}`,
+  });
+  trackRow.artist_id = newArtistId;
+
+  const newAlbumId = sha1Id('alb', `${targetArtistName}::${targetAlbumTitle}`);
+  const existingTargetAlbum = db.albums.get(newAlbumId);
+  db.albums.set(newAlbumId, {
+    id: newAlbumId,
+    artist_id: newArtistId,
+    title: targetAlbumTitle,
+    year:
+      params.year !== undefined
+        ? params.year
+          ? Number(params.year)
+          : null
+        : existingTargetAlbum?.year ?? currentAlbumRow?.year ?? null,
+    genre:
+      params.genre && params.genre.trim()
+        ? params.genre.trim()
+        : existingTargetAlbum?.genre || currentAlbumRow?.genre || 'Music',
+    cover_path:
+      existingTargetAlbum?.cover_path || currentAlbumRow?.cover_path || null,
+    musicbrainz_id:
+      params.albumMusicbrainzId !== undefined
+        ? params.albumMusicbrainzId
+          ? String(params.albumMusicbrainzId).trim()
+          : null
+        : existingTargetAlbum?.musicbrainz_id ||
+          currentAlbumRow?.musicbrainz_id ||
+          null,
+  });
+  trackRow.album_id = newAlbumId;
+
+  const albumRow = db.albums.get(newAlbumId);
+  if (albumRow) {
     // Handle custom uploaded or URL cover image first
     if (params.customCoverImage && params.customCoverImage.trim()) {
       const rawImg = params.customCoverImage.trim();
@@ -2942,30 +3195,73 @@ export function formatNotificationDateTime(ms: number = Date.now()): string {
   }
 }
 
+let recentDownloadBatchCount = 0;
+let recentDownloadBatchLastMs = 0;
+
 export function addPersistentNotification(input: {
+  id?: string;
   message: string;
-  category?: 'system' | 'download' | 'security' | 'library';
+  category?: 'system' | 'download' | 'security' | 'library' | 'listenbrainz' | 'lidarr' | 'slskd';
   severity?: 'info' | 'success' | 'warn' | 'error';
   service?: string;
   dedupKey?: string;
   cooldownMs?: number;
+  trackId?: string;
 }): NotificationRow {
   const nowMs = Date.now();
   const nowStr = formatNotificationDateTime(nowMs);
   const cleanMsg = String(input.message || '').trim();
-  const category = input.category || 'system';
+  const rawCategory = input.category || 'system';
+  const category: 'system' | 'download' | 'security' | 'library' =
+    rawCategory === 'listenbrainz' || rawCategory === 'lidarr' || rawCategory === 'slskd'
+      ? 'download'
+      : rawCategory;
   const severity = input.severity || 'info';
-  const dedupKey =
-    input.dedupKey ||
-    (input.service
-      ? `${input.service}:${severity}:${cleanMsg.slice(0, 80).toLowerCase()}`
-      : `${category}:${severity}:${cleanMsg.slice(0, 80).toLowerCase()}`);
+
+  // Batch rapid per-track download notifications within a 25-second window into a single summary alert
+  const isTrackDownloadComplete =
+    category === 'download' &&
+    severity === 'success' &&
+    !input.dedupKey &&
+    (cleanMsg.includes('downloaded') ||
+      cleanMsg.includes('ready via') ||
+      cleanMsg.includes('added & triggered'));
+
+  const dedupKey = isTrackDownloadComplete
+    ? 'download:batch:completed'
+    : input.dedupKey ||
+      (input.service
+        ? `${input.service}:${severity}:${cleanMsg.slice(0, 80).toLowerCase()}`
+        : `${category}:${severity}:${cleanMsg.slice(0, 80).toLowerCase()}`);
+
+  // If the user explicitly dismissed this warning/error recently (within 30 minutes), suppress background re-addition
+  const dismissedAt = db.dismissedDedupKeys.get(dedupKey);
+  if (
+    dismissedAt &&
+    (severity === 'warn' || severity === 'error') &&
+    nowMs - dismissedAt < 30 * 60 * 1000
+  ) {
+    return {
+      id: `notif-suppressed-${nowMs}`,
+      message: cleanMsg,
+      category,
+      severity,
+      service: input.service,
+      dedupKey,
+      createdAt: nowStr,
+      timestampMs: nowMs,
+      read: true,
+    };
+  }
+
   const cooldownMs =
     typeof input.cooldownMs === 'number'
       ? input.cooldownMs
-      : severity === 'error' || severity === 'warn'
-        ? 10 * 60 * 1000 // 10-minute deduplication window per service outage
-        : 15 * 1000;
+      : isTrackDownloadComplete
+        ? 25 * 1000
+        : severity === 'error' || severity === 'warn'
+          ? 10 * 60 * 1000 // 10-minute deduplication window per service outage
+          : 15 * 1000;
 
   const existingIdx = db.notifications.findIndex(
     (n) =>
@@ -2975,7 +3271,16 @@ export function addPersistentNotification(input: {
 
   if (existingIdx !== -1) {
     const existing = db.notifications[existingIdx];
-    existing.message = cleanMsg;
+    if (isTrackDownloadComplete && nowMs - recentDownloadBatchLastMs < 25000) {
+      recentDownloadBatchCount += 1;
+      existing.message = `Download Queue: ${recentDownloadBatchCount} tracks downloaded & indexed into /music (latest: ${cleanMsg})`;
+    } else {
+      if (isTrackDownloadComplete) {
+        recentDownloadBatchCount = 1;
+      }
+      existing.message = cleanMsg;
+    }
+    recentDownloadBatchLastMs = nowMs;
     existing.severity = severity;
     existing.createdAt = nowStr;
     existing.timestampMs = nowMs;
@@ -2987,8 +3292,13 @@ export function addPersistentNotification(input: {
     return existing;
   }
 
+  if (isTrackDownloadComplete) {
+    recentDownloadBatchCount = 1;
+    recentDownloadBatchLastMs = nowMs;
+  }
+
   const row: NotificationRow = {
-    id: `notif-${nowMs}-${Math.random().toString(36).slice(2, 6)}`,
+    id: input.id || `notif-${nowMs}-${Math.random().toString(36).slice(2, 6)}`,
     message: cleanMsg,
     category,
     severity,
@@ -3023,7 +3333,7 @@ export function markPersistentNotificationsRead(
       }
     }
   }
-  syncDatabaseToPersistentDisk();
+  syncDatabaseToPersistentDisk(true);
   return computeNotificationSummary();
 }
 
@@ -3031,13 +3341,25 @@ export function deletePersistentNotifications(
   ids?: string[],
   clearAll = false
 ) {
-  if (clearAll) {
+  const nowMs = Date.now();
+  if (clearAll || !Array.isArray(ids) || ids.length === 0) {
+    for (const n of db.notifications) {
+      if (n.dedupKey) {
+        db.dismissedDedupKeys.set(n.dedupKey, nowMs);
+      }
+    }
     db.notifications = [];
-  } else if (Array.isArray(ids) && ids.length > 0) {
+    recentDownloadBatchCount = 0;
+  } else {
     const idSet = new Set(ids.map(String));
+    for (const n of db.notifications) {
+      if (idSet.has(n.id) && n.dedupKey) {
+        db.dismissedDedupKeys.set(n.dedupKey, nowMs);
+      }
+    }
     db.notifications = db.notifications.filter((n) => !idSet.has(n.id));
   }
-  syncDatabaseToPersistentDisk();
+  syncDatabaseToPersistentDisk(true);
   return computeNotificationSummary();
 }
 

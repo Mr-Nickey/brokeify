@@ -150,6 +150,10 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
   const [organizeRecursive, setOrganizeRecursive] = useState<boolean>(true);
   const [organizeSkipOrganized, setOrganizeSkipOrganized] =
     useState<boolean>(false);
+  const [isTestingFiveSongs, setIsTestingFiveSongs] = useState<boolean>(false);
+  const [fiveSongTestReport, setFiveSongTestReport] = useState<any | null>(
+    null
+  );
 
   const fetchOrganizeJobStatus = async () => {
     try {
@@ -302,6 +306,41 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
       });
     } finally {
       setIsTestingDrivePath(false);
+    }
+  };
+
+  const handleRunFiveSongTest = async (applyLiveMoveOnSample = false) => {
+    setIsTestingFiveSongs(true);
+    setFiveSongTestReport(null);
+    try {
+      const resp = await fetch('/api/library/test-5-songs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          targetPath: '',
+          applyLiveMoveOnSample,
+        }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      setFiveSongTestReport(data);
+      const summaryMsg = data?.overallPassed
+        ? `✅ 5-Song Read/Write & Organizer Test PASSED (${data.sampleTrackCount || 0} sample songs verified on disk)!`
+        : `⚠️ 5-Song Read/Write Test detected permission or locking issues on ${drivePathInput || '/music'}.`;
+      showSavedCard('acoustid', summaryMsg);
+      onShowToast?.(summaryMsg);
+    } catch (err: any) {
+      const errMsg =
+        err?.message || 'Network error running 5-Song Read/Write Test.';
+      setFiveSongTestReport({
+        ok: false,
+        overallPassed: false,
+        summary: errMsg,
+        steps: [],
+        sampleSongs: [],
+      });
+      onShowToast?.(`⚠️ ${errMsg}`);
+    } finally {
+      setIsTestingFiveSongs(false);
     }
   };
 
@@ -595,7 +634,7 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
             <button
               type="button"
               onClick={handleTestDriveInSettings}
-              disabled={isTestingDrivePath}
+              disabled={isTestingDrivePath || isTestingFiveSongs}
               data-testid="settings-test-drive-btn"
               className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-[#00ff66]/50 bg-[#00ff66]/15 hover:bg-[#00ff66]/25 px-3.5 py-2 text-xs font-mono font-bold text-[#00ff66] transition-colors whitespace-nowrap min-h-[38px]"
             >
@@ -605,6 +644,21 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                 <RefreshCw className="w-3.5 h-3.5" />
               )}
               <span>Test Drive Path</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleRunFiveSongTest(false)}
+              disabled={isTestingFiveSongs || isRescanningLibrary}
+              data-testid="settings-5-song-test-btn"
+              className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-cyan-500/50 bg-cyan-500/15 hover:bg-cyan-500/25 px-3.5 py-2 text-xs font-mono font-bold text-cyan-300 transition-colors whitespace-nowrap min-h-[38px]"
+            >
+              {isTestingFiveSongs ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <HardDrive className="w-3.5 h-3.5" />
+              )}
+              <span>5-Song Dry-Run / Read-Write Test</span>
             </button>
 
             <button
@@ -637,6 +691,109 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                 <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
               )}
               <span>{driveTestFeedback.message}</span>
+            </div>
+          )}
+
+          {fiveSongTestReport && (
+            <div
+              data-testid="settings-five-song-report"
+              className={`rounded-xl border p-4 text-xs font-mono space-y-3 ${
+                fiveSongTestReport.overallPassed
+                  ? 'border-emerald-500/50 bg-emerald-950/25 text-emerald-200'
+                  : 'border-rose-500/50 bg-rose-950/30 text-rose-200'
+              }`}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 font-bold text-sm">
+                  {fiveSongTestReport.overallPassed ? (
+                    <CheckCircle2 className="w-4 h-4 text-[#00ff66] shrink-0" />
+                  ) : (
+                    <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                  )}
+                  <span>
+                    5-Song Read/Write &amp; Organizer Diagnostic Report:{' '}
+                    {fiveSongTestReport.overallPassed ? 'PASSED' : 'FAILED'} (
+                    {fiveSongTestReport.durationMs ?? 0}ms)
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setFiveSongTestReport(null)}
+                  className="text-zinc-400 hover:text-white text-xs"
+                >
+                  ✕
+                </button>
+              </div>
+              <p className="text-zinc-300">{fiveSongTestReport.summary}</p>
+              {Array.isArray(fiveSongTestReport.steps) &&
+                fiveSongTestReport.steps.length > 0 && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {fiveSongTestReport.steps.map((st: any) => (
+                      <div
+                        key={st.step}
+                        className={`rounded-lg border p-2.5 ${
+                          st.passed
+                            ? 'border-emerald-500/30 bg-zinc-950/70'
+                            : 'border-rose-500/40 bg-rose-950/40'
+                        }`}
+                      >
+                        <div className="font-bold flex items-center justify-between">
+                          <span>{st.label}</span>
+                          <span
+                            className={
+                              st.passed ? 'text-[#00ff66]' : 'text-rose-400'
+                            }
+                          >
+                            {st.passed ? 'PASS' : 'FAIL'}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-zinc-300 mt-1">
+                          {st.detail}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              {Array.isArray(fiveSongTestReport.sampleSongs) &&
+                fiveSongTestReport.sampleSongs.length > 0 && (
+                  <div className="space-y-1.5 pt-1">
+                    <div className="text-[11px] font-bold uppercase text-cyan-300">
+                      Sample Tracks Verified ({fiveSongTestReport.sampleSongs.length}):
+                    </div>
+                    {fiveSongTestReport.sampleSongs.map(
+                      (s: any, idx: number) => (
+                        <div
+                          key={`${s.sourcePath}-${idx}`}
+                          className="rounded-lg border border-zinc-800 bg-zinc-950/80 p-2 text-[11px] space-y-0.5"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-bold text-white truncate">
+                              #{idx + 1} {s.cleanedArtist} — {s.cleanedTitle}
+                            </span>
+                            <span
+                              className={`font-bold shrink-0 ${
+                                s.persistedOnDisk && s.parentWritable
+                                  ? 'text-[#00ff66]'
+                                  : 'text-rose-400'
+                              }`}
+                            >
+                              {s.persistedOnDisk && s.parentWritable
+                                ? '✓ R/W & PERSISTED'
+                                : '✗ LOCKED / READ-ONLY'}
+                            </span>
+                          </div>
+                          <div className="text-zinc-400 truncate">
+                            From: <code>{s.relativeSourcePath}</code> → To:{' '}
+                            <code className="text-[#00ff66]">
+                              {s.proposedRelativeDestPath}
+                            </code>
+                          </div>
+                          <div className="text-zinc-300">{s.message}</div>
+                        </div>
+                      )
+                    )}
+                  </div>
+                )}
             </div>
           )}
         </div>
@@ -1696,6 +1853,25 @@ export const SourcesHubView: React.FC<SourcesHubViewProps> = ({
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      disabled={
+                        isTestingFiveSongs ||
+                        organizeJob?.status === 'running' ||
+                        organizeJob?.status === 'scanning'
+                      }
+                      onClick={() => handleRunFiveSongTest(false)}
+                      data-testid="btn-organizer-5-song-test"
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-cyan-500/50 bg-cyan-500/15 hover:bg-cyan-500/25 disabled:opacity-50 px-3 py-1.5 text-xs font-mono font-bold text-cyan-300 transition-colors"
+                    >
+                      {isTestingFiveSongs ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <HardDrive className="w-3.5 h-3.5" />
+                      )}
+                      <span>5-Song Dry-Run / Read-Write Test</span>
+                    </button>
+
                     <button
                       type="button"
                       disabled={

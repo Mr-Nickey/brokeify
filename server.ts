@@ -71,6 +71,8 @@ import {
   markPersistentNotificationsRead,
   deletePersistentNotifications,
   formatNotificationDateTime,
+  cleanArtistName,
+  setOrganizerActiveState,
 } from './src/server/libraryEngine.ts';
 import {
   identifyAudioFileWithAcoustIdAndMusicBrainz,
@@ -92,6 +94,7 @@ import {
   cancelLibraryOrganizeJob,
   startLibraryOrganizeJob,
   applyPreviewedLibraryOrganizeJob,
+  runFiveSongReadWriteTest,
 } from './src/server/fingerprintAndFileManager.ts';
 import { generateBrokeifyApiSpecMarkdown } from './src/server/apiSpecGenerator.ts';
 
@@ -390,7 +393,10 @@ app.use((req, res, next) => {
     const category = inferServerCategory(req.path);
     const endpointLabel = `${req.method} ${req.originalUrl} (${durationMs}ms)`;
 
-    if (status >= 400 || (body && body.ok === false && !body.skipped)) {
+    if (
+      (status >= 400 || (body && body.ok === false && !body.skipped)) &&
+      !(status === 401 && body?.requiresLogin)
+    ) {
       const errText =
         body?.error ||
         body?.message ||
@@ -1551,9 +1557,7 @@ function isAdminOnlyEndpointPath(reqPath: string, method: string): boolean {
     (reqPath.startsWith('/api/scheduler/') && m !== 'GET') ||
     (reqPath.startsWith('/api/autopilot/') && m !== 'GET') ||
     reqPath.startsWith('/api/debug/') ||
-    reqPath === '/api/version/check' ||
-    (reqPath === '/api/notifications' && m === 'DELETE') ||
-    reqPath === '/api/notifications/delete'
+    reqPath === '/api/version/check'
   );
 }
 
@@ -4314,33 +4318,21 @@ app.post('/api/listenbrainz/grab-mix', async (req, res) => {
     let queuedCount = 0;
 
     if (autoDownload && missingTracks.length > 0) {
+      const { slskdUrl, slskdApiKey } = getSlskdConfig();
       for (const m of missingTracks) {
-        const jobId = `job-lb-${Date.now()}-${Math.random()
-          .toString(36)
-          .slice(2, 7)}`;
-        const label = `${m.artist} - ${m.title}`;
-        slskdJobs.set(jobId, {
-          id: jobId,
-          trackId: m.id,
+        createAndEnqueueTrackGrabJob({
           artist: m.artist,
           title: m.title,
           album: m.album || '',
-          label,
-          searchText: `${m.artist} ${m.title}`,
           sourceMode: downloaderMode,
-          sourceEngine: downloaderMode === 'auto' ? 'slskd' : downloaderMode,
-          status: 'queued',
-          message: `Queued from ListenBrainz (${finalSlice.length}-song grab)`,
-          startedAt: new Date().toISOString(),
-          files: [],
-        });
-        dripGrabQueue.push({
-          jobId,
-          sourceMode: downloaderMode,
+          slskdUrl,
+          slskdApiKey,
+          activeFilters: cfg.discoveryFilters || null,
+          playlistId,
+          ghostTrackId: m.id,
         });
         queuedCount++;
       }
-      scheduleDripWorker();
     }
 
     addPersistentNotification({
@@ -7235,10 +7227,12 @@ const handleSlskdGrabRequest = async (req: any, res: any) => {
 app.post('/api/slskd/grab', requireAdmin, handleSlskdGrabRequest);
 app.post('/api/slskd/grab-job', requireAdmin, handleSlskdGrabRequest);
 
-app.get('/api/slskd/status', (_req, res) => {
+function computeSlskdStatusPayload() {
   updatePendingQueuePositions();
   const jobs = Array.from(slskdJobs.values()).sort((a, b) =>
-    b.createdAt.localeCompare(a.createdAt)
+    String(b.createdAt || b.startedAt || '').localeCompare(
+      String(a.createdAt || a.startedAt || '')
+    )
   );
   let queuedCount = 0;
   let searchingCount = 0;
@@ -7252,11 +7246,11 @@ app.get('/api/slskd/status', (_req, res) => {
     else if (j.status === 'searching') searchingCount++;
     else if (j.status === 'downloading') downloadingCount++;
     else if (j.status === 'completed') completedCount++;
-    else if (j.status === 'failed') failedCount++;
+    else if (j.status === 'failed' || j.status === 'not_found') failedCount++;
     else if (j.status === 'filtered') filteredCount++;
   }
 
-  res.json({
+  return {
     ok: true,
     jobs,
     notifications: readyNotifications,
@@ -7272,7 +7266,196 @@ app.get('/api/slskd/status', (_req, res) => {
       filteredCount,
       totalBatchesRemaining: Math.ceil(queuedCount / DRIP_BATCH_SIZE),
     },
-  });
+  };
+}
+
+app.get('/api/slskd/status', (_req, res) => {
+  res.json(computeSlskdStatusPayload());
+});
+
+app.post('/api/slskd/jobs/manage', requireAdmin, (req, res) => {
+  try {
+    const action = String(req.body?.action || '').trim();
+    const targetJobId = String(req.body?.jobId || '').trim();
+    const requestedSourceMode = req.body?.sourceMode
+      ? String(req.body.sourceMode).toLowerCase()
+      : '';
+    const includeFiltered = req.body?.includeFiltered !== false;
+    const ignoreFilters = Boolean(req.body?.ignoreFilters);
+
+    const cfg = readServerConfig();
+    const { slskdUrl, slskdApiKey } = getSlskdConfig();
+    const defaultSourceMode =
+      cfg.integrations?.preferredDownloader || 'auto';
+
+    let removedCount = 0;
+    let retriedCount = 0;
+    let actionMessage = 'Updated download queue.';
+
+    const resolveEngineForMode = (mode: string) =>
+      mode === 'youtube'
+        ? 'youtube'
+        : mode === 'archive'
+          ? 'archive'
+          : mode === 'lidarr'
+            ? 'lidarr'
+            : 'slskd';
+
+    if (action === 'clear-completed') {
+      const removedIds = new Set<string>();
+      for (const [id, job] of slskdJobs.entries()) {
+        if (job.status === 'completed') {
+          slskdJobs.delete(id);
+          removedIds.add(id);
+          removedCount++;
+        }
+      }
+      if (removedIds.size > 0) {
+        for (let i = pendingGrabQueue.length - 1; i >= 0; i--) {
+          if (removedIds.has(pendingGrabQueue[i]?.job?.id)) {
+            pendingGrabQueue.splice(i, 1);
+          }
+        }
+      }
+      actionMessage = `Removed ${removedCount} completed download(s).`;
+    } else if (action === 'clear-failed') {
+      const removedIds = new Set<string>();
+      for (const [id, job] of slskdJobs.entries()) {
+        if (
+          job.status === 'failed' ||
+          job.status === 'not_found' ||
+          (includeFiltered && job.status === 'filtered')
+        ) {
+          slskdJobs.delete(id);
+          removedIds.add(id);
+          removedCount++;
+        }
+      }
+      if (removedIds.size > 0) {
+        for (let i = pendingGrabQueue.length - 1; i >= 0; i--) {
+          if (removedIds.has(pendingGrabQueue[i]?.job?.id)) {
+            pendingGrabQueue.splice(i, 1);
+          }
+        }
+      }
+      actionMessage = `Cleared ${removedCount} failed/filtered download(s).`;
+    } else if (action === 'clear-all') {
+      removedCount = slskdJobs.size;
+      slskdJobs.clear();
+      pendingGrabQueue.length = 0;
+      actionMessage = `Cleared all ${removedCount} download job(s).`;
+    } else if (action === 'remove-job') {
+      if (!targetJobId || !slskdJobs.has(targetJobId)) {
+        return res.status(404).json({
+          ok: false,
+          error: 'Download job not found in queue.',
+        });
+      }
+      slskdJobs.delete(targetJobId);
+      removedCount = 1;
+      for (let i = pendingGrabQueue.length - 1; i >= 0; i--) {
+        if (pendingGrabQueue[i]?.job?.id === targetJobId) {
+          pendingGrabQueue.splice(i, 1);
+        }
+      }
+      actionMessage = 'Removed download job from list.';
+    } else if (action === 'retry-job') {
+      const job = targetJobId ? slskdJobs.get(targetJobId) : null;
+      if (!job) {
+        return res.status(404).json({
+          ok: false,
+          error: 'Download job not found in queue.',
+        });
+      }
+      const nextMode =
+        requestedSourceMode || job.sourceMode || defaultSourceMode;
+      job.sourceMode = nextMode;
+      job.sourceEngine = resolveEngineForMode(nextMode);
+      job.status = 'queued';
+      job.error = undefined;
+      job.completedAt = null;
+      job.createdAt = new Date().toISOString();
+      job.message = `Re-queued via ${formatEngineChainLabel(nextMode)}`;
+
+      for (let i = pendingGrabQueue.length - 1; i >= 0; i--) {
+        if (pendingGrabQueue[i]?.job?.id === job.id) {
+          pendingGrabQueue.splice(i, 1);
+        }
+      }
+      pendingGrabQueue.push({
+        job,
+        slskdUrl,
+        slskdApiKey,
+        sourceMode: nextMode,
+        filtersConfig: ignoreFilters ? null : cfg.discoveryFilters || null,
+      });
+      retriedCount = 1;
+      actionMessage = `Re-queued "${job.label}" via ${formatEngineChainLabel(nextMode)}!`;
+    } else if (action === 'retry-all-failed') {
+      for (const job of slskdJobs.values()) {
+        if (
+          job.status === 'failed' ||
+          job.status === 'not_found' ||
+          (req.body?.includeFiltered && job.status === 'filtered')
+        ) {
+          const nextMode =
+            requestedSourceMode || job.sourceMode || defaultSourceMode;
+          job.sourceMode = nextMode;
+          job.sourceEngine = resolveEngineForMode(nextMode);
+          job.status = 'queued';
+          job.error = undefined;
+          job.completedAt = null;
+          job.createdAt = new Date().toISOString();
+          job.message = `Re-queued via ${formatEngineChainLabel(nextMode)}`;
+
+          for (let i = pendingGrabQueue.length - 1; i >= 0; i--) {
+            if (pendingGrabQueue[i]?.job?.id === job.id) {
+              pendingGrabQueue.splice(i, 1);
+            }
+          }
+          pendingGrabQueue.push({
+            job,
+            slskdUrl,
+            slskdApiKey,
+            sourceMode: nextMode,
+            filtersConfig: ignoreFilters ? null : cfg.discoveryFilters || null,
+          });
+          retriedCount++;
+        }
+      }
+      actionMessage = `Re-queued ${retriedCount} failed download(s)${
+        requestedSourceMode ? ` via ${requestedSourceMode.toUpperCase()}` : ''
+      }!`;
+    } else {
+      return res.status(400).json({
+        ok: false,
+        error: `Unsupported queue action: "${action}".`,
+      });
+    }
+
+    updatePendingQueuePositions();
+    if (retriedCount > 0) {
+      pumpGrabQueue();
+    }
+    saveDripQueueState();
+
+    const statusPayload = computeSlskdStatusPayload();
+    return res.json({
+      ...statusPayload,
+      action,
+      removedCount,
+      retriedCount,
+      message: actionMessage,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : 'Failed to manage download queue jobs.',
+    });
+  }
 });
 
 app.post('/api/slskd/notifications/dismiss', (req, res) => {
@@ -7317,6 +7500,8 @@ async function pollSlskdTransfersAndScanLocalLibrary() {
       }
     }
 
+    const newlyCompletedJobs: any[] = [];
+
     for (const job of activeDownloadingJobs) {
       if (!Array.isArray(job.files) || job.files.length === 0) continue;
 
@@ -7340,10 +7525,17 @@ async function pollSlskdTransfersAndScanLocalLibrary() {
         job.status = 'completed';
         job.completedAt = new Date().toISOString();
         job.message = `✓ Downloaded via slskd & added to library!`;
+        newlyCompletedJobs.push(job);
+      }
+    }
 
-        await runFullLibraryScan();
-        reconcilePlaylistsWithLibrary();
+    if (newlyCompletedJobs.length > 0) {
+      await runFullLibraryScan();
+      reconcilePlaylistsWithLibrary();
+      saveDripQueueState();
 
+      if (newlyCompletedJobs.length === 1) {
+        const job = newlyCompletedJobs[0];
         readyNotifications.unshift({
           id: `notif-${job.id}`,
           jobId: job.id,
@@ -7358,6 +7550,24 @@ async function pollSlskdTransfersAndScanLocalLibrary() {
           severity: 'success',
           service: 'slskd',
           trackId: job.trackId || undefined,
+        });
+      } else {
+        const batchId = `notif-slskd-batch-${Date.now()}`;
+        const summaryLabel = `${newlyCompletedJobs.length} tracks (${newlyCompletedJobs[0].label} + ${newlyCompletedJobs.length - 1} more)`;
+        readyNotifications.unshift({
+          id: batchId,
+          jobId: newlyCompletedJobs[0].id,
+          label: summaryLabel,
+          message: `${newlyCompletedJobs.length} slskd downloads completed & indexed into /music!`,
+          completedAt: new Date().toISOString(),
+        });
+        addPersistentNotification({
+          id: batchId,
+          message: `slskd Transfer Batch: ${newlyCompletedJobs.length} downloads completed & indexed into /music (${newlyCompletedJobs[0].label} and ${newlyCompletedJobs.length - 1} more).`,
+          category: 'download',
+          severity: 'success',
+          service: 'slskd',
+          dedupKey: 'download:batch:completed',
         });
       }
     }
@@ -8347,10 +8557,19 @@ app.post('/api/notifications/read', (req, res) => {
 
 app.post('/api/notifications/delete', (req, res) => {
   const ids = Array.isArray(req.body?.ids) ? req.body.ids : undefined;
-  if (!ids || ids.length === 0) {
+  const clearAll =
+    Boolean(req.body?.clearAll) || !Array.isArray(ids) || ids.length === 0;
+  if (clearAll) {
     readyNotifications.length = 0;
+  } else if (ids) {
+    const idSet = new Set(ids.map(String));
+    for (let i = readyNotifications.length - 1; i >= 0; i--) {
+      if (idSet.has(readyNotifications[i]?.id)) {
+        readyNotifications.splice(i, 1);
+      }
+    }
   }
-  const data = deletePersistentNotifications(ids);
+  const data = deletePersistentNotifications(ids, clearAll);
   return res.json({
     ok: true,
     ...data,
@@ -8359,7 +8578,7 @@ app.post('/api/notifications/delete', (req, res) => {
 
 app.delete('/api/notifications', (_req, res) => {
   readyNotifications.length = 0;
-  const data = deletePersistentNotifications();
+  const data = deletePersistentNotifications(undefined, true);
   return res.json({
     ok: true,
     ...data,
@@ -8412,31 +8631,43 @@ async function scanAndOrganizeStagingInbox() {
     };
 
     const inboxAudioFiles = await collectAudioFiles(stagingDir);
-    for (const filePath of inboxAudioFiles) {
-      try {
-        const res = await fingerprintTagAndOrganizeFile(filePath, {
-          acoustidApiKey: cfg.integrations?.acoustidApiKey,
-          moveToLibraryRoot: true,
-        });
-        if (res.ok) {
-          organizedFiles.push({
-            from: filePath,
-            to: res.finalPath,
-            title: res.identified.title,
-            artist: res.identified.artist,
+    if (inboxAudioFiles.length > 0) {
+      setOrganizerActiveState(true);
+    }
+    try {
+      for (const filePath of inboxAudioFiles) {
+        try {
+          const res = await fingerprintTagAndOrganizeFile(filePath, {
+            acoustidApiKey: cfg.integrations?.acoustidApiKey,
+            moveToLibraryRoot: true,
           });
+          if (res.ok) {
+            await indexAudioFile(res.finalPath);
+            organizedFiles.push({
+              from: filePath,
+              to: res.finalPath,
+              title: res.identified.title,
+              artist: res.identified.artist,
+            });
+          }
+        } catch {
+          // continue with next file
         }
-      } catch {
-        // continue with next file
+      }
+    } finally {
+      if (inboxAudioFiles.length > 0) {
+        setOrganizerActiveState(false);
       }
     }
 
     if (organizedFiles.length > 0) {
+      reconcilePlaylistsWithLibrary();
       addPersistentNotification({
         message: `Staging Auto-Organizer: Fingerprinted, tagged & organized ${organizedFiles.length} incoming track(s) from ${stagingDir} into /music.`,
         category: 'library',
         severity: 'success',
         service: 'Auto-Organizer',
+        dedupKey: 'organizer:staging:completed',
       });
     }
   } catch {
@@ -9156,6 +9387,33 @@ app.post('/api/library/organize/apply', requireAdmin, async (_req, res) => {
   );
   return res.json({ ok: true, job });
 });
+
+// POST /api/library/test-5-songs -> Run 5-Song Dry-Run / Read-Write & Folder/Artwork Persistence Test on /music
+const handleFiveSongTestRequest = async (req: any, res: any) => {
+  try {
+    const targetPath = req.body?.targetPath
+      ? String(req.body.targetPath).trim()
+      : '';
+    const applyLiveMoveOnSample = Boolean(req.body?.applyLiveMoveOnSample);
+    const report = await runFiveSongReadWriteTest({
+      targetPath,
+      applyLiveMoveOnSample,
+    });
+    return res.json(report);
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      overallPassed: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : 'Failed to execute 5-Song Read/Write Test.',
+    });
+  }
+};
+
+app.post('/api/library/test-5-songs', requireAdmin, handleFiveSongTestRequest);
+app.post('/api/storage/test-5-songs', requireAdmin, handleFiveSongTestRequest);
 
 // ============================================================================
 // 13D. STORAGE & DRIVE CAPACITY STATS (/api/storage/stats) + 24H SCHEDULED TASKS CRON ENGINE (/api/scheduler/*)

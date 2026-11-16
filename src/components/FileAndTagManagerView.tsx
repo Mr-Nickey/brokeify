@@ -233,6 +233,11 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
   const [organizeDryRun, setOrganizeDryRun] = useState<boolean>(true);
   const [organizeSkipOrganized, setOrganizeSkipOrganized] =
     useState<boolean>(false);
+  const [runningFiveSongTest, setRunningFiveSongTest] =
+    useState<boolean>(false);
+  const [fiveSongTestReport, setFiveSongTestReport] = useState<any | null>(
+    null
+  );
 
   const onLibraryChangedRef = useRef(onLibraryChanged);
   useEffect(() => {
@@ -411,6 +416,53 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
         type: 'err',
         text: 'Network error cancelling organizer.',
       });
+    }
+  };
+
+  const handleRunFiveSongTest = async (
+    scope: 'entire_library' | 'current_folder' = 'entire_library',
+    applyLiveMoveOnSample = false
+  ) => {
+    setRunningFiveSongTest(true);
+    setFiveSongTestReport(null);
+    try {
+      const resp = await fetch('/api/library/test-5-songs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          targetPath: scope === 'current_folder' ? currentPath : '',
+          applyLiveMoveOnSample,
+        }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      setFiveSongTestReport(data);
+      const msg = data?.overallPassed
+        ? `✅ 5-Song Read/Write & Organizer Test PASSED (${data.sampleTrackCount || 0} sample songs verified)!`
+        : `⚠️ 5-Song Read/Write Test found permission or locking issues on ${musicRoot}.`;
+      setStatusBanner({
+        type: data?.overallPassed ? 'ok' : 'err',
+        text: msg,
+      });
+      onNotify?.(msg);
+      if (applyLiveMoveOnSample) {
+        loadDirectory(currentPath, true);
+        onLibraryChangedRef.current?.();
+      }
+    } catch (err) {
+      const errMsg =
+        err instanceof Error
+          ? err.message
+          : 'Network error running 5-Song Read/Write Test.';
+      setFiveSongTestReport({
+        ok: false,
+        overallPassed: false,
+        summary: errMsg,
+        steps: [],
+        sampleSongs: [],
+      });
+      setStatusBanner({ type: 'err', text: errMsg });
+    } finally {
+      setRunningFiveSongTest(false);
     }
   };
 
@@ -998,6 +1050,21 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
           <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
+              disabled={runningFiveSongTest}
+              onClick={() => handleRunFiveSongTest('entire_library', false)}
+              data-testid="btn-five-song-read-write-test"
+              className="inline-flex items-center gap-1.5 rounded-xl border border-cyan-500/50 bg-cyan-950/40 hover:bg-cyan-900/60 disabled:opacity-50 px-3.5 py-2 text-xs font-mono font-bold text-cyan-200 transition-colors shadow-md"
+            >
+              {runningFiveSongTest ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-cyan-300" />
+              ) : (
+                <HardDrive className="w-3.5 h-3.5 text-cyan-300" />
+              )}
+              <span>5-Song Dry-Run / Read-Write Test</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => setShowOrganizeModal(true)}
               data-testid="btn-clean-established-library"
               className="inline-flex items-center gap-1.5 rounded-xl border border-purple-500/50 bg-purple-950/40 hover:bg-purple-900/60 px-3.5 py-2 text-xs font-mono font-bold text-purple-200 transition-colors shadow-md"
@@ -1024,6 +1091,138 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
             </button>
           </div>
         </div>
+
+        {/* 5-Song Dry-Run / Read-Write Test Pass/Fail Report Panel */}
+        {fiveSongTestReport && (
+          <div
+            data-testid="five-song-test-report-panel"
+            className={`rounded-2xl border p-4 text-xs font-mono space-y-3 ${
+              fiveSongTestReport.overallPassed
+                ? 'border-emerald-500/50 bg-emerald-950/25 text-emerald-200'
+                : 'border-rose-500/50 bg-rose-950/30 text-rose-200'
+            }`}
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 font-bold text-sm">
+                <span
+                  className={`px-2 py-0.5 rounded text-[11px] font-bold uppercase ${
+                    fiveSongTestReport.overallPassed
+                      ? 'bg-[#00ff66] text-zinc-950'
+                      : 'bg-rose-500 text-white'
+                  }`}
+                >
+                  {fiveSongTestReport.overallPassed ? 'PASS' : 'FAIL'}
+                </span>
+                <span className="text-white">
+                  5-Song Read/Write &amp; Organizer Diagnostic Report (
+                  {fiveSongTestReport.durationMs ?? 0}ms)
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={runningFiveSongTest}
+                  onClick={() => handleRunFiveSongTest('entire_library', false)}
+                  className="rounded-lg border border-cyan-500/40 bg-cyan-950/40 px-2.5 py-1 text-[11px] font-bold text-cyan-200 hover:bg-cyan-900/50"
+                >
+                  Re-Run 5-Song Test
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFiveSongTestReport(null)}
+                  className="rounded-lg border border-zinc-700 px-2 py-1 text-[11px] text-zinc-400 hover:text-white"
+                >
+                  Dismiss ✕
+                </button>
+              </div>
+            </div>
+
+            <p className="text-zinc-300">{fiveSongTestReport.summary}</p>
+
+            {Array.isArray(fiveSongTestReport.steps) &&
+              fiveSongTestReport.steps.length > 0 && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                  {fiveSongTestReport.steps.map((st: any) => (
+                    <div
+                      key={st.step}
+                      className={`rounded-xl border p-3 ${
+                        st.passed
+                          ? 'border-emerald-500/35 bg-zinc-950/80'
+                          : 'border-rose-500/45 bg-rose-950/40'
+                      }`}
+                    >
+                      <div className="font-bold flex items-center justify-between gap-2">
+                        <span className="text-white">{st.label}</span>
+                        <span
+                          className={
+                            st.passed ? 'text-[#00ff66]' : 'text-rose-400'
+                          }
+                        >
+                          {st.passed ? '✓ PASS' : '✗ FAIL'}
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-zinc-300 mt-1">
+                        {st.detail}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+            {Array.isArray(fiveSongTestReport.sampleSongs) &&
+              fiveSongTestReport.sampleSongs.length > 0 && (
+                <div className="space-y-1.5 pt-1">
+                  <div className="text-[11px] font-bold uppercase text-cyan-300">
+                    5 Sample Songs Tested Across {fiveSongTestReport.musicRoot || '/music'}:
+                  </div>
+                  <div className="grid grid-cols-1 gap-2">
+                    {fiveSongTestReport.sampleSongs.map(
+                      (s: any, idx: number) => (
+                        <div
+                          key={`${s.sourcePath}-${idx}`}
+                          className="rounded-xl border border-zinc-800 bg-zinc-950/90 p-2.5 text-[11px] space-y-1"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="font-bold text-white">
+                              #{idx + 1} Artist:{' '}
+                              <span className="text-[#00ff66]">
+                                {s.cleanedArtist}
+                              </span>{' '}
+                              {s.rawArtist && s.rawArtist !== s.cleanedArtist ? (
+                                <span className="text-amber-300">
+                                  (stripped from &ldquo;{s.rawArtist}&rdquo;)
+                                </span>
+                              ) : null}{' '}
+                              · Title: {s.cleanedTitle}
+                            </span>
+                            <span
+                              className={`font-bold ${
+                                s.persistedOnDisk && s.parentWritable
+                                  ? 'text-[#00ff66]'
+                                  : 'text-rose-400'
+                              }`}
+                            >
+                              {s.persistedOnDisk && s.parentWritable
+                                ? '✓ R/W & PERSISTED ON DISK'
+                                : '✗ LOCKED / PERMISSION ERROR'}
+                            </span>
+                          </div>
+                          <div className="text-zinc-400 break-all">
+                            Current: <code>{s.relativeSourcePath}</code> →
+                            Organized:{' '}
+                            <code className="text-[#00ff66]">
+                              {s.proposedRelativeDestPath}
+                            </code>
+                          </div>
+                          <div className="text-zinc-300">{s.message}</div>
+                        </div>
+                      )
+                    )}
+                  </div>
+                </div>
+              )}
+          </div>
+        )}
 
         {/* Storage Metrics Grid */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
@@ -2661,13 +2860,26 @@ export const FileAndTagManagerView: React.FC<FileAndTagManagerViewProps> = ({
               </label>
             </div>
 
-            <div className="flex items-center justify-end gap-2 pt-2 border-t border-zinc-800">
+            <div className="flex flex-wrap items-center justify-end gap-2 pt-2 border-t border-zinc-800">
               <button
                 type="button"
                 onClick={() => setShowOrganizeModal(false)}
                 className="rounded-xl border border-zinc-700 px-3 py-1.5 text-xs font-mono text-zinc-400 hover:text-white"
               >
                 Cancel
+              </button>
+              <button
+                type="button"
+                disabled={runningFiveSongTest}
+                onClick={() => {
+                  setShowOrganizeModal(false);
+                  void handleRunFiveSongTest(organizeScope, false);
+                }}
+                data-testid="modal-5-song-test-btn"
+                className="inline-flex items-center gap-1.5 rounded-xl border border-cyan-500/60 bg-cyan-950/60 hover:bg-cyan-900/80 px-3.5 py-1.5 text-xs font-mono font-bold text-cyan-200"
+              >
+                <HardDrive className="w-3.5 h-3.5" />
+                <span>5-Song Read/Write Test</span>
               </button>
               <button
                 type="button"

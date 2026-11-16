@@ -63,6 +63,7 @@ interface RequestDiscoverViewProps {
   picardConfig?: PicardOrganizerConfig;
   onUpdatePicardConfig?: (next: PicardOrganizerConfig) => void;
   jobs: SlskdGrabJob[];
+  onUpdateJobs?: (jobs: SlskdGrabJob[]) => void;
   onPlayTrack: (track: Track) => void;
   onSaveResolvedPlaylist?: (playlist: Playlist) => void;
   onRefreshStatus: () => void;
@@ -105,6 +106,7 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
   picardConfig,
   onUpdatePicardConfig,
   jobs,
+  onUpdateJobs,
   onPlayTrack,
   onSaveResolvedPlaylist,
   onRefreshStatus,
@@ -203,6 +205,12 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
   const [managingJobsAction, setManagingJobsAction] = useState<string | null>(
     null
   );
+  const [isRefreshingTransfers, setIsRefreshingTransfers] =
+    useState<boolean>(false);
+  const [queueActionFeedback, setQueueActionFeedback] = useState<{
+    ok: boolean;
+    message: string;
+  } | null>(null);
 
   const formatDownloadBytes = (bytes?: number): string => {
     const b = Number(bytes || 0);
@@ -245,6 +253,44 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
     return 0;
   };
 
+  const handleRefreshTransferQueue = async () => {
+    setIsRefreshingTransfers(true);
+    try {
+      const resp = await fetch('/api/slskd/status?refresh=1');
+      const data = await resp.json().catch(() => ({}));
+      if (resp.ok && data.ok && Array.isArray(data.jobs)) {
+        if (onUpdateJobs) {
+          onUpdateJobs(data.jobs);
+        }
+        onRefreshStatus();
+        const completed = data.jobs.filter(
+          (j: SlskdGrabJob) => j.status === 'completed'
+        ).length;
+        const failed = data.jobs.filter(
+          (j: SlskdGrabJob) =>
+            j.status === 'failed' || j.status === 'not_found'
+        ).length;
+        const msg = `🔄 Refreshed transfer queue (${data.jobs.length} total · ${completed} completed · ${failed} failed).`;
+        setQueueActionFeedback({ ok: true, message: msg });
+        onShowToast(msg);
+      } else {
+        const errMsg =
+          data.error || `Failed to refresh download queue (HTTP ${resp.status}).`;
+        setQueueActionFeedback({ ok: false, message: errMsg });
+        onShowToast(`⚠️ ${errMsg}`);
+      }
+    } catch (err) {
+      const errMsg =
+        err instanceof Error
+          ? err.message
+          : 'Network error while refreshing download queue.';
+      setQueueActionFeedback({ ok: false, message: errMsg });
+      onShowToast(`⚠️ ${errMsg}`);
+    } finally {
+      setIsRefreshingTransfers(false);
+    }
+  };
+
   const handleManageDownloadJobs = async (payload: {
     action:
       | 'clear-completed'
@@ -270,31 +316,39 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
       });
       const data = await resp.json().catch(() => ({}));
       if (resp.ok && data.ok) {
-        if (payload.action === 'clear-completed') {
-          onShowToast(
-            `Removed ${data.removedCount || 0} completed download(s).`
-          );
-        } else if (payload.action === 'clear-failed') {
-          onShowToast(
-            `Cleared ${data.removedCount || 0} failed/filtered download(s).`
-          );
-        } else if (payload.action === 'retry-all-failed') {
-          onShowToast(
-            `Re-queued ${data.retriedCount || 0} failed download(s)${
-              payload.sourceMode ? ` via ${payload.sourceMode.toUpperCase()}` : ''
-            }!`
-          );
-        } else if (payload.action === 'retry-job') {
-          onShowToast('Re-queued download job!');
-        } else if (payload.action === 'remove-job') {
-          onShowToast('Removed download job from list.');
+        if (Array.isArray(data.jobs) && onUpdateJobs) {
+          onUpdateJobs(data.jobs);
         }
+        let toastMsg = data.message || 'Updated download jobs.';
+        if (payload.action === 'clear-completed') {
+          toastMsg = `✓ Removed ${data.removedCount ?? 0} completed download(s).`;
+        } else if (payload.action === 'clear-failed') {
+          toastMsg = `✓ Cleared ${data.removedCount ?? 0} failed/filtered download(s).`;
+        } else if (payload.action === 'retry-all-failed') {
+          toastMsg = `🔄 Re-queued ${data.retriedCount ?? 0} failed download(s)${
+            payload.sourceMode ? ` via ${payload.sourceMode.toUpperCase()}` : ''
+          }!`;
+        } else if (payload.action === 'retry-job') {
+          toastMsg = data.message || '🔄 Re-queued download job!';
+        } else if (payload.action === 'remove-job') {
+          toastMsg = '🗑️ Removed download job from list.';
+        }
+        setQueueActionFeedback({ ok: true, message: toastMsg });
+        onShowToast(toastMsg);
         onRefreshStatus();
       } else {
-        onShowToast(data.error || 'Failed to update download jobs.');
+        const errMsg =
+          data.error || `Failed to update download jobs (HTTP ${resp.status}).`;
+        setQueueActionFeedback({ ok: false, message: errMsg });
+        onShowToast(`⚠️ ${errMsg}`);
       }
-    } catch {
-      onShowToast('Network error while managing download jobs.');
+    } catch (err) {
+      const errMsg =
+        err instanceof Error
+          ? err.message
+          : 'Network error while managing download jobs.';
+      setQueueActionFeedback({ ok: false, message: errMsg });
+      onShowToast(`⚠️ ${errMsg}`);
     } finally {
       setManagingJobsAction(null);
     }
@@ -3177,14 +3231,40 @@ export const RequestDiscoverView: React.FC<RequestDiscoverViewProps> = ({
 
                 <button
                   type="button"
-                  onClick={onRefreshStatus}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs font-mono text-zinc-200 hover:text-white min-h-[36px]"
+                  disabled={isRefreshingTransfers || managingJobsAction !== null}
+                  onClick={handleRefreshTransferQueue}
+                  data-testid="downloads-refresh-btn"
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs font-mono text-zinc-200 hover:text-white min-h-[36px] disabled:opacity-50"
                 >
-                  <RefreshCw className="w-3.5 h-3.5 text-[#00ff66]" />
-                  <span>Refresh</span>
+                  <RefreshCw
+                    className={`w-3.5 h-3.5 text-[#00ff66] ${
+                      isRefreshingTransfers ? 'animate-spin' : ''
+                    }`}
+                  />
+                  <span>{isRefreshingTransfers ? 'Refreshing...' : 'Refresh'}</span>
                 </button>
               </div>
             </div>
+
+            {queueActionFeedback && (
+              <div
+                data-testid="downloads-action-feedback"
+                className={`rounded-xl border px-3.5 py-2 text-xs font-mono flex items-center justify-between gap-2 ${
+                  queueActionFeedback.ok
+                    ? 'border-emerald-500/40 bg-emerald-950/30 text-[#00ff66]'
+                    : 'border-rose-500/40 bg-rose-950/30 text-rose-300'
+                }`}
+              >
+                <span>{queueActionFeedback.message}</span>
+                <button
+                  type="button"
+                  onClick={() => setQueueActionFeedback(null)}
+                  className="text-zinc-400 hover:text-white text-[11px] px-1.5"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
 
             {/* Filter Bar: Status Pills + Engine Filter + Search Input */}
             <div className="rounded-xl border border-zinc-800 bg-zinc-950/75 p-3 space-y-3">

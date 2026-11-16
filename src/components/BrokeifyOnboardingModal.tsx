@@ -132,6 +132,8 @@ export const BrokeifyOnboardingModal: React.FC<BrokeifyOnboardingModalProps> = (
     message: string;
     driveStatus?: DriveInspectionStatus;
   } | null>(null);
+  const [testingFiveSongs, setTestingFiveSongs] = useState<boolean>(false);
+  const [fiveSongReport, setFiveSongReport] = useState<any | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   const fetchCurrentDriveStatus = async () => {
@@ -196,6 +198,39 @@ export const BrokeifyOnboardingModal: React.FC<BrokeifyOnboardingModalProps> = (
       });
     } finally {
       setTestingPath(false);
+    }
+  };
+
+  const handleRunFiveSongTest = async () => {
+    setTestingFiveSongs(true);
+    setFiveSongReport(null);
+    try {
+      const resp = await fetch('/api/library/test-5-songs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ targetPath: '' }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      setFiveSongReport(data);
+      if (data?.overallPassed) {
+        onShowToast(
+          `✅ 5-Song Read/Write & Organizer Test PASSED (${data.sampleTrackCount || 0} sample songs verified)!`
+        );
+      } else {
+        onShowToast(
+          `⚠️ 5-Song Read/Write Test found permission or locking issues on ${customPathInput || '/music'}.`
+        );
+      }
+    } catch (err: any) {
+      setFiveSongReport({
+        ok: false,
+        overallPassed: false,
+        summary: err?.message || 'Network error running 5-Song Test.',
+        steps: [],
+        sampleSongs: [],
+      });
+    } finally {
+      setTestingFiveSongs(false);
     }
   };
 
@@ -482,7 +517,7 @@ export const BrokeifyOnboardingModal: React.FC<BrokeifyOnboardingModalProps> = (
                 <button
                   type="button"
                   onClick={() => handleTestPath()}
-                  disabled={testingPath || connectingDrive}
+                  disabled={testingPath || connectingDrive || testingFiveSongs}
                   data-testid="test-drive-path-btn"
                   className="inline-flex items-center justify-center gap-2 rounded-xl border border-[#00ff66]/50 bg-[#00ff66]/15 hover:bg-[#00ff66]/25 px-4 py-2.5 text-xs font-mono font-bold text-[#00ff66] transition-colors whitespace-nowrap shrink-0 min-h-[42px]"
                 >
@@ -492,6 +527,21 @@ export const BrokeifyOnboardingModal: React.FC<BrokeifyOnboardingModalProps> = (
                     <Server className="w-4 h-4" />
                   )}
                   <span>Test Folder Path</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleRunFiveSongTest}
+                  disabled={testingFiveSongs || connectingDrive}
+                  data-testid="onboarding-5-song-test-btn"
+                  className="inline-flex items-center justify-center gap-2 rounded-xl border border-cyan-500/50 bg-cyan-500/15 hover:bg-cyan-500/25 px-4 py-2.5 text-xs font-mono font-bold text-cyan-300 transition-colors whitespace-nowrap shrink-0 min-h-[42px]"
+                >
+                  {testingFiveSongs ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <HardDrive className="w-4 h-4" />
+                  )}
+                  <span>5-Song Dry-Run / Read-Write Test</span>
                 </button>
 
                 <button
@@ -535,6 +585,107 @@ export const BrokeifyOnboardingModal: React.FC<BrokeifyOnboardingModalProps> = (
                 ))}
               </div>
             </div>
+
+            {fiveSongReport && (
+              <div
+                data-testid="onboarding-five-song-report"
+                className={`rounded-xl border p-4 text-xs font-mono space-y-3 ${
+                  fiveSongReport.overallPassed
+                    ? 'border-emerald-500/50 bg-emerald-950/25 text-emerald-200'
+                    : 'border-rose-500/50 bg-rose-950/30 text-rose-200'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 font-bold text-sm">
+                    {fiveSongReport.overallPassed ? (
+                      <CheckCircle2 className="w-4 h-4 text-[#00ff66] shrink-0" />
+                    ) : (
+                      <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                    )}
+                    <span>
+                      5-Song Read/Write &amp; Organizer Test:{' '}
+                      {fiveSongReport.overallPassed ? 'PASSED' : 'FAILED'} (
+                      {fiveSongReport.durationMs ?? 0}ms)
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setFiveSongReport(null)}
+                    className="text-zinc-400 hover:text-white text-xs"
+                  >
+                    ✕
+                  </button>
+                </div>
+                <p className="text-zinc-300">{fiveSongReport.summary}</p>
+                {Array.isArray(fiveSongReport.steps) &&
+                  fiveSongReport.steps.length > 0 && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      {fiveSongReport.steps.map((st: any) => (
+                        <div
+                          key={st.step}
+                          className={`rounded-lg border p-2.5 ${
+                            st.passed
+                              ? 'border-emerald-500/30 bg-zinc-950/70'
+                              : 'border-rose-500/40 bg-rose-950/40'
+                          }`}
+                        >
+                          <div className="font-bold flex items-center justify-between">
+                            <span>{st.label}</span>
+                            <span
+                              className={
+                                st.passed ? 'text-[#00ff66]' : 'text-rose-400'
+                              }
+                            >
+                              {st.passed ? 'PASS' : 'FAIL'}
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-zinc-300 mt-1">
+                            {st.detail}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                {Array.isArray(fiveSongReport.sampleSongs) &&
+                  fiveSongReport.sampleSongs.length > 0 && (
+                    <div className="space-y-1.5 pt-1">
+                      <div className="text-[11px] font-bold uppercase text-cyan-300">
+                        Sample Tracks Verified ({fiveSongReport.sampleSongs.length}):
+                      </div>
+                      {fiveSongReport.sampleSongs.map((s: any, idx: number) => (
+                        <div
+                          key={`${s.sourcePath}-${idx}`}
+                          className="rounded-lg border border-zinc-800 bg-zinc-950/80 p-2 text-[11px] space-y-0.5"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-bold text-white truncate">
+                              #{idx + 1} {s.cleanedArtist} — {s.cleanedTitle}
+                            </span>
+                            <span
+                              className={`font-bold shrink-0 ${
+                                s.persistedOnDisk && s.parentWritable
+                                  ? 'text-[#00ff66]'
+                                  : 'text-rose-400'
+                              }`}
+                            >
+                              {s.persistedOnDisk && s.parentWritable
+                                ? '✓ R/W & PERSISTED'
+                                : '✗ LOCKED / READ-ONLY'}
+                            </span>
+                          </div>
+                          <div className="text-zinc-400 truncate">
+                            From: <code>{s.relativeSourcePath}</code> → To:{' '}
+                            <code className="text-[#00ff66]">
+                              {s.proposedRelativeDestPath}
+                            </code>
+                          </div>
+                          <div className="text-zinc-300">{s.message}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+              </div>
+            )}
 
             {testResult && (
               <div

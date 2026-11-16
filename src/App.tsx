@@ -534,6 +534,8 @@ export default function App() {
   const [deletingTrackId, setDeletingTrackId] = useState<string | null>(null);
   const hasLoadedServerConfigRef = useRef<boolean>(false);
   const scrobbledTrackIdsRef = useRef<Set<string>>(new Set());
+  const lastClearedNotificationsAtRef = useRef<number>(0);
+  const deletedNotificationIdsRef = useRef<Set<string>>(new Set());
 
   // New Unified Modals: Spotify Importer, Add to Playlist, Merge/Link Playlists, and Metadata Inspector
   const [spotifyImporterModalOpen, setSpotifyImporterModalOpen] =
@@ -946,7 +948,7 @@ export default function App() {
     setAppNotifications((prev) => {
       if (prev[0]?.message === toastMessage) return prev;
       const nextItem: AppNotificationItem = {
-        id: `notif-${nowMs}-${Math.random().toString(36).slice(2, 6)}`,
+        id: `toast-${nowMs}-${Math.random().toString(36).slice(2, 6)}`,
         message: toastMessage,
         category: inferNotificationCategory(toastMessage),
         createdAt: formatNotificationTimestamp(undefined, nowMs),
@@ -970,14 +972,31 @@ export default function App() {
 
   // Poll persistent SQLite notifications (/api/notifications) so backend service errors & finished downloads feed directly into the Bell
   const syncPersistentNotificationsFromServer = useCallback(async () => {
+    const pollStartedAt = Date.now();
     try {
       const resp = await fetch('/api/notifications');
       if (!resp.ok) return;
       const data = await resp.json();
       if (!data?.ok || !Array.isArray(data.notifications)) return;
+      // Ignore stale in-flight poll responses that started before a Clear All action
+      if (lastClearedNotificationsAtRef.current >= pollStartedAt) {
+        return;
+      }
       setAppNotifications((prev) => {
+        const clearedCutOff = lastClearedNotificationsAtRef.current;
+        const deletedIds = deletedNotificationIdsRef.current;
         const byId = new Map<string, AppNotificationItem>();
         for (const srvItem of data.notifications) {
+          if (!srvItem?.id || deletedIds.has(srvItem.id)) {
+            continue;
+          }
+          if (
+            clearedCutOff > 0 &&
+            typeof srvItem.timestampMs === 'number' &&
+            srvItem.timestampMs <= clearedCutOff
+          ) {
+            continue;
+          }
           if (
             typeof srvItem.message === 'string' &&
             srvItem.message.includes('Rate limit exceeded')
@@ -999,9 +1018,14 @@ export default function App() {
             read: Boolean(srvItem.read),
           });
         }
+        // Only preserve local client toast-* notifications created after the last Clear All
         for (const loc of prev) {
           if (
+            loc?.id &&
+            loc.id.startsWith('toast-') &&
             !byId.has(loc.id) &&
+            !deletedIds.has(loc.id) &&
+            (!clearedCutOff || (loc.timestampMs && loc.timestampMs > clearedCutOff)) &&
             !String(loc.message || '').includes('Rate limit exceeded')
           ) {
             byId.set(loc.id, {
@@ -1141,6 +1165,9 @@ export default function App() {
 
   const handleDeleteNotifications = useCallback((ids: string[]) => {
     const idSet = new Set(ids);
+    for (const id of ids) {
+      deletedNotificationIdsRef.current.add(id);
+    }
     fetch('/api/notifications/delete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1161,9 +1188,20 @@ export default function App() {
   }, []);
 
   const handleClearAllBellNotifications = useCallback(() => {
-    fetch('/api/notifications', { method: 'DELETE' }).catch(() => {});
-    setAppNotifications([]);
+    lastClearedNotificationsAtRef.current = Date.now();
+    setAppNotifications((prev) => {
+      for (const n of prev) {
+        if (n.id) deletedNotificationIdsRef.current.add(n.id);
+      }
+      return [];
+    });
     setReadyNotifications([]);
+    fetch('/api/notifications', { method: 'DELETE' }).catch(() => {});
+    fetch('/api/notifications/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clearAll: true }),
+    }).catch(() => {});
     try {
       localStorage.setItem(NOTIFICATIONS_STORAGE_KEY, JSON.stringify([]));
     } catch {
@@ -2820,17 +2858,13 @@ export default function App() {
         }}
       />
 
-      {/* Toast Notification Banner (kept in DOM for accessibility/test status, visually shown only when popup banners are unmuted) */}
+      {/* Toast Notification Banner */}
       {toastMessage && (
         <div
           role="status"
           aria-live="polite"
           data-testid="instant-mix-toast"
-          className={
-            mutePopupBanners
-              ? 'sr-only'
-              : 'fixed top-16 right-4 z-50 rounded-xl border border-[#00ff66]/50 bg-zinc-950/95 px-4 py-2.5 text-xs font-mono font-bold text-[#00ff66] shadow-2xl flex items-center gap-2 backdrop-blur-md'
-          }
+          className="fixed top-16 right-4 z-50 rounded-xl border border-[#00ff66]/50 bg-zinc-950/95 px-4 py-2.5 text-xs font-mono font-bold text-[#00ff66] shadow-2xl flex items-center gap-2 backdrop-blur-md"
         >
           <Sparkles className="w-4 h-4 text-[#00ff66] shrink-0" />
           <span>{toastMessage}</span>
@@ -6076,6 +6110,7 @@ export default function App() {
             picardConfig={picardConfig}
             onUpdatePicardConfig={setPicardConfig}
             jobs={slskdJobs}
+            onUpdateJobs={setSlskdJobs}
             onPlayTrack={(track) => audio.playSpecificTrack(track, allTracks)}
             onSaveResolvedPlaylist={(pl) => {
               handleSaveResolvedPlaylist(pl);
